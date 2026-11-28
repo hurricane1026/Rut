@@ -8,6 +8,9 @@
 
 using namespace rut;
 
+static_assert(ws_deflate_wire_limit(0).to_u64() == 1024);
+static_assert(ws_deflate_wire_limit(UINT32_MAX).to_u64() == 4'831'839'230);
+
 #if RUT_ENABLE_WEBSOCKET
 namespace {
 struct Owner {
@@ -162,7 +165,7 @@ TEST(ws_deflate, decoded_and_wire_work_limits_fail_without_publishing_partial_ou
         Owner owner;
         REQUIRE(owner.init());
         REQUIRE(ws_inflate_begin(*owner.codec, 32));
-        std::vector<u8> wire(ws_deflate_wire_limit(32) + 1, 0);
+        std::vector<u8> wire((ws_deflate_wire_limit(32) + range_int<1, 2>{}).to_u64(), 0);
         u8 output[32]{};
         u32 length = 99;
         CHECK_EQ(ws_inflate_chunk(*owner.codec,
@@ -205,7 +208,7 @@ TEST(ws_deflate, all_window_sizes_and_large_incompressible_payloads_fit_one_code
             random ^= random << 5;
             byte = static_cast<u8>(random);
         }
-        std::vector<u8> compressed(ws_deflate_wire_limit(kWsMaxMessageCapacity));
+        std::vector<u8> compressed(ws_deflate_wire_limit(kWsMaxMessageCapacity).to_u64());
         std::vector<u8> output(input.size());
         u32 compressed_length = 0;
         u32 output_length = 0;
@@ -300,7 +303,7 @@ TEST(ws_deflate,
                     payload[4096] = 0x82;
                     payload[4097] = 0xac;
                     std::vector<u8> replacement(4000, 'b');
-                    std::vector<u8> compressed(ws_deflate_wire_limit(kLimit));
+                    std::vector<u8> compressed(ws_deflate_wire_limit(kLimit).to_u64());
                     u32 compressed_length = 0;
                     REQUIRE_EQ(ws_deflate_payload(*sender.codec,
                                                   payload.data(),
@@ -525,7 +528,7 @@ TEST(ws_deflate, inspector_incompressible_maximum_falls_back_without_losing_owne
         REQUIRE_EQ(ws_parse_header(output.data(), produced, masked, &header, true),
                    ParseStatus::Complete);
         CHECK_FALSE(header.compressed);
-        CHECK_EQ(header.payload_len, input.size());
+        CHECK_EQ(static_cast<u64>(header.payload_len), input.size());
         if (masked)
             ws_unmask(output.data() + header.header_len, header.payload_len, header.mask_key);
         CHECK_EQ(memcmp(output.data() + header.header_len, input.data(), input.size()), 0);

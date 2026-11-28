@@ -138,18 +138,20 @@ private:
     bool initialized_ = false;
     bool send_dns_query(bool aaaa, u64 now);
     bool begin_dns_tls();
-    bool advance_dns_stream(u64 now);
-    bool advance_dns_https(u64 now);
-    bool accept_dns_result(const JwksDnsAddresses& result, u64 now);
+    [[nodiscard]] bool advance_dns_datagram(u64 now);
+    [[nodiscard]] bool advance_dns_stream(u64 now);
+    [[nodiscard]] bool advance_dns_https(u64 now);
+    [[nodiscard]] bool accept_dns_result(const JwksDnsAddresses& result, u64 now);
     void close_dns();
-    bool begin_http(u64 now);
-    bool start_http(HttpsFetch& fetch, u64 now);
+    [[nodiscard]] bool begin_http(u64 now);
+    [[nodiscard]] bool start_http(HttpsFetch& fetch, u64 now);
     bool can_try_next_address(const HttpsFetch& fetch) const;
     Str selected_address() const;
     Str discovery_selected_address() const;
     bool accept_discovery(u64 now);
     void clear_dns_cache();
-    bool fail();
+    void mark_failed();
+    [[nodiscard]] bool fail();
 };
 // Observe before checking deadlines so idle rows still detect clock resets.
 bool jwks_observe_time(u64& previous_ms, u64 now_ms);

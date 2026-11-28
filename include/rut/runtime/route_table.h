@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/byte_span.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
@@ -828,7 +829,7 @@ public:
             strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes ||
             exact_count > kMaxExactStrictLocalResponseBindings)
             return false;
-        const i64 exact_count_signed = static_cast<i64>(exact_count);
+        const i64 exact_count_signed = i64{exact_count};
         if (!exact_strict_local_response_binding_range_is_neutral(
                 exact_strict_local_response_bindings + exact_count_signed,
                 static_cast<u32>(static_cast<i64>(kMaxExactStrictLocalResponseBindings) -
@@ -854,26 +855,24 @@ public:
             const u16 id = pre_route_policy_ids[slot];
             if (id == 0) continue;
             if (id > strict_local_response_policy_count) return false;
-            if (slot == kRouteMethodHead &&
-                strict_local_response_policies[static_cast<i64>(id) - 1].head_mode !=
-                    StrictLocalResponseHeadMode::SuppressBody)
+            if (slot == kRouteMethodHead && strict_local_response_policies[i64{id} - 1].head_mode !=
+                                                StrictLocalResponseHeadMode::SuppressBody)
                 return false;
-            referenced[static_cast<i64>(id) - 1] = true;
+            referenced[i64{id} - 1] = true;
         }
         for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
             const u16 id = unmatched_policy_ids[slot];
             if (id == 0) continue;
             if (id > strict_local_response_policy_count) return false;
-            referenced[static_cast<i64>(id) - 1] = true;
+            referenced[i64{id} - 1] = true;
         }
         const u16 any_id = unmatched_policy_ids[kRouteMethodAny];
-        if (any_id != 0 && strict_local_response_policies[static_cast<i64>(any_id) - 1].head_mode !=
+        if (any_id != 0 && strict_local_response_policies[i64{any_id} - 1].head_mode !=
                                StrictLocalResponseHeadMode::SuppressBody)
             return false;
         const u16 head_id = unmatched_policy_ids[kRouteMethodHead];
-        if (head_id != 0 &&
-            strict_local_response_policies[static_cast<i64>(head_id) - 1].head_mode !=
-                StrictLocalResponseHeadMode::SuppressBody)
+        if (head_id != 0 && strict_local_response_policies[i64{head_id} - 1].head_mode !=
+                                StrictLocalResponseHeadMode::SuppressBody)
             return false;
         for (u32 i = 0; i < exact_count; i++) {
             const auto& binding = exact_strict_local_response_bindings[i];
@@ -883,7 +882,7 @@ public:
             const u32 slot = route_method_slot_from_key(binding.method);
             if (slot == kRouteMethodSlotInvalid) return false;
             if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
-                strict_local_response_policies[static_cast<i64>(binding.policy_id) - 1].head_mode !=
+                strict_local_response_policies[i64{binding.policy_id} - 1].head_mode !=
                     StrictLocalResponseHeadMode::SuppressBody)
                 return false;
             for (u32 prior = 0; prior < i; prior++) {
@@ -893,7 +892,7 @@ public:
                     __builtin_memcmp(binding.path, other.path, binding.path_len) == 0)
                     return false;
             }
-            referenced[static_cast<i64>(binding.policy_id) - 1] = true;
+            referenced[i64{binding.policy_id} - 1] = true;
         }
         for (u32 i = 0; i < strict_local_response_policy_count; i++)
             if (!referenced[i]) return false;
@@ -1021,14 +1020,10 @@ private:
             method_key == kRouteMethodInvalid || method_key == kRouteMethodAny ||
             route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
             return invalid;
-        const uintptr_t raw_address = reinterpret_cast<uintptr_t>(raw_target.ptr);
-        const uintptr_t normalized_address = reinterpret_cast<uintptr_t>(slash_normalized_path.ptr);
-        uintptr_t raw_end = 0;
-        uintptr_t normalized_end = 0;
-        if (__builtin_add_overflow(raw_address, static_cast<uintptr_t>(raw_target.len), &raw_end) ||
-            __builtin_add_overflow(normalized_address,
-                                   static_cast<uintptr_t>(slash_normalized_path.len),
-                                   &normalized_end))
+        uintptr_t raw_end, normalized_end;
+        if (!raw_byte_span_address_end(raw_target.ptr, raw_target.len, &raw_end) ||
+            !raw_byte_span_address_end(
+                slash_normalized_path.ptr, slash_normalized_path.len, &normalized_end))
             return invalid;
         if (raw_target.ptr[0] != '/' || slash_normalized_path.ptr[0] != '/') return invalid;
         bool previous_slash = false;
@@ -1078,7 +1073,7 @@ public:
             strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
             strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
             return false;
-        const auto& policy = strict_local_response_policies[static_cast<i64>(id) - 1];
+        const auto& policy = strict_local_response_policies[i64{id} - 1];
         return strict_local_response_bytes_owned(policy.reason) &&
                strict_local_response_bytes_owned(policy.content_type) &&
                strict_local_response_bytes_owned(policy.server) &&
@@ -1151,8 +1146,8 @@ private:
             }
             for (u32 i = 0; i < exact_binding_count; i++) {
                 const u16 source_id = exact_bindings[i].policy_id;
-                if (!target.append_exact_strict_local_response_binding(
-                        exact_bindings[i], remap[static_cast<i64>(source_id) - 1]))
+                if (!target.append_exact_strict_local_response_binding(exact_bindings[i],
+                                                                       remap[i64{source_id} - 1]))
                     return false;
             }
             return target.strict_local_response_table_is_valid();
@@ -1236,13 +1231,13 @@ public:
                 const u16 source_id = method_policy_ids[slot];
                 if (source_id == 0) continue;
                 if (!target.set_unmatched_policy_id(static_cast<u8>(slot),
-                                                    remap[static_cast<i64>(source_id) - 1]))
+                                                    remap[i64{source_id} - 1]))
                     return false;
             }
             for (u32 i = 0; i < exact_binding_count; i++) {
                 const u16 source_id = exact_bindings[i].policy_id;
-                if (!target.append_exact_strict_local_response_binding(
-                        exact_bindings[i], remap[static_cast<i64>(source_id) - 1]))
+                if (!target.append_exact_strict_local_response_binding(exact_bindings[i],
+                                                                       remap[i64{source_id} - 1]))
                     return false;
             }
             return target.strict_local_response_table_is_valid();
@@ -1331,37 +1326,37 @@ public:
     // by `max_message_size` (at most one buffer slice). Same failure modes as
     // add_proxy() plus handler, size, UTF-8, and bounded-table validation. Policy
     // arrays are copied, but their text views must outlive the route configuration.
-    bool add_ws_terminate(const char* path,
-                          u8 method,
-                          u16 upstream_id,
-                          WsMessageHandlerFn handler,
-                          u32 max_message_size,
-                          u16 close_code = 1000,
-                          WsTextRewrite forward_text = {},
-                          Str close_reason = {},
-                          const WsClosePolicy* close_policies = nullptr,
-                          u32 close_policy_count = 0,
-                          const WsTextRewrite* forward_texts = nullptr,
-                          u32 forward_text_count = 0,
-                          Str subprotocol = {});
+    [[nodiscard]] bool add_ws_terminate(const char* path,
+                                        u8 method,
+                                        u16 upstream_id,
+                                        WsMessageHandlerFn handler,
+                                        u32 max_message_size,
+                                        u16 close_code = 1000,
+                                        WsTextRewrite forward_text = {},
+                                        Str close_reason = {},
+                                        const WsClosePolicy* close_policies = nullptr,
+                                        u32 close_policy_count = 0,
+                                        const WsTextRewrite* forward_texts = nullptr,
+                                        u32 forward_text_count = 0,
+                                        Str subprotocol = {});
 
     // Attach terminate-mode metadata to an already registered HTTP JIT route.
     // The compiler uses this after `register_jit_routes` so HTTP guards execute
     // before the handler's Forward outcome can open the configured upstream.
-    bool attach_ws_terminate_to_jit(u32 route_index,
-                                    const char* path,
-                                    u8 method,
-                                    u16 upstream_id,
-                                    WsMessageHandlerFn handler,
-                                    u32 max_message_size,
-                                    u16 close_code = 1000,
-                                    WsTextRewrite forward_text = {},
-                                    Str close_reason = {},
-                                    const WsClosePolicy* close_policies = nullptr,
-                                    u32 close_policy_count = 0,
-                                    const WsTextRewrite* forward_texts = nullptr,
-                                    u32 forward_text_count = 0,
-                                    Str subprotocol = {});
+    [[nodiscard]] bool attach_ws_terminate_to_jit(u32 route_index,
+                                                  const char* path,
+                                                  u8 method,
+                                                  u16 upstream_id,
+                                                  WsMessageHandlerFn handler,
+                                                  u32 max_message_size,
+                                                  u16 close_code = 1000,
+                                                  WsTextRewrite forward_text = {},
+                                                  Str close_reason = {},
+                                                  const WsClosePolicy* close_policies = nullptr,
+                                                  u32 close_policy_count = 0,
+                                                  const WsTextRewrite* forward_texts = nullptr,
+                                                  u32 forward_text_count = 0,
+                                                  Str subprotocol = {});
 
     // Set a route's rate limit to a single token-bucket rule (`max` per
     // `window_sec`, burst capacity defaulting to `max`, per-client-IP key),
@@ -1573,7 +1568,7 @@ public:
 
     bool response_policy_id_is_valid(u16 id) const {
         return id != 0 && id <= response_policy_count &&
-               admitted_response_policy_valid(response_policies[static_cast<i64>(id) - 1]);
+               admitted_response_policy_valid(response_policies[i64{id} - 1]);
     }
 
     u16 add_failure_policy(const ForwardFailurePolicySpec& policy);
@@ -1588,14 +1583,13 @@ public:
     bool failure_policy_id_is_valid(u16 id) const {
         return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
                id <= failure_policy_count &&
-               admitted_forward_failure_policy_valid(failure_policies[static_cast<i64>(id) - 1]);
+               admitted_forward_failure_policy_valid(failure_policies[i64{id} - 1]);
     }
 
     bool timeout_failure_policy_id_is_valid(u16 id) const {
         return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
                id <= failure_policy_count &&
-               admitted_forward_timeout_failure_policy_valid(
-                   failure_policies[static_cast<i64>(id) - 1]);
+               admitted_forward_timeout_failure_policy_valid(failure_policies[i64{id} - 1]);
     }
 
     // Full validation of every forward policy table, run once when a config is
@@ -1610,7 +1604,7 @@ public:
     bool policy_bundle_id_is_valid(u16 id) const {
         if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 || id > policy_bundle_count)
             return false;
-        const auto& b = policy_bundles[static_cast<i64>(id) - 1];
+        const auto& b = policy_bundles[i64{id} - 1];
         if ((b.response_policy_id != 0 && !response_policy_id_is_valid(b.response_policy_id)) ||
             (b.failure_policy_id != 0 && !failure_policy_id_is_valid(b.failure_policy_id)) ||
             (b.response_read_timeout_seconds != 0 &&
@@ -1626,7 +1620,7 @@ public:
         // violated, but a config should never publish one in the first
         // place.
         if (b.response_policy_id != 0 &&
-            response_policies[static_cast<i64>(b.response_policy_id) - 1].header_order ==
+            response_policies[i64{b.response_policy_id} - 1].header_order ==
                 ResponsePolicyHeaderOrder::Upstream &&
             (b.response_read_timeout_seconds != 0 ||
              b.response_buffering != ForwardResponseBufferingMode::None ||
@@ -1639,7 +1633,7 @@ public:
         // policy's status to be 502 and closes the downstream connection on
         // mismatch, so this trust boundary must reject the same combination.
         if (b.failure_policy_id != 0 &&
-            failure_policies[static_cast<i64>(b.failure_policy_id) - 1].header_order ==
+            failure_policies[i64{b.failure_policy_id} - 1].header_order ==
                 FailurePolicyHeaderOrder::LengthTypeDateServer &&
             b.response_read_timeout_seconds != 0)
             return false;
@@ -1650,10 +1644,9 @@ public:
                 b.timeout_failure_policy_id == 0 ||
                 !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
                 return false;
-            const auto& response = response_policies[static_cast<i64>(b.response_policy_id) - 1];
-            const auto& failure = failure_policies[static_cast<i64>(b.failure_policy_id) - 1];
-            const auto& timeout =
-                failure_policies[static_cast<i64>(b.timeout_failure_policy_id) - 1];
+            const auto& response = response_policies[i64{b.response_policy_id} - 1];
+            const auto& failure = failure_policies[i64{b.failure_policy_id} - 1];
+            const auto& timeout = failure_policies[i64{b.timeout_failure_policy_id} - 1];
             // The entry checks above already validated all three complete policy shapes.
             // The buffering role only needs these tuple fields; all Reject modes also satisfy
             // the suppress-body equality check in the legacy None path below.
@@ -1668,14 +1661,12 @@ public:
         if (b.response_policy_id == 0 || b.failure_policy_id == 0 ||
             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
             return false;
-        const bool response_suppress =
-            response_policies[static_cast<i64>(b.response_policy_id) - 1].head_mode ==
-            ResponsePolicyHeadMode::SuppressBody;
-        const bool failure_suppress =
-            failure_policies[static_cast<i64>(b.failure_policy_id) - 1].head_mode ==
-            FailurePolicyHeadMode::SuppressBody;
+        const bool response_suppress = response_policies[i64{b.response_policy_id} - 1].head_mode ==
+                                       ResponsePolicyHeadMode::SuppressBody;
+        const bool failure_suppress = failure_policies[i64{b.failure_policy_id} - 1].head_mode ==
+                                      FailurePolicyHeadMode::SuppressBody;
         const bool timeout_suppress =
-            failure_policies[static_cast<i64>(b.timeout_failure_policy_id) - 1].head_mode ==
+            failure_policies[i64{b.timeout_failure_policy_id} - 1].head_mode ==
             FailurePolicyHeadMode::SuppressBody;
         return response_suppress == failure_suppress && failure_suppress == timeout_suppress;
     }
@@ -1686,24 +1677,16 @@ public:
 
     bool target_transform_id_is_valid(u16 id) const {
         return forward_target_transform_id_is_valid(id, target_transform_count) &&
-               forward_target_transform_spec_valid(target_transforms[static_cast<i64>(id) - 1]);
+               forward_target_transform_spec_valid(target_transforms[i64{id} - 1]);
     }
 
     // Register foundation-only redirect metadata. Strings are copied into
     // RouteConfig-owned storage; no compiler/RIR pointer escapes here.
-    bool redirect_policy_string_is_owned(Str value) const {
+    [[nodiscard]] bool redirect_policy_string_is_owned(Str value) const {
         if (value.len == 0) return true;
-        if (value.ptr == nullptr || redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes ||
-            value.len > redirect_policy_bytes_used)
-            return false;
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(redirect_policy_bytes);
-        uintptr_t end = 0;
-        if (__builtin_add_overflow(begin, static_cast<uintptr_t>(redirect_policy_bytes_used), &end))
-            return false;
-        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
-        uintptr_t remaining = 0;
-        if (__builtin_sub_overflow(end, ptr, &remaining)) return false;
-        return ptr >= begin && ptr <= end && value.len <= remaining;
+        return redirect_policy_bytes_used <= kRedirectPolicyBytesPoolBytes &&
+               byte_span_within(
+                   redirect_policy_bytes, redirect_policy_bytes_used, value.ptr, value.len);
     }
 
     bool redirect_policy_strings_are_owned(const RedirectPolicySpec& policy) const {
@@ -1729,8 +1712,8 @@ public:
         return redirect_policy_count <= kMaxRedirectPolicies &&
                redirect_policy_bytes_used <= kRedirectPolicyBytesPoolBytes && id != 0 &&
                id <= redirect_policy_count &&
-               redirect_policy_strings_are_owned(redirect_policies[static_cast<i64>(id) - 1]) &&
-               redirect_policy_spec_valid(redirect_policies[static_cast<i64>(id) - 1]);
+               redirect_policy_strings_are_owned(redirect_policies[i64{id} - 1]) &&
+               redirect_policy_spec_valid(redirect_policies[i64{id} - 1]);
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.
@@ -1770,9 +1753,9 @@ public:
     bool remove_firewall_allow_ip(u32 ip) {
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] != ip) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_count; j++)
-                firewall_allow_ips[static_cast<i64>(j) - 1] = firewall_allow_ips[j];
-            firewall_allow_ips[static_cast<i64>(firewall_allow_count) - 1] = 0;
+            for (u32 j = i64{i} + 1; j < firewall_allow_count; j++)
+                firewall_allow_ips[i64{j} - 1] = firewall_allow_ips[j];
+            firewall_allow_ips[i64{firewall_allow_count} - 1] = 0;
             firewall_allow_count--;
             return true;
         }
@@ -1813,9 +1796,9 @@ public:
     bool remove_firewall_deny_ip(u32 ip) {
         for (u32 i = 0; i < firewall_deny_count; i++) {
             if (firewall_deny_ips[i] != ip) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_count; j++)
-                firewall_deny_ips[static_cast<i64>(j) - 1] = firewall_deny_ips[j];
-            firewall_deny_ips[static_cast<i64>(firewall_deny_count) - 1] = 0;
+            for (u32 j = i64{i} + 1; j < firewall_deny_count; j++)
+                firewall_deny_ips[i64{j} - 1] = firewall_deny_ips[j];
+            firewall_deny_ips[i64{firewall_deny_count} - 1] = 0;
             firewall_deny_count--;
             return true;
         }
@@ -1845,9 +1828,9 @@ public:
     bool remove_firewall_allow_port(u16 port) {
         for (u32 i = 0; i < firewall_allow_port_count; i++) {
             if (firewall_allow_ports[i] != port) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_port_count; j++)
-                firewall_allow_ports[static_cast<i64>(j) - 1] = firewall_allow_ports[j];
-            firewall_allow_ports[static_cast<i64>(firewall_allow_port_count) - 1] = 0;
+            for (u32 j = i64{i} + 1; j < firewall_allow_port_count; j++)
+                firewall_allow_ports[i64{j} - 1] = firewall_allow_ports[j];
+            firewall_allow_ports[i64{firewall_allow_port_count} - 1] = 0;
             firewall_allow_port_count--;
             return true;
         }
@@ -1865,9 +1848,9 @@ public:
     bool remove_firewall_deny_port(u16 port) {
         for (u32 i = 0; i < firewall_deny_port_count; i++) {
             if (firewall_deny_ports[i] != port) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_port_count; j++)
-                firewall_deny_ports[static_cast<i64>(j) - 1] = firewall_deny_ports[j];
-            firewall_deny_ports[static_cast<i64>(firewall_deny_port_count) - 1] = 0;
+            for (u32 j = i64{i} + 1; j < firewall_deny_port_count; j++)
+                firewall_deny_ports[i64{j} - 1] = firewall_deny_ports[j];
+            firewall_deny_ports[i64{firewall_deny_port_count} - 1] = 0;
             firewall_deny_port_count--;
             return true;
         }
@@ -1928,9 +1911,9 @@ public:
         for (u32 i = 0; i < firewall_allow_range_count; i++) {
             const auto& r = firewall_allow_ranges[i];
             if (r.start_ip != start_ip || r.end_ip != end_ip) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_range_count; j++)
-                firewall_allow_ranges[static_cast<i64>(j) - 1] = firewall_allow_ranges[j];
-            firewall_allow_ranges[static_cast<i64>(firewall_allow_range_count) - 1] = {0, 0};
+            for (u32 j = i64{i} + 1; j < firewall_allow_range_count; j++)
+                firewall_allow_ranges[i64{j} - 1] = firewall_allow_ranges[j];
+            firewall_allow_ranges[i64{firewall_allow_range_count} - 1] = {0, 0};
             firewall_allow_range_count--;
             return true;
         }
@@ -1959,9 +1942,9 @@ public:
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
             const auto& r = firewall_allow_cidrs[i];
             if (r.net_addr != net_addr || r.mask != mask) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_cidr_count; j++)
-                firewall_allow_cidrs[static_cast<i64>(j) - 1] = firewall_allow_cidrs[j];
-            firewall_allow_cidrs[static_cast<i64>(firewall_allow_cidr_count) - 1] = {0, 0};
+            for (u32 j = i64{i} + 1; j < firewall_allow_cidr_count; j++)
+                firewall_allow_cidrs[i64{j} - 1] = firewall_allow_cidrs[j];
+            firewall_allow_cidrs[i64{firewall_allow_cidr_count} - 1] = {0, 0};
             firewall_allow_cidr_count--;
             return true;
         }
@@ -2035,9 +2018,9 @@ public:
         for (u32 i = 0; i < firewall_deny_range_count; i++) {
             const auto& r = firewall_deny_ranges[i];
             if (r.start_ip != start_ip || r.end_ip != end_ip) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_range_count; j++)
-                firewall_deny_ranges[static_cast<i64>(j) - 1] = firewall_deny_ranges[j];
-            firewall_deny_ranges[static_cast<i64>(firewall_deny_range_count) - 1] = {0, 0};
+            for (u32 j = i64{i} + 1; j < firewall_deny_range_count; j++)
+                firewall_deny_ranges[i64{j} - 1] = firewall_deny_ranges[j];
+            firewall_deny_ranges[i64{firewall_deny_range_count} - 1] = {0, 0};
             firewall_deny_range_count--;
             return true;
         }
@@ -2066,9 +2049,9 @@ public:
         for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
             const auto& r = firewall_deny_cidrs[i];
             if (r.net_addr != net_addr || r.mask != mask) continue;
-            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_cidr_count; j++)
-                firewall_deny_cidrs[static_cast<i64>(j) - 1] = firewall_deny_cidrs[j];
-            firewall_deny_cidrs[static_cast<i64>(firewall_deny_cidr_count) - 1] = {0, 0};
+            for (u32 j = i64{i} + 1; j < firewall_deny_cidr_count; j++)
+                firewall_deny_cidrs[i64{j} - 1] = firewall_deny_cidrs[j];
+            firewall_deny_cidrs[i64{firewall_deny_cidr_count} - 1] = {0, 0};
             firewall_deny_cidr_count--;
             return true;
         }
@@ -2234,12 +2217,11 @@ private:
                 slash_idx = i;
             }
         }
-        if (slash_idx == 0xffffffffu || slash_idx == 0 ||
-            static_cast<i64>(slash_idx) + 1 >= static_cast<i64>(s.len))
+        if (slash_idx == 0xffffffffu || slash_idx == 0 || i64{slash_idx} + 1 >= i64{s.len})
             return false;
         if (!parse_ipv4_dotted({s.ptr, slash_idx}, out_ip)) return false;
         u32 prefix = 0;
-        for (u32 i = static_cast<i64>(slash_idx) + 1; i < s.len; i++) {
+        for (u32 i = i64{slash_idx} + 1; i < s.len; i++) {
             const char c = s.ptr[i];
             if (c < '0' || c > '9') return false;
             prefix = static_cast<u32>(static_cast<i64>(prefix) * 10 + (static_cast<i64>(c) - '0'));
@@ -2256,12 +2238,11 @@ private:
                 dash_idx = i;
             }
         }
-        if (dash_idx == 0xffffffffu || dash_idx == 0 ||
-            static_cast<i64>(dash_idx) + 1 >= static_cast<i64>(s.len))
+        if (dash_idx == 0xffffffffu || dash_idx == 0 || i64{dash_idx} + 1 >= i64{s.len})
             return false;
         if (!parse_ipv4_dotted({s.ptr, dash_idx}, out_start_ip)) return false;
         if (!parse_ipv4_dotted(
-                {s.ptr + static_cast<i64>(dash_idx) + 1,
+                {s.ptr + i64{dash_idx} + 1,
                  static_cast<u32>(static_cast<i64>(s.len) - static_cast<i64>(dash_idx) - 1)},
                 out_end_ip))
             return false;
@@ -2412,7 +2393,7 @@ inline bool route_requires_response_read_timeout_preflight_close(const RouteEntr
         return true;
     const u16 id = route->preflight_forward_policy_bundle_id;
     if (config == nullptr || !config->policy_bundle_id_is_valid(id)) return true;
-    const auto& bundle = config->policy_bundles[static_cast<i64>(id) - 1];
+    const auto& bundle = config->policy_bundles[i64{id} - 1];
     // A forged route marker that points at a legacy zero-duration bundle is
     // invalid too. Both valid metadata and every invalid shape use the same
     // zero-byte close boundary.

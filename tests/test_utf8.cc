@@ -1,3 +1,4 @@
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
 #include "test.h"
@@ -41,7 +42,13 @@ constexpr Utf8Case kBoundaryCases[] = {
 };
 
 [[nodiscard]] constexpr u8 continuation(u32 payload) {
-    return static_cast<u8>(0x80 | (payload & 0x3F));
+    return (range_int<0x80, 0x81>{} + bounded_remainder<64>(payload)).to<u8>();
+}
+[[nodiscard]] constexpr u8 byte(u32 value) {
+    range_int<0, 256> checked;
+    if (!decltype(checked)::try_from_u64(value, &checked))
+        RUT_TRAP("UTF-8 test byte exceeds its range");
+    return checked.to<u8>();
 }
 
 }  // namespace
@@ -61,7 +68,7 @@ TEST(utf8, boundary_cases) {
 
 TEST(utf8, every_single_byte) {
     for (u32 value = 0; value < 0x100; ++value) {
-        const u8 kByte = static_cast<u8>(value);
+        const u8 kByte = byte(value);
         REQUIRE_EQ(utf8_valid(&kByte, 1), value < 0x80);
     }
 }
@@ -71,17 +78,16 @@ TEST(utf8, every_multibyte_payload) {
     // patterns. RFC 3629 defines which payloads are legal for each width.
     // https://www.rfc-editor.org/rfc/rfc3629#section-4
     for (u32 cp = 0; cp < 0x800; ++cp) {
-        const u8 kBytes[] = {static_cast<u8>(0xC0 | (cp >> 6)), continuation(cp)};
+        const u8 kBytes[] = {byte(0xC0 | (cp >> 6)), continuation(cp)};
         REQUIRE_EQ(utf8_valid(kBytes, sizeof(kBytes)), cp >= 0x80);
     }
     for (u32 cp = 0; cp < 0x10000; ++cp) {
-        const u8 kBytes[] = {
-            static_cast<u8>(0xE0 | (cp >> 12)), continuation(cp >> 6), continuation(cp)};
+        const u8 kBytes[] = {byte(0xE0 | (cp >> 12)), continuation(cp >> 6), continuation(cp)};
         const bool kSurrogate = cp >= 0xD800 && cp <= 0xDFFF;
         REQUIRE_EQ(utf8_valid(kBytes, sizeof(kBytes)), cp >= 0x800 && !kSurrogate);
     }
     for (u32 cp = 0; cp < 0x200000; ++cp) {
-        const u8 kBytes[] = {static_cast<u8>(0xF0 | (cp >> 18)),
+        const u8 kBytes[] = {byte(0xF0 | (cp >> 18)),
                              continuation(cp >> 12),
                              continuation(cp >> 6),
                              continuation(cp)};

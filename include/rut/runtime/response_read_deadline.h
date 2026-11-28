@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/request_policy.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_capacity.h"
@@ -142,7 +143,7 @@ struct CompleteContentLengthResponseClassification {
     u64 total = 0;
 };
 
-inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out) {
+[[nodiscard]] inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out) {
     if (position == nullptr || out == nullptr || value.ptr == nullptr || *position >= value.len)
         return false;
     u64 parsed = 0;
@@ -153,8 +154,7 @@ inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out
         if (byte < '0' || byte > '9') break;
         const u64 digit = static_cast<u64>(static_cast<i64>(byte) - static_cast<i64>('0'));
         u64 scaled = 0;
-        if (__builtin_mul_overflow(parsed, u64{10}, &scaled) ||
-            __builtin_add_overflow(scaled, digit, &parsed))
+        if (mul_overflow(parsed, u64{10}, &scaled) || add_overflow(scaled, digit, &parsed))
             return false;
         ++cursor;
     }
@@ -164,8 +164,8 @@ inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out
     return true;
 }
 
-inline CompleteContentLengthResponseClassification classify_complete_content_length_response(
-    const ParsedResponse& response) {
+[[nodiscard]] inline CompleteContentLengthResponseClassification
+classify_complete_content_length_response(const ParsedResponse& response) {
     CompleteContentLengthResponseClassification classification{};
     if (response.version != HttpVersion::Http11 || response.headers_truncated ||
         !response.has_content_length || response.content_length_count != 1 ||
@@ -211,9 +211,8 @@ inline CompleteContentLengthResponseClassification classify_complete_content_len
         return {};
     u64 range_length = 0;
     u64 expected_length = static_cast<u64>(response.content_length);
-    if (__builtin_sub_overflow(classification.last, classification.first, &range_length) ||
-        __builtin_sub_overflow(expected_length, u64{1}, &expected_length) ||
-        range_length != expected_length)
+    if (sub_overflow(classification.last, classification.first, &range_length) ||
+        sub_overflow(expected_length, u64{1}, &expected_length) || range_length != expected_length)
         return {};
     classification.response_class = CompleteContentLengthResponseClass::CoherentSingleRange206;
     return classification;
@@ -1370,8 +1369,7 @@ inline bool response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable
                method,
                route_method) &&
            c.pipeline_stash_len != 0 && c.send_buf.len() == c.pipeline_stash_len &&
-           static_cast<i64>(c.recv_buf.len()) <=
-               static_cast<i64>(c.recv_buf.capacity()) - static_cast<i64>(c.pipeline_stash_len);
+           i64{c.recv_buf.len()} <= c.recv_buf.capacity() - i64{c.pipeline_stash_len};
 }
 
 inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
@@ -1381,8 +1379,7 @@ inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
     if (!response_read_deadline_coalesced_get_phase1_proof_is_stable(
             c, proof, allow_retired_episode) ||
         c.pipeline_stash_len == 0 || c.send_buf.len() != c.pipeline_stash_len ||
-        static_cast<i64>(c.recv_buf.len()) >
-            static_cast<i64>(c.recv_buf.capacity()) - static_cast<i64>(c.pipeline_stash_len))
+        i64{c.recv_buf.len()} > c.recv_buf.capacity() - i64{c.pipeline_stash_len})
         return false;
     return true;
 }
@@ -1999,9 +1996,9 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c.response_read_deadline_post_commit_downstream_submitted &&
         c.response_read_deadline_post_commit_downstream_submitted <=
             c.response_read_deadline_post_commit_origin_received &&
-        static_cast<i64>(c.response_read_deadline_post_commit_inflight_body) <=
-            static_cast<i64>(c.response_read_deadline_post_commit_downstream_submitted) -
-                static_cast<i64>(c.response_read_deadline_post_commit_downstream_completed);
+        i64{c.response_read_deadline_post_commit_inflight_body} <=
+            i64{c.response_read_deadline_post_commit_downstream_submitted} -
+                i64{c.response_read_deadline_post_commit_downstream_completed};
     if (post_commit && !post_commit_owner) return false;
     if (complete_buffering && !bodyless_post_commit && !fixed_upload_post_commit) return false;
     if (complete_buffering) {
@@ -2299,11 +2296,9 @@ inline bool response_read_deadline_combined_send_frame_is_stable(const Connectio
             CompleteContentLengthResponseClass::BoundedPositiveBody ||
         header_len == 0 || body_len == 0 || c.response_header_buf.data() == nullptr ||
         c.upstream_recv_buf.data() == nullptr || header_len > c.response_header_buf.capacity() ||
-        static_cast<i64>(body_len) >
-            static_cast<i64>(c.response_header_buf.capacity()) - static_cast<i64>(header_len) ||
-        raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.capacity() ||
-        static_cast<i64>(body_len) >
-            static_cast<i64>(c.upstream_recv_buf.capacity()) - static_cast<i64>(raw_header_end))
+        i64{body_len} > c.response_header_buf.capacity() - i64{header_len} || raw_header_end == 0 ||
+        raw_header_end > c.upstream_recv_buf.capacity() ||
+        i64{body_len} > c.upstream_recv_buf.capacity() - i64{raw_header_end})
         return false;
 
     const u32 send_len =
@@ -2327,8 +2322,8 @@ inline bool response_read_deadline_combined_send_frame_is_stable(const Connectio
            c.response_read_deadline_send_upstream_episode ==
                c.response_read_deadline_post_commit_episode &&
            c.response_read_deadline_send_owner_generation != 0 &&
-           __builtin_memcmp(c.response_header_buf.data() + static_cast<i64>(header_len),
-                            c.upstream_recv_buf.data() + static_cast<i64>(raw_header_end),
+           __builtin_memcmp(c.response_header_buf.data() + i64{header_len},
+                            c.upstream_recv_buf.data() + i64{raw_header_end},
                             body_len) == 0;
 }
 
@@ -2390,7 +2385,7 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             (complete_buffering
                  ? ResponseBodyChain::kMaxBody
                  : static_cast<u32>(
-                       static_cast<i64>(c.upstream_recv_buf.capacity()) -
+                       c.upstream_recv_buf.capacity() -
                        static_cast<i64>(c.response_read_deadline_post_commit_raw_header_end))) ||
         c.response_read_deadline_post_commit_origin_received >
             c.response_read_deadline_post_commit_declared_body ||
@@ -2398,9 +2393,9 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             c.response_read_deadline_post_commit_downstream_submitted ||
         c.response_read_deadline_post_commit_downstream_submitted >
             c.response_read_deadline_post_commit_origin_received ||
-        static_cast<i64>(c.response_read_deadline_post_commit_inflight_body) >
-            static_cast<i64>(c.response_read_deadline_post_commit_downstream_submitted) -
-                static_cast<i64>(c.response_read_deadline_post_commit_downstream_completed) ||
+        i64{c.response_read_deadline_post_commit_inflight_body} >
+            i64{c.response_read_deadline_post_commit_downstream_submitted} -
+                i64{c.response_read_deadline_post_commit_downstream_completed} ||
         c.protocol != ConnProtocol::Http11 ||
         (c.tls_active && !response_read_deadline_tls_complete_get_profile_is_stable(c)) ||
         c.h2 != nullptr || c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
@@ -2530,11 +2525,10 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         const u32 inflight = c.response_read_deadline_post_commit_inflight_body;
         const u32 header_len = c.response_header_buf.len();
         if (submitted > selected || completed > submitted ||
-            static_cast<i64>(inflight) >
-                static_cast<i64>(submitted) - static_cast<i64>(completed) ||
+            i64{inflight} > i64{submitted} - i64{completed} ||
             selected > c.response_read_deadline_post_commit_origin_received ||
             c.resp_body_mode != BodyMode::ContentLength || c.resp_body_sent < header_len ||
-            static_cast<i64>(c.resp_body_sent) - static_cast<i64>(header_len) != submitted ||
+            i64{c.resp_body_sent} - i64{header_len} != submitted ||
             c.resp_body_remaining !=
                 (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
                      ? static_cast<u32>(

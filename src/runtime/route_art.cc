@@ -311,9 +311,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // Match as many bytes of the existing edge as possible.
         const Str e = header(child).edge;
         u32 k = 0;
-        while (k < e.len && static_cast<i64>(i) + static_cast<i64>(k) < static_cast<i64>(p.len) &&
-               e.ptr[k] == p.ptr[static_cast<i64>(i) + static_cast<i64>(k)])
-            k++;
+        while (k < e.len && i64{i} + i64{k} < i64{p.len} && e.ptr[k] == p.ptr[i64{i} + i64{k}]) k++;
         if (k == e.len) {
             // Full edge match — descend. Capture the slot in cur that
             // holds `child` so a future upgrade of child's children can
@@ -487,26 +485,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // ends at the split). Loop body re-reads `cur` to decide.
         cur = new_child_ref;
         i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(k));
-        // Re-establish patch site for the new cur (we just rewrote
-        // it). Resolve it the same way as the full-match branch.
-        {
-            ArtChildRef* site = nullptr;
-            const u16 ni = art_idx(cur);
-            // For the patch site of the next iteration's child of
-            // cur, we'll resolve lazily on the next descent step;
-            // setting it to nullptr here is safe because the next
-            // iteration will recompute it. But cur itself was just
-            // written through cur_patch_site, so future writes to
-            // *cur_patch_site would clobber it. Reset cur_patch_site
-            // to point at where cur lives in its parent so future
-            // upgrades of cur propagate correctly. Since we just
-            // wrote cur via *cur_patch_site, that pointer is still
-            // valid and points at cur's slot in the parent.
-            (void)site;
-            (void)ni;
-            // cur_patch_site stays as-is (still pointing at the slot
-            // that holds cur in its parent).
-        }
+        // cur_patch_site still points at the parent's slot holding the replacement.
     }
 
     // Set the per-method terminal slot at `cur`. First-insert-wins.
@@ -566,10 +545,9 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
             if (child == kArtInvalidChildRef) return best;
             const ArtNode4& cn = n4_pool_[art_idx(child)];
             const Str e = cn.hdr.edge;
-            if (static_cast<i64>(i) + static_cast<i64>(e.len) > static_cast<i64>(p.len))
-                return best;
+            if (i64{i} + i64{e.len} > i64{p.len}) return best;
             for (u32 k = 0; k < e.len; k++) {
-                if (e.ptr[k] != p.ptr[static_cast<i64>(i) + static_cast<i64>(k)]) return best;
+                if (e.ptr[k] != p.ptr[i64{i} + i64{k}]) return best;
             }
             cur_idx = art_idx(child);
             i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(e.len));
@@ -675,9 +653,9 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
             }
         }
 
-        if (static_cast<i64>(i) + static_cast<i64>(child_edge.len) > static_cast<i64>(p.len)) break;
+        if (i64{i} + i64{child_edge.len} > i64{p.len}) break;
         for (u32 k = 0; k < child_edge.len; k++) {
-            if (child_edge.ptr[k] != p.ptr[static_cast<i64>(i) + static_cast<i64>(k)]) return best;
+            if (child_edge.ptr[k] != p.ptr[i64{i} + i64{k}]) return best;
         }
         cur = child;
         i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(child_edge.len));

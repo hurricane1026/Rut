@@ -1079,7 +1079,7 @@ bool is_input_fd(pid_t pid, u64 fd, const struct stat& input) {
     snprintf(proc_path,
              sizeof(proc_path),
              "/proc/%d/fd/%llu",
-             static_cast<int>(pid),
+             int{pid},
              static_cast<unsigned long long>(fd));
     struct stat info{};
     return stat(proc_path, &info) == 0 && info.st_dev == input.st_dev &&
@@ -1171,10 +1171,9 @@ TracedRun run_converter_with_rewrites(const char* executable,
         u32 offset_zero_reads = 0u;
         int deliver = 0;
         for (;;) {
-            if (ptrace(PTRACE_SYSCALL,
-                       child,
-                       nullptr,
-                       reinterpret_cast<void*>(static_cast<intptr_t>(deliver))) != 0) {
+            if (ptrace(
+                    PTRACE_SYSCALL, child, nullptr, reinterpret_cast<void*>(intptr_t{deliver})) !=
+                0) {
                 kill(child, SIGKILL);
                 break;
             }
@@ -2027,7 +2026,7 @@ TEST(envoy_convert, api_forged_model_rejected) {
     // successfully. `name_string` (src/envoy/parser.cc:179-185) rejects
     // every name over `kMaxEnvoyNameLen` during parsing, but nothing before
     // this fix re-enforced that bound at lowering time.
-    const std::string overlong_name(static_cast<size_t>(envoy::kMaxEnvoyNameLen) + 1u, 'a');
+    const std::string overlong_name(size_t{envoy::kMaxEnvoyNameLen} + 1u, 'a');
     envoy::Bootstrap overlong_cluster_names = parsed.value();
     overlong_cluster_names.listener.filter_chain.hcm.route_config.virtual_host.routes[0]
         .action.cluster = str(overlong_name);

@@ -27,7 +27,7 @@ struct ChunkedParser {
     };
 
     State state;
-    u32 chunk_remaining;  // bytes left in current chunk data
+    i64 chunk_remaining;  // bytes left in current chunk data
     bool has_digits;      // at least one hex digit seen in current size field
 
     void reset() {

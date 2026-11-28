@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/byte_span.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/runtime/http_parser.h"
 #include <cstddef>
@@ -107,22 +108,13 @@ inline void clear_access_log_downstream_host_snapshot(AccessLogDownstreamHostSna
     snapshot.record.reserved[1] = 0u;
 }
 
-inline bool access_log_header_view_in_bounds(Str view,
-                                             const u8* receive_data,
-                                             u32 receive_length,
-                                             u32 header_end) {
-    if (view.ptr == nullptr || receive_data == nullptr || header_end == 0u ||
-        header_end > receive_length)
-        return false;
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(receive_data);
-    uintptr_t end = 0;
-    if (__builtin_add_overflow(begin, static_cast<uintptr_t>(header_end), &end)) return false;
-    const uintptr_t address = reinterpret_cast<uintptr_t>(view.ptr);
-    uintptr_t remaining = 0;
-    if (address < begin || address > end || __builtin_sub_overflow(end, address, &remaining) ||
-        static_cast<uintptr_t>(view.len) > remaining)
-        return false;
-    return true;
+[[nodiscard]] inline bool access_log_header_view_in_bounds(Str view,
+                                                           const u8* receive_data,
+                                                           u32 receive_length,
+                                                           u32 header_end) {
+    if (header_end == 0 || header_end > receive_length) return false;
+    u32 offset;
+    return byte_span_offset_within(receive_data, header_end, view.ptr, view.len, &offset);
 }
 
 // Capture only a complete, strictly parsed HTTP/1 request. Every stored

@@ -1,19 +1,20 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/runtime/slice_pool.h"
 
 namespace rut {
 namespace detail {
 
 // Only physical extents may change before a receive completion is accepted.
-constexpr bool record_direct_write_extent(
+[[nodiscard]] constexpr bool record_direct_write_extent(
     u64 begin, u64 address, u32 capacity, u32 count, u32& tail_dirty, u32& node_dirty) {
     if (address < begin) return false;
     u64 raw_offset = 0;
-    if (__builtin_sub_overflow(address, begin, &raw_offset) || raw_offset > capacity) return false;
+    if (sub_overflow(address, begin, &raw_offset) || raw_offset > capacity) return false;
     const u32 kOffset = static_cast<u32>(raw_offset);
     u32 kEnd = 0;
-    if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;
+    if (add_overflow(kOffset, count, &kEnd)) return false;
     if (kEnd > capacity) return false;
     if (kEnd > tail_dirty) tail_dirty = kEnd;
     if (kEnd > node_dirty) node_dirty = kEnd;
@@ -36,14 +37,12 @@ struct ResponseBodyChain {
         u32 offset;
         // Physical high-water mark survives private reuse within one response.
         u32 dirty_end;
-        u8 bytes[static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(sizeof(Node*)) -
-                 static_cast<i64>(3) * static_cast<i64>(sizeof(u32))];
+        u8 bytes[i64{SlicePool::kSliceSize} - i64{sizeof(Node*)} - i64{3} * i64{sizeof(u32)}];
     };
     static_assert(sizeof(Node) == SlicePool::kSliceSize);
     static constexpr u32 kPayload = sizeof(Node::bytes);
     static_assert(kPayload == SlicePool::kResponseBodyPayload);
-    static constexpr u32 kHeader =
-        static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(kPayload));
+    static constexpr u32 kHeader = u32{i64{SlicePool::kSliceSize} - i64{kPayload}};
     static constexpr u32 header_size() { return kHeader; }
 
     // Payload of a node, which may extend past Node::bytes for a bulk node.
@@ -51,7 +50,7 @@ struct ResponseBodyChain {
         return reinterpret_cast<u8*>(node) + static_cast<i64>(header_size());
     }
     static const u8* payload(const Node* node) {
-        return reinterpret_cast<const u8*>(node) + static_cast<i64>(header_size());
+        return reinterpret_cast<const u8*>(node) + i64{header_size()};
     }
     static u32 payload_capacity(const SlicePool& pool, const Node* node) {
         return static_cast<u32>(
@@ -85,15 +84,12 @@ struct ResponseBodyChain {
     // and a ~48 KiB bulk node for a 64 KiB TLS body measured slower than
     // slices at high concurrency.
     static constexpr u32 kBulkAfterPlaintext = kPayload;
-    static constexpr u32 kBulkAfterTls =
-        static_cast<u32>(static_cast<i64>(4) * static_cast<i64>(kPayload));
+    static constexpr u32 kBulkAfterTls = u32{i64{4} * i64{kPayload}};
 
     // Reserve before publishing: allocation failure leaves the existing bytes
     // and length unchanged, as required by the receive copy witness.
     bool append(SlicePool& pool, const u8* src, u32 len, u32 bulk_after = kBulkAfterPlaintext) {
-        if (static_cast<i64>(len) > static_cast<i64>(kMaxBody) - static_cast<i64>(size) ||
-            (owner && owner != &pool))
-            return false;
+        if (i64{len} > i64{kMaxBody} - i64{size} || (owner && owner != &pool)) return false;
         if (len == 0) return true;
         const u32 spare = tail ? static_cast<u32>(static_cast<i64>(payload_capacity(pool, tail)) -
                                                   static_cast<i64>(tail->len))
@@ -153,10 +149,10 @@ struct ResponseBodyChain {
             const u32 room = static_cast<u32>(static_cast<i64>(payload_capacity(pool, write)) -
                                               static_cast<i64>(write->len));
             const u32 n = len < room ? len : room;
-            __builtin_memcpy(payload(write) + static_cast<i64>(write->len), src, n);
+            __builtin_memcpy(payload(write) + i64{write->len}, src, n);
             write->len = static_cast<u32>(static_cast<i64>(write->len) + static_cast<i64>(n));
             if (write->dirty_end < write->len) write->dirty_end = write->len;
-            src += static_cast<i64>(n);
+            src += i64{n};
             len = static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(n));
             write = write->next;
         }
@@ -231,9 +227,8 @@ struct ResponseBodyChain {
 
     // Valid only after a successful reserve_tail() with no intervening
     // append()/reserve_tail() failure or consume() of the tail.
-    u8* write_ptr(const SlicePool& pool) const {
-        (void)pool;
-        return tail ? payload(tail) + static_cast<i64>(tail->len) : nullptr;
+    [[nodiscard]] u8* write_ptr(const SlicePool&) const {
+        return tail ? payload(tail) + i64{tail->len} : nullptr;
     }
     u32 write_avail(const SlicePool& pool) const {
         return tail ? static_cast<u32>(static_cast<i64>(payload_capacity(pool, tail)) -
@@ -262,9 +257,8 @@ struct ResponseBodyChain {
     // observed buffer. Only previously accounted origin bytes can have been sent.
     static constexpr bool matches_buffered_length(
         u32 buffered, u32 header, u32 received, u32 completed, u32 newly_copied) {
-        return completed <= received && static_cast<i64>(buffered) + static_cast<i64>(completed) ==
-                                            static_cast<i64>(header) + static_cast<i64>(received) +
-                                                static_cast<i64>(newly_copied);
+        return completed <= received &&
+               i64{buffered} + i64{completed} == i64{header} + i64{received} + i64{newly_copied};
     }
 
     // Record bytes a direct recv wrote straight into write_ptr()'s

@@ -89,10 +89,10 @@ _Static_assert(RUT_GATE_PBUF_REG_RESERVED_OFFSET + RUT_GATE_PBUF_REG_RESERVED_SI
 #define RUT_GATE_SEND_EVENT 2U
 #define RUT_GATE_UPSTREAM_CONNECT_EVENT 3U
 #define RUT_GATE_TIMEOUT_EVENT 6U
-#define RUT_GATE_TIMER_CONN_ID 0x00FFFFFEU
+#define RUT_GATE_TIMER_CONN_ID UINT64_C(0x00FFFFFE)
 #define RUT_GATE_PBUF_RING_SIZE \
     (sizeof(struct io_uring_buf_ring) + RUT_GATE_BUFFER_COUNT * sizeof(struct io_uring_buf))
-#define RUT_GATE_PBUF_DATA_SIZE ((size_t)RUT_GATE_BUFFER_COUNT * RUT_GATE_BUFFER_SIZE)
+#define RUT_GATE_PBUF_DATA_SIZE sizeof(unsigned char[RUT_GATE_BUFFER_COUNT][RUT_GATE_BUFFER_SIZE])
 
 struct ring_view {
     int fd;
@@ -428,9 +428,8 @@ static int setup_params_valid(const struct io_uring_params* params) {
         return 0;
 
     const uint64_t cq_size =
-        (uint64_t)params->cq_off.cqes + (uint64_t)params->cq_entries * sizeof(struct io_uring_cqe);
-    const uint64_t sq_size =
-        (uint64_t)params->sq_off.array + (uint64_t)params->sq_entries * sizeof(uint32_t);
+        params->cq_off.cqes + (uint64_t)params->cq_entries * sizeof(struct io_uring_cqe);
+    const uint64_t sq_size = params->sq_off.array + (uint64_t)params->sq_entries * sizeof(uint32_t);
     if (cq_size > SIZE_MAX || sq_size > SIZE_MAX || params->sq_off.head != 0 ||
         params->sq_off.tail != sizeof(uint32_t) ||
         params->sq_off.ring_mask != 4U * sizeof(uint32_t) ||
@@ -501,7 +500,7 @@ static int mapped_ring_identity_valid(void) {
         !range_valid(ring_view.sq_ring,
                      ring_view.sq_ring_length,
                      params->sq_off.array,
-                     (size_t)params->sq_entries * sizeof(uint32_t)) ||
+                     params->sq_entries * sizeof(uint32_t)) ||
         !range_valid(ring_view.cq_ring, ring_view.cq_ring_length, params->cq_off.head, 4) ||
         !range_valid(ring_view.cq_ring, ring_view.cq_ring_length, params->cq_off.tail, 4) ||
         !range_valid(ring_view.cq_ring, ring_view.cq_ring_length, params->cq_off.ring_mask, 4) ||
@@ -509,12 +508,12 @@ static int mapped_ring_identity_valid(void) {
         !range_valid(ring_view.cq_ring,
                      ring_view.cq_ring_length,
                      params->cq_off.cqes,
-                     (size_t)params->cq_entries * sizeof(struct io_uring_cqe)) ||
-        ring_view.sqes_length != (size_t)params->sq_entries * sizeof(struct io_uring_sqe))
+                     params->cq_entries * sizeof(struct io_uring_cqe)) ||
+        ring_view.sqes_length != params->sq_entries * sizeof(struct io_uring_sqe))
         return 0;
 
-    char* sq = (char*)ring_view.sq_ring;
-    char* cq = (char*)ring_view.cq_ring;
+    char* sq = ring_view.sq_ring;
+    char* cq = ring_view.cq_ring;
     const uint32_t sq_entries =
         __atomic_load_n((uint32_t*)(sq + params->sq_off.ring_entries), __ATOMIC_ACQUIRE);
     const uint32_t sq_mask =
@@ -556,7 +555,7 @@ static int pbuf_registration_valid(const struct io_uring_buf_reg* registration) 
         ring_view.buffer_data_length != RUT_GATE_PBUF_DATA_SIZE ||
         ring_view.buffer_ring_mapping == 0 ||
         ring_view.buffer_ring_length != RUT_GATE_PBUF_RING_SIZE ||
-        registration->ring_addr != (uint64_t)(uintptr_t)ring_view.buffer_ring_mapping ||
+        registration->ring_addr != (uintptr_t)ring_view.buffer_ring_mapping ||
         registration->ring_entries != RUT_GATE_BUFFER_COUNT ||
         registration->bgid != RUT_GATE_BUFFER_GROUP || registration->flags != 0 ||
         !pbuf_registration_reserved_bytes_zero(registration) ||
@@ -627,13 +626,12 @@ void* mmap(void* address, size_t length, int protection, int flags, int fd, off_
         if ((uint64_t)offset == IORING_OFF_SQ_RING && owner_death != 0 &&
             strcmp(owner_death, "1") == 0)
             (void)rut_gate_kernel_syscall(SYS_exit_group, 86, 0, 0, 0, 0, 0);
-        const size_t expected_sq_length = (size_t)ring_view.params.sq_off.array +
-                                          (size_t)ring_view.params.sq_entries * sizeof(uint32_t);
-        const size_t expected_cq_length =
-            (size_t)ring_view.params.cq_off.cqes +
-            (size_t)ring_view.params.cq_entries * sizeof(struct io_uring_cqe);
+        const size_t expected_sq_length =
+            ring_view.params.sq_off.array + ring_view.params.sq_entries * sizeof(uint32_t);
+        const size_t expected_cq_length = ring_view.params.cq_off.cqes +
+                                          ring_view.params.cq_entries * sizeof(struct io_uring_cqe);
         const size_t expected_sqes_length =
-            (size_t)ring_view.params.sq_entries * sizeof(struct io_uring_sqe);
+            ring_view.params.sq_entries * sizeof(struct io_uring_sqe);
         if (!ring_view.setup_valid || address != 0 || protection != (PROT_READ | PROT_WRITE) ||
             flags != (MAP_SHARED | MAP_POPULATE)) {
             fail_locked(RUT_IOURING_GATE_ERROR_RING);
@@ -699,7 +697,7 @@ static int inspect_submission(uint32_t to_submit) {
         return 0;
     }
     const char* expected = "HTTP/1.1 502 ";
-    char* sq = (char*)ring_view.sq_ring;
+    char* sq = ring_view.sq_ring;
     uint32_t* head = (uint32_t*)(sq + ring_view.params.sq_off.head);
     uint32_t* tail = (uint32_t*)(sq + ring_view.params.sq_off.tail);
     uint32_t* mask = (uint32_t*)(sq + ring_view.params.sq_off.ring_mask);
@@ -883,7 +881,7 @@ static int inspect_submission(uint32_t to_submit) {
         gate->sq_tail_at_hit = last;
         gate->intercepted_prefix_length = expected_length;
         memcpy(gate->intercepted_prefix, expected, expected_length);
-        char* cq = (char*)ring_view.cq_ring;
+        char* cq = ring_view.cq_ring;
         uint32_t* cq_head = (uint32_t*)(cq + ring_view.params.cq_off.head);
         gate->cq_head_at_hit = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
         uint32_t armed = RUT_DOWNSTREAM_GATE_ARMED;
@@ -940,7 +938,7 @@ static int inspect_submission(uint32_t to_submit) {
         gate->sq_tail_at_hit = last;
         gate->ingress_recv_sqe_count = ingress_recv_count;
         gate->ingress_send_sqe_count = ingress_send_count;
-        char* cq = (char*)ring_view.cq_ring;
+        char* cq = ring_view.cq_ring;
         uint32_t* cq_head = (uint32_t*)(cq + ring_view.params.cq_off.head);
         gate->cq_head_at_hit = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
         uint32_t armed = RUT_DOWNSTREAM_GATE_ARMED;
@@ -964,7 +962,7 @@ static int inspect_submission(uint32_t to_submit) {
 
 static const unsigned char* buffer_bytes(uint16_t wanted) {
     uint64_t base = ring_view.buffer_ring->bufs[0].addr;
-    if (base != (uint64_t)(uintptr_t)ring_view.buffer_data_mapping) return 0;
+    if (base != (uintptr_t)ring_view.buffer_data_mapping) return 0;
     for (uint32_t i = 0; i < ring_view.buffer_entries; i++) {
         const struct io_uring_buf* buffer = &ring_view.buffer_ring->bufs[i];
         if (buffer->bid != i || buffer->len != RUT_GATE_BUFFER_SIZE ||
@@ -979,7 +977,7 @@ static int witness_request_two(void) {
     if (gate->request_two_length == 0 ||
         gate->request_two_length > RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY)
         return 0;
-    char* cq = (char*)ring_view.cq_ring;
+    char* cq = ring_view.cq_ring;
     uint32_t* head = (uint32_t*)(cq + ring_view.params.cq_off.head);
     uint32_t* tail = (uint32_t*)(cq + ring_view.params.cq_off.tail);
     uint32_t* mask = (uint32_t*)(cq + ring_view.params.cq_off.ring_mask);
@@ -1019,11 +1017,11 @@ static int witness_request_two(void) {
                     fail(RUT_IOURING_GATE_ERROR_BUFFER);
                     return 0;
                 }
-                if (memcmp(bytes, gate->request_two + copied, (size_t)cqe->res) != 0) {
+                if (memcmp(bytes, gate->request_two + copied, cqe->res) != 0) {
                     fail(RUT_IOURING_GATE_ERROR_REQUEST_MISMATCH);
                     return 0;
                 }
-                memcpy(gate->witness_wire + copied, bytes, (size_t)cqe->res);
+                memcpy(gate->witness_wire + copied, bytes, cqe->res);
                 copied += (uint32_t)cqe->res;
                 fragments++;
                 if (copied < gate->request_two_length && (cqe->flags & IORING_CQE_F_MORE) == 0) {
@@ -1031,8 +1029,7 @@ static int witness_request_two(void) {
                     return 0;
                 }
             } else {
-                const uint64_t timer =
-                    ((uint64_t)RUT_GATE_TIMER_CONN_ID << 8) | RUT_GATE_TIMEOUT_EVENT;
+                const uint64_t timer = (RUT_GATE_TIMER_CONN_ID << 8) | RUT_GATE_TIMEOUT_EVENT;
                 if (timer_seen || cqe->user_data != timer || cqe->flags != 0 || cqe->res != 8) {
                     fail(RUT_IOURING_GATE_ERROR_CQ);
                     return 0;
@@ -1235,7 +1232,7 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
         if (!ready_mask_mutation_injected && mutate != 0 && strcmp(mutate, "1") == 0 &&
             rut_downstream_gate_load(&gate->ring_ready) == 1) {
             ready_mask_mutation_injected = 1;
-            char* sq = (char*)ring_view.sq_ring;
+            char* sq = ring_view.sq_ring;
             uint32_t* mask = (uint32_t*)(sq + ring_view.params.sq_off.ring_mask);
             const uint32_t original = __atomic_load_n(mask, __ATOMIC_ACQUIRE);
             __atomic_store_n(mask, original ^ 1U, __ATOMIC_RELEASE);

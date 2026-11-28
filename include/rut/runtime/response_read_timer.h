@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/io_event.h"
 
 #include <stdint.h>
@@ -8,18 +10,18 @@ namespace rut {
 
 // An early completion rearms for the remaining interval, rounded up to a
 // millisecond. Missing, unrepresentable or elapsed deadlines cannot rearm.
-constexpr u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
+[[nodiscard]] constexpr u32 response_read_timer_remaining_ms(u64 last_progress_ns,
+                                                             u64 timeout_ns,
+                                                             u64 now_ns) {
     u64 deadline = 0;
-    if (last_progress_ns == 0 || __builtin_add_overflow(last_progress_ns, timeout_ns, &deadline) ||
+    // RUT_INTEGER_RANGE: both timestamps can use the full u64 range.
+    if (last_progress_ns == 0 || add_overflow(last_progress_ns, timeout_ns, &deadline) ||
         now_ns >= deadline)
         return 0;
-    u64 remaining = 0;
-    (void)__builtin_sub_overflow(deadline, now_ns, &remaining);
-    u64 rounded = 0;
-    (void)__builtin_sub_overflow(remaining, 1, &rounded);
-    (void)__builtin_add_overflow(rounded / 1'000'000, 1, &rounded);
-    const u64 kMillis = rounded;
-    return kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis);
+    // The guard establishes now_ns < deadline, so both differences fit u64.
+    const u64 kRounded = wrapping_sub(wrapping_sub(deadline, now_ns), u64{1});
+    const auto kMillis = bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{};
+    return kMillis.min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}).to<u32>();
 }
 
 // Batch evidence records which completions arrived, including rejected ones.
@@ -52,11 +54,12 @@ enum class TimerCompletion : u8 { Rejected, Pending, Drained };
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wswitch-enum"
 #pragma GCC diagnostic error "-Wswitch"
-constexpr TimerCompletion consume_response_read_timer_owner(ResponseReadTimerPhase phase,
-                                                            u32 owner_generation,
-                                                            u32 tagged_generation,
-                                                            bool& target_owned,
-                                                            bool& cancel_owned) {
+[[nodiscard]] constexpr TimerCompletion consume_response_read_timer_owner(
+    ResponseReadTimerPhase phase,
+    u32 owner_generation,
+    u32 tagged_generation,
+    bool* target_owned,
+    bool* cancel_owned) {
     const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
     if (generation == 0 || generation != owner_generation) return TimerCompletion::Rejected;
     const bool cancel = (tagged_generation & kResponseReadTimerCancelBit) != 0;
@@ -64,17 +67,17 @@ constexpr TimerCompletion consume_response_read_timer_owner(ResponseReadTimerPha
         case ResponseReadTimerPhase::None:
             return TimerCompletion::Rejected;
         case ResponseReadTimerPhase::Armed:
-            if (cancel || cancel_owned) return TimerCompletion::Rejected;
+            if (cancel || *cancel_owned) return TimerCompletion::Rejected;
             break;
         case ResponseReadTimerPhase::CancelPending:
             break;
         default:
             return TimerCompletion::Rejected;
     }
-    bool& owned = cancel ? cancel_owned : target_owned;
-    if (!owned) return TimerCompletion::Rejected;
-    owned = false;
-    return target_owned || cancel_owned ? TimerCompletion::Pending : TimerCompletion::Drained;
+    bool* owned = cancel ? cancel_owned : target_owned;
+    if (!*owned) return TimerCompletion::Rejected;
+    *owned = false;
+    return *target_owned || *cancel_owned ? TimerCompletion::Pending : TimerCompletion::Drained;
 }
 #pragma GCC diagnostic pop
 

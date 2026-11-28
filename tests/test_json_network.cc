@@ -35,7 +35,7 @@ static bool slice_is_in_use(const SlicePool& pool, const u8* ptr) {
     if (!ptr || !pool.base || !pool.in_use_map || pool.count == 0) return false;
     const u64 base = reinterpret_cast<u64>(pool.base);
     const u64 address = reinterpret_cast<u64>(ptr);
-    const u64 bytes = static_cast<u64>(pool.count) * SlicePool::kSliceSize;
+    const u64 bytes = u64{pool.count} * SlicePool::kSliceSize;
     if (address < base || address - base >= bytes) return false;
     const u64 offset = address - base;
     if (offset % SlicePool::kSliceSize != 0) return false;
@@ -254,8 +254,8 @@ TEST(json_network, large_http2_dynamic_body_survives_flow_control) {
     CHECK_EQ(h2_pump_outbound(*h2, response, sizeof(response), status), 0u);
     CHECK(status == H2PumpStatus::Blocked);
     while (h2->outbound_stream != 0) {
-        h2->conn_send_window = static_cast<i32>(kBodySize);
-        h2->streams[0].send_window = static_cast<i32>(kBodySize);
+        h2->conn_send_window = i32{kBodySize};
+        h2->streams[0].send_window = i32{kBodySize};
         const u32 written = h2_pump_outbound(*h2, response, sizeof(response), status);
         REQUIRE(written >= kFrameHeaderSize);
         REQUIRE_EQ(response[3], static_cast<u8>(Http2FrameType::Data));

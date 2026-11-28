@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "runtime/simd/simd.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_canon.h"
 
@@ -31,14 +32,13 @@ static inline u64 load_u64(const u8* p) {
 }
 
 static constexpr u32 u32_lit(char a, char b, char c, char d) {
-    return static_cast<u32>(static_cast<u8>(a)) | (static_cast<u32>(static_cast<u8>(b)) << 8) |
-           (static_cast<u32>(static_cast<u8>(c)) << 16) |
-           (static_cast<u32>(static_cast<u8>(d)) << 24);
+    return range_int{byte_value(a)}.to<u32>() | (range_int{byte_value(b)}.to<u32>() << 8) |
+           (range_int{byte_value(c)}.to<u32>() << 16) | (range_int{byte_value(d)}.to<u32>() << 24);
 }
 
 static constexpr u64 u64_lit(const char* s) {
     u64 v = 0;
-    for (int i = 0; i < 8; i++) v |= static_cast<u64>(static_cast<u8>(s[i])) << (i * 8);
+    for (int i = 0; i < 8; i++) v |= range_int{byte_value(s[i])}.to_u64() << (i * 8);
     return v;
 }
 
@@ -47,24 +47,25 @@ static constexpr u64 u64_lit(const char* s) {
 // ============================================================================
 
 static inline bool str_ci_eq(const u8* a, const char* b, u32 len) {
+    const i64 input_length = range_int{len}.to<i64>();
     constexpr u64 kMask8 = 0x2020202020202020ULL;
     constexpr u32 kMask4 = 0x20202020U;
     i64 i = 0;
-    for (; i + 8 <= static_cast<i64>(len); i += 8) {
+    for (; i + 8 <= input_length; i += 8) {
         u64 va = load_u64(a + i);
         u64 vb;
         __builtin_memcpy(&vb, b + i, 8);
         if ((va | kMask8) != (vb | kMask8)) return false;
     }
-    if (i + 4 <= static_cast<i64>(len)) {
+    if (i + 4 <= input_length) {
         u32 va = load_u32(a + i);
         u32 vb;
         __builtin_memcpy(&vb, b + i, 4);
         if ((va | kMask4) != (vb | kMask4)) return false;
         i += 4;
     }
-    for (; i < static_cast<i64>(len); i++) {
-        if ((a[i] | 0x20) != (static_cast<u8>(b[i]) | 0x20)) return false;
+    for (; i < input_length; i++) {
+        if ((a[i] | 0x20) != (byte_value(b[i]) | 0x20)) return false;
     }
     return true;
 }
@@ -75,18 +76,18 @@ static inline bool str_ci_eq(const u8* a, const char* b, u32 len) {
 
 // Parse a decimal unsigned integer from `p[0..len)`.
 // Returns the parsed value, or error on empty input, non-digit, or overflow.
-static inline core::Expected<u32, Error> parse_uint(const u8* p, u32 len) {
+[[nodiscard]] static inline core::Expected<i64, Error> parse_uint(const u8* p, u32 len) {
     if (UNLIKELY(len == 0))
         return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
-    u32 val = 0;
+    i64 val = 0;
     for (u32 i = 0; i < len; i++) {
-        const i64 d = static_cast<i64>(p[i]) - '0';
-        if (UNLIKELY(d < 0 || d > 9))
+        const auto digit = range_int(p[i]) - range_int<'0', '1'>{};
+        if (UNLIKELY(digit.value() < 0 || digit.value() > 9))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
-        // Pre-multiply overflow check: val * 10 + d <= 0xFFFFFFFF
-        if (UNLIKELY(static_cast<i64>(val) > (0xFFFFFFFFLL - d) / 10))
+        const i64 kDigit = digit.value();
+        if (UNLIKELY(val > (INT64_MAX - kDigit) / 10))
             return core::make_unexpected(Error::make(ERANGE, Error::Source::HttpParser));
-        val = static_cast<u32>(static_cast<i64>(val) * 10 + d);
+        val = val * 10 + kDigit;
     }
     return val;
 }
@@ -99,62 +100,59 @@ static inline core::Expected<u32, Error> parse_uint(const u8* p, u32 len) {
 // ============================================================================
 
 static inline HttpMethod parse_method_direct(const u8* buf, u32 end, u32& pos) {
-    if (UNLIKELY(static_cast<i64>(pos) + 4 > static_cast<i64>(end))) return HttpMethod::Unknown;
+    if (UNLIKELY(end < 4)) return HttpMethod::Unknown;
 
     // Fast path: load first 4 bytes and dispatch
-    u32 v4 = load_u32(buf + static_cast<i64>(pos));
+    u32 v4 = load_u32(buf);
 
     // 3-byte methods: "GET " or "PUT "
     if (v4 == u32_lit('G', 'E', 'T', ' ')) {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 4);
+        pos = 4;
         return HttpMethod::GET;
     }
     if (v4 == u32_lit('P', 'U', 'T', ' ')) {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 4);
+        pos = 4;
         return HttpMethod::PUT;
     }
 
     // 4-byte methods: "POST" + ' ' or "HEAD" + ' '
-    if (UNLIKELY(static_cast<i64>(pos) + 5 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    if (v4 == u32_lit('P', 'O', 'S', 'T') && buf[static_cast<i64>(pos) + 4] == ' ') {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 5);
+    if (UNLIKELY(end < 5)) return HttpMethod::Unknown;
+    if (v4 == u32_lit('P', 'O', 'S', 'T') && buf[4] == ' ') {
+        pos = 5;
         return HttpMethod::POST;
     }
-    if (v4 == u32_lit('H', 'E', 'A', 'D') && buf[static_cast<i64>(pos) + 4] == ' ') {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 5);
+    if (v4 == u32_lit('H', 'E', 'A', 'D') && buf[4] == ' ') {
+        pos = 5;
         return HttpMethod::HEAD;
     }
 
     // 5-byte methods
-    if (UNLIKELY(static_cast<i64>(pos) + 6 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    if (v4 == u32_lit('P', 'A', 'T', 'C') && buf[static_cast<i64>(pos) + 4] == 'H' &&
-        buf[static_cast<i64>(pos) + 5] == ' ') {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 6);
+    if (UNLIKELY(end < 6)) return HttpMethod::Unknown;
+    if (v4 == u32_lit('P', 'A', 'T', 'C') && buf[4] == 'H' && buf[5] == ' ') {
+        pos = 6;
         return HttpMethod::PATCH;
     }
-    if (v4 == u32_lit('T', 'R', 'A', 'C') && buf[static_cast<i64>(pos) + 4] == 'E' &&
-        buf[static_cast<i64>(pos) + 5] == ' ') {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 6);
+    if (v4 == u32_lit('T', 'R', 'A', 'C') && buf[4] == 'E' && buf[5] == ' ') {
+        pos = 6;
         return HttpMethod::TRACE;
     }
 
     // 6-byte method: "DELETE"
-    if (UNLIKELY(static_cast<i64>(pos) + 7 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    if (v4 == u32_lit('D', 'E', 'L', 'E') && buf[static_cast<i64>(pos) + 4] == 'T' &&
-        buf[static_cast<i64>(pos) + 5] == 'E' && buf[static_cast<i64>(pos) + 6] == ' ') {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 7);
+    if (UNLIKELY(end < 7)) return HttpMethod::Unknown;
+    if (v4 == u32_lit('D', 'E', 'L', 'E') && buf[4] == 'T' && buf[5] == 'E' && buf[6] == ' ') {
+        pos = 7;
         return HttpMethod::DELETE;
     }
 
     // 7-byte methods: "OPTIONS" or "CONNECT"
-    if (UNLIKELY(static_cast<i64>(pos) + 8 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    u32 hi = load_u32(buf + static_cast<i64>(pos) + 4);
+    if (UNLIKELY(end < 8)) return HttpMethod::Unknown;
+    u32 hi = load_u32(buf + 4);
     if (v4 == u32_lit('O', 'P', 'T', 'I') && hi == u32_lit('O', 'N', 'S', ' ')) {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 8);
+        pos = 8;
         return HttpMethod::OPTIONS;
     }
     if (v4 == u32_lit('C', 'O', 'N', 'N') && hi == u32_lit('E', 'C', 'T', ' ')) {
-        pos = static_cast<u32>(static_cast<i64>(pos) + 8);
+        pos = 8;
         return HttpMethod::CONNECT;
     }
 
@@ -168,7 +166,7 @@ static inline HttpMethod parse_method_direct(const u8* buf, u32 end, u32& pos) {
 // Version + CRLF: check "HTTP/1.1\r\n" or "HTTP/1.0\r\n" as u64 + u16
 static constexpr u64 kHttp11 = u64_lit("HTTP/1.1");
 static constexpr u64 kHttp10 = u64_lit("HTTP/1.0");
-static constexpr u16 kCRLF = static_cast<u16>('\r') | (static_cast<u16>('\n') << 8);
+static constexpr u16 kCRLF = u16{'\r'} | (u16{'\n'} << 8);
 
 // ============================================================================
 // Inline fast-path scanners for short data
@@ -189,17 +187,17 @@ static inline u32 fast_scan_header_name(const u8* buf, u32 pos, u32 end) {
 
 // Connection: comma-separated token parsing (handles "close, upgrade" etc.)
 static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req) {
+    const i64 value_length = range_int{vlen}.to<i64>();
     i64 i = 0;
-    while (i < static_cast<i64>(vlen)) {
+    while (i < value_length) {
         // Skip leading OWS and commas
-        while (i < static_cast<i64>(vlen) && (val[i] == ' ' || val[i] == '\t' || val[i] == ','))
-            i++;
-        if (i >= static_cast<i64>(vlen)) break;
+        while (i < value_length && (val[i] == ' ' || val[i] == '\t' || val[i] == ',')) i++;
+        if (i >= value_length) break;
 
         // Find end of token
         i64 tok_start = i;
-        while (i < static_cast<i64>(vlen) && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
-        u32 tok_len = static_cast<u32>(i - tok_start);
+        while (i < value_length && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
+        const i64 tok_len = i - tok_start;
 
         if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             req->keep_alive = false;
@@ -236,17 +234,17 @@ static inline bool is_transfer_coding_token_char(u8 c) {
 // separately below; HTTP/1 dispatch admits only the classified final-chunked
 // subset and rejects unsupported or ambiguous framing before routing.
 static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, u32 vlen) {
+    const i64 value_length = range_int{vlen}.to<i64>();
     if (vlen == 0) return RequestTransferEncoding::Unsupported;
     bool saw_token = false;
     bool saw_chunked = false;
     i64 i = 0;
     for (;;) {
-        while (i < static_cast<i64>(vlen) && (val[i] == ' ' || val[i] == '\t')) i++;
-        if (i == static_cast<i64>(vlen) || val[i] == ',')
-            return RequestTransferEncoding::Unsupported;
+        while (i < value_length && (val[i] == ' ' || val[i] == '\t')) i++;
+        if (i == value_length || val[i] == ',') return RequestTransferEncoding::Unsupported;
 
         const i64 start = i;
-        while (i < static_cast<i64>(vlen) && is_transfer_coding_token_char(val[i])) i++;
+        while (i < value_length && is_transfer_coding_token_char(val[i])) i++;
         if (i == start) return RequestTransferEncoding::Unsupported;
         saw_token = true;
         const bool is_chunked = i - start == 7 && str_ci_eq(val + start, "chunked", 7);
@@ -255,8 +253,8 @@ static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, 
             saw_chunked = true;
         }
 
-        while (i < static_cast<i64>(vlen) && (val[i] == ' ' || val[i] == '\t')) i++;
-        if (i == static_cast<i64>(vlen))
+        while (i < value_length && (val[i] == ' ' || val[i] == '\t')) i++;
+        if (i == value_length)
             return saw_token && saw_chunked ? RequestTransferEncoding::FinalChunked
                                             : RequestTransferEncoding::Unsupported;
         if (val[i] != ',') return RequestTransferEncoding::Unsupported;
@@ -271,6 +269,7 @@ static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, 
 // Returns quickly for non-semantic headers via first-byte + length dispatch.
 static inline ParseStatus apply_semantic_header(
     const u8* name, u32 name_len, const u8* val, u32 vlen, ParsedRequest* req) {
+    const i64 value_length = range_int{vlen}.to<i64>();
     // Dispatch on (first_byte | 0x20) and length for fast rejection
     u8 first = name[0] | 0x20;
 
@@ -302,16 +301,14 @@ static inline ParseStatus apply_semantic_header(
             }
             // Parse as comma-separated token list, match full "chunked" token
             i64 ti = 0;
-            while (ti < static_cast<i64>(vlen)) {
-                while (ti < static_cast<i64>(vlen) &&
-                       (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ','))
+            while (ti < value_length) {
+                while (ti < value_length && (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ','))
                     ti++;
-                if (ti >= static_cast<i64>(vlen)) break;
+                if (ti >= value_length) break;
                 i64 tok_start = ti;
-                while (ti < static_cast<i64>(vlen) && val[ti] != ',' && val[ti] != ' ' &&
-                       val[ti] != '\t')
+                while (ti < value_length && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t')
                     ti++;
-                u32 tok_len = static_cast<u32>(ti - tok_start);
+                const i64 tok_len = ti - tok_start;
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
                     req->chunked = true;
                     break;
@@ -326,27 +323,23 @@ static inline ParseStatus apply_semantic_header(
             // interpretation for passthrough routes; terminate-mode WebSocket eligibility
             // separately requires an exact comma-list item below.
             i64 i = 0;
-            while (i < static_cast<i64>(vlen)) {
-                while (i < static_cast<i64>(vlen) &&
-                       (val[i] == ' ' || val[i] == '\t' || val[i] == ','))
-                    i++;
-                if (i >= static_cast<i64>(vlen)) break;
-                while (i < static_cast<i64>(vlen) && val[i] != ',' && val[i] != ' ' &&
-                       val[i] != '\t')
-                    i++;
+            while (i < value_length) {
+                while (i < value_length && (val[i] == ' ' || val[i] == '\t' || val[i] == ',')) i++;
+                if (i >= value_length) break;
+                while (i < value_length && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
                 req->has_upgrade_header = true;
             }
             i = 0;
-            while (i <= static_cast<i64>(vlen)) {
+            while (i <= value_length) {
                 const i64 kItemStart = i;
-                while (i < static_cast<i64>(vlen) && val[i] != ',') i++;
+                while (i < value_length && val[i] != ',') i++;
                 i64 end = i;
                 i64 start = kItemStart;
                 while (start < end && (val[start] == ' ' || val[start] == '\t')) start++;
                 while (end > start && (val[end - 1] == ' ' || val[end - 1] == '\t')) end--;
                 if (end - start == 9 && str_ci_eq(val + start, "websocket", 9))
                     req->upgrade_is_websocket = true;
-                if (i == static_cast<i64>(vlen)) break;
+                if (i == value_length) break;
                 i++;
             }
             return ParseStatus::Complete;
@@ -365,6 +358,7 @@ static inline ParseStatus apply_semantic_header(
 // falls back to find_header_end() to disambiguate.
 
 ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
+    const i64 input_length = range_int{len}.to<i64>();
     header_end = 0;  // Clear on entry so stale values are never exposed on Incomplete/Error.
     req->reset();
 
@@ -405,27 +399,34 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         u32 uri_start = pos;
         u32 canon_end = 0;
         u32 uri_end = simd::scan_uri(buf, pos, len, &canon_end);
-        if (uri_end == static_cast<u32>(-1)) return ParseStatus::Error;
+        if (uri_end == UINT32_MAX) return ParseStatus::Error;
         if (UNLIKELY(uri_end >= len)) goto maybe_incomplete;
-        if (UNLIKELY(uri_end == uri_start)) return ParseStatus::Error;
-        req->path = {reinterpret_cast<const char*>(buf + static_cast<i64>(uri_start)),
-                     static_cast<u32>(static_cast<i64>(uri_end) - static_cast<i64>(uri_start))};
-        for (i64 i = uri_start; i < static_cast<i64>(uri_end); i++)
+        u32 uri_length;
+        if (UNLIKELY(uri_end == uri_start ||
+                     !(range_int(uri_end) - range_int(uri_start)).to(&uri_length)))
+            return ParseStatus::Error;
+        req->path = {reinterpret_cast<const char*>(buf + range_int{uri_start}.index()), uri_length};
+        for (i64 i = uri_start; i < range_int{uri_end}.to<i64>(); i++)
             req->target_has_fragment |= buf[i] == '#';
         if (buf[uri_start] == '/') {
+            u32 canonical_length;
+            if (UNLIKELY(canon_end > uri_end ||
+                         !(range_int(canon_end) - range_int(uri_start)).to(&canonical_length)))
+                return ParseStatus::Error;
             req->path_canon = finalize_path_canonical(
-                reinterpret_cast<const char*>(buf + static_cast<i64>(uri_start)),
-                static_cast<u32>(static_cast<i64>(canon_end) - static_cast<i64>(uri_start)));
+                reinterpret_cast<const char*>(buf + range_int{uri_start}.index()),
+                canonical_length);
         }
-        pos = static_cast<u32>(static_cast<i64>(uri_end) + 1);
+        pos = (range_int(uri_end) + range_int<1, 2>{}).min(range_int(len)).to<u32>();
     }
 
     // Version + CRLF
-    if (UNLIKELY(static_cast<i64>(pos) + 10 > static_cast<i64>(len))) goto maybe_incomplete;
+    if (UNLIKELY((range_int{pos} + range_int<10, 11>{}).to<i64>() > input_length))
+        goto maybe_incomplete;
     {
-        u64 ver = load_u64(buf + static_cast<i64>(pos));
+        u64 ver = load_u64(buf + range_int{pos}.index());
         u16 crlf_val;
-        __builtin_memcpy(&crlf_val, buf + static_cast<i64>(pos) + 8, 2);
+        __builtin_memcpy(&crlf_val, buf + (range_int{pos} + range_int<8, 9>{}).index(), 2);
         if (UNLIKELY(crlf_val != kCRLF)) return ParseStatus::Error;
         if (LIKELY(ver == kHttp11)) {
             req->version = HttpVersion::Http11;
@@ -437,19 +438,19 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
             return ParseStatus::Error;
         }
     }
-    pos = static_cast<u32>(static_cast<i64>(pos) + 10);
+    pos = (range_int(pos) + range_int<10, 11>{}).min(range_int(len)).to<u32>();
 
     // --- Headers (single-pass) ---
     for (;;) {
         // Need at least 2 bytes to check for end-of-headers or start of a header
-        if (UNLIKELY(static_cast<i64>(pos) + 2 > static_cast<i64>(len))) {
+        if (UNLIKELY((range_int{pos} + range_int<2, 3>{}).to<i64>() > input_length)) {
             return ParseStatus::Incomplete;
         }
 
         // End of headers?
         if (buf[pos] == '\r') {
-            if (LIKELY(buf[static_cast<i64>(pos) + 1] == '\n')) {
-                pos = static_cast<u32>(static_cast<i64>(pos) + 2);
+            if (LIKELY(buf[(range_int{pos} + range_int<1, 2>{}).index()] == '\n')) {
+                pos = (range_int(pos) + range_int<2, 3>{}).min(range_int(len)).to<u32>();
                 break;
             }
             return ParseStatus::Error;
@@ -458,63 +459,70 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         // Header name — inline fast path
         u32 name_start = pos;
         u32 colon_pos = fast_scan_header_name(buf, pos, len);
-        if (UNLIKELY(colon_pos == static_cast<u32>(-1))) goto maybe_incomplete;
-        if (UNLIKELY(colon_pos == name_start)) return ParseStatus::Error;
-        u32 name_len = static_cast<u32>(static_cast<i64>(colon_pos) - static_cast<i64>(name_start));
-        pos = static_cast<u32>(static_cast<i64>(colon_pos) + 1);
+        if (UNLIKELY(colon_pos == UINT32_MAX)) goto maybe_incomplete;
+        u32 name_len;
+        if (UNLIKELY(colon_pos == name_start ||
+                     !(range_int(colon_pos) - range_int(name_start)).to(&name_len)))
+            return ParseStatus::Error;
+        pos = (range_int(colon_pos) + range_int<1, 2>{}).min(range_int(len)).to<u32>();
         const u32 raw_value_start = pos;
 
         // Skip OWS — hot path: single space after colon
         if (UNLIKELY(pos >= len)) goto maybe_incomplete;
         if (LIKELY(buf[pos] == ' ')) {
-            pos = static_cast<u32>(static_cast<i64>(pos) + 1);
+            ++pos;
         }
-        while (UNLIKELY(pos < len && (buf[pos] == ' ' || buf[pos] == '\t')))
-            pos = static_cast<u32>(static_cast<i64>(pos) + 1);
+        while (UNLIKELY(pos < len && (buf[pos] == ' ' || buf[pos] == '\t'))) ++pos;
         if (UNLIKELY(pos >= len)) goto maybe_incomplete;
 
         {
             // Header value — SIMD scan for \r
             u32 value_start = pos;
             u32 cr_pos = simd::scan_header_value(buf, pos, len);
-            if (cr_pos == static_cast<u32>(-1)) return ParseStatus::Error;
-            if (UNLIKELY(cr_pos >= len || static_cast<i64>(cr_pos) + 1 >= static_cast<i64>(len)))
-                goto maybe_incomplete;
-            if (UNLIKELY(buf[static_cast<i64>(cr_pos) + 1] != '\n')) return ParseStatus::Error;
+            if (cr_pos == UINT32_MAX) return ParseStatus::Error;
+            const auto after_cr = range_int{cr_pos} + range_int<1, 2>{};
+            if (UNLIKELY(after_cr.to<i64>() >= input_length)) goto maybe_incomplete;
+            if (UNLIKELY(buf[after_cr.index()] != '\n')) return ParseStatus::Error;
             pos = cr_pos;
 
             // Trim trailing OWS
             u32 value_end = pos;
-            if (UNLIKELY(value_end > value_start && buf[static_cast<i64>(value_end) - 1] <= ' ')) {
-                while (value_end > value_start && (buf[static_cast<i64>(value_end) - 1] == ' ' ||
-                                                   buf[static_cast<i64>(value_end) - 1] == '\t')) {
-                    value_end = static_cast<u32>(static_cast<i64>(value_end) - 1);
+            if (UNLIKELY(value_end > value_start &&
+                         buf[range_int{value_end}.to<i64>() - 1] <= ' ')) {
+                while (value_end > value_start &&
+                       (buf[range_int{value_end}.to<i64>() - 1] == ' ' ||
+                        buf[range_int{value_end}.to<i64>() - 1] == '\t')) {
+                    --value_end;
                 }
             }
+
+            u32 value_len;
+            u32 raw_value_len;
+            if (UNLIKELY(!(range_int(value_end) - range_int(value_start)).to(&value_len) ||
+                         !(range_int(cr_pos) - range_int(raw_value_start)).to(&raw_value_len)))
+                return ParseStatus::Error;
 
             // Store header
             if (UNLIKELY(hdr_count >= kMaxHeaders)) return ParseStatus::Error;
             headers[hdr_count].name = {
-                reinterpret_cast<const char*>(buf + static_cast<i64>(name_start)), name_len};
+                reinterpret_cast<const char*>(buf + range_int{name_start}.index()), name_len};
             headers[hdr_count].value = {
-                reinterpret_cast<const char*>(buf + static_cast<i64>(value_start)),
-                static_cast<u32>(static_cast<i64>(value_end) - static_cast<i64>(value_start))};
+                reinterpret_cast<const char*>(buf + range_int{value_start}.index()), value_len};
             headers[hdr_count].raw_value = {
-                reinterpret_cast<const char*>(buf + static_cast<i64>(raw_value_start)),
-                static_cast<u32>(static_cast<i64>(cr_pos) - static_cast<i64>(raw_value_start))};
+                reinterpret_cast<const char*>(buf + range_int{raw_value_start}.index()),
+                raw_value_len};
             hdr_count++;
 
             // Semantic header detection
-            ParseStatus sem = apply_semantic_header(
-                buf + static_cast<i64>(name_start),
-                name_len,
-                buf + static_cast<i64>(value_start),
-                static_cast<u32>(static_cast<i64>(value_end) - static_cast<i64>(value_start)),
-                req);
+            ParseStatus sem = apply_semantic_header(buf + range_int{name_start}.index(),
+                                                    name_len,
+                                                    buf + range_int{value_start}.index(),
+                                                    value_len,
+                                                    req);
             if (UNLIKELY(sem == ParseStatus::Error)) return ParseStatus::Error;
         }
 
-        pos = static_cast<u32>(static_cast<i64>(pos) + 2);  // skip \r\n
+        pos = (range_int(pos) + range_int<2, 3>{}).min(range_int(len)).to<u32>();  // skip \r\n
     }
 
     req->header_count = hdr_count;
@@ -546,17 +554,17 @@ maybe_incomplete:
 
 // Connection header parsing for responses (sets both keep_alive and connection_close).
 static inline void match_connection_response(const u8* val, u32 vlen, ParsedResponse* resp) {
+    const i64 value_length = range_int{vlen}.to<i64>();
     i64 i = 0;
-    while (i < static_cast<i64>(vlen)) {
+    while (i < value_length) {
         // Skip leading OWS and commas
-        while (i < static_cast<i64>(vlen) && (val[i] == ' ' || val[i] == '\t' || val[i] == ','))
-            i++;
-        if (i >= static_cast<i64>(vlen)) break;
+        while (i < value_length && (val[i] == ' ' || val[i] == '\t' || val[i] == ',')) i++;
+        if (i >= value_length) break;
 
         // Find end of token
         i64 tok_start = i;
-        while (i < static_cast<i64>(vlen) && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
-        u32 tok_len = static_cast<u32>(i - tok_start);
+        while (i < value_length && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
+        const i64 tok_len = i - tok_start;
 
         if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             resp->connection_close = true;
@@ -571,6 +579,7 @@ static inline void match_connection_response(const u8* val, u32 vlen, ParsedResp
 // Check and apply semantic headers for responses.
 static inline ParseStatus apply_semantic_header_response(
     const u8* name, u32 name_len, const u8* val, u32 vlen, ParsedResponse* resp) {
+    const i64 value_length = range_int{vlen}.to<i64>();
     u8 first = name[0] | 0x20;
 
     if (first == 'c') {
@@ -592,16 +601,14 @@ static inline ParseStatus apply_semantic_header_response(
     } else if (first == 't') {
         if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
             i64 ti = 0;
-            while (ti < static_cast<i64>(vlen)) {
-                while (ti < static_cast<i64>(vlen) &&
-                       (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ','))
+            while (ti < value_length) {
+                while (ti < value_length && (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ','))
                     ti++;
-                if (ti >= static_cast<i64>(vlen)) break;
+                if (ti >= value_length) break;
                 i64 tok_start = ti;
-                while (ti < static_cast<i64>(vlen) && val[ti] != ',' && val[ti] != ' ' &&
-                       val[ti] != '\t')
+                while (ti < value_length && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t')
                     ti++;
-                u32 tok_len = static_cast<u32>(ti - tok_start);
+                const i64 tok_len = ti - tok_start;
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
                     resp->chunked = true;
                     break;
@@ -618,6 +625,7 @@ static inline ParseStatus apply_semantic_header_response(
 // ============================================================================
 
 ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* resp) {
+    const i64 input_length = range_int{len}.to<i64>();
     header_end = 0;
 
     // Minimum: "HTTP/1.x NNN\r\n\r\n" = 17 bytes for an empty-header response.
@@ -634,16 +642,16 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
     // --- Status line: HTTP/1.x SP NNN SP reason CRLF ---
 
     // Check "HTTP/1." prefix (7 bytes) via u64 load
-    if (UNLIKELY(static_cast<i64>(pos) + 10 > static_cast<i64>(len)))
+    if (UNLIKELY((range_int{pos} + range_int<10, 11>{}).to<i64>() > input_length))
         return ParseStatus::Incomplete;
     {
-        u64 ver_prefix = load_u64(buf + static_cast<i64>(pos));
+        u64 ver_prefix = load_u64(buf + range_int{pos}.index());
         // Mask off the version digit (byte 7) to check "HTTP/1."
         constexpr u64 kHttpSlash1Dot = u64_lit("HTTP/1.0") & 0x00FFFFFFFFFFFFFFULL;
         if (UNLIKELY((ver_prefix & 0x00FFFFFFFFFFFFFFULL) != kHttpSlash1Dot))
             return ParseStatus::Error;
 
-        u8 ver_digit = buf[static_cast<i64>(pos) + 7];
+        u8 ver_digit = buf[(range_int{pos} + range_int<7, 8>{}).index()];
         if (LIKELY(ver_digit == '1')) {
             resp->version = HttpVersion::Http11;
             resp->keep_alive = true;  // HTTP/1.1 default
@@ -654,52 +662,63 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
             return ParseStatus::Error;
         }
     }
-    pos = static_cast<u32>(static_cast<i64>(pos) + 8);  // past "HTTP/1.x"
+    pos = (range_int(pos) + range_int<8, 9>{}).min(range_int(len)).to<u32>();  // past "HTTP/1.x"
 
     // Expect SP
     if (UNLIKELY(buf[pos] != ' ')) return ParseStatus::Error;
-    pos = static_cast<u32>(static_cast<i64>(pos) + 1);
+    ++pos;
 
     // Parse 3-digit status code
-    if (UNLIKELY(static_cast<i64>(pos) + 3 > static_cast<i64>(len))) return ParseStatus::Incomplete;
+    if (UNLIKELY((range_int{pos} + range_int<3, 4>{}).to<i64>() > input_length))
+        return ParseStatus::Incomplete;
     {
-        const i64 d0 = static_cast<i64>(buf[pos]) - '0';
-        const i64 d1 = static_cast<i64>(buf[static_cast<i64>(pos) + 1]) - '0';
-        const i64 d2 = static_cast<i64>(buf[static_cast<i64>(pos) + 2]) - '0';
-        if (UNLIKELY(d0 < 0 || d0 > 9 || d1 < 0 || d1 > 9 || d2 < 0 || d2 > 9))
+        using Digit = range_int<0, 10>;
+        Digit hundreds, tens, units;
+        if (UNLIKELY(
+                !Digit::try_from_i64(range_int{buf[pos]}.to<i64>() - '0', &hundreds) ||
+                !Digit::try_from_i64(
+                    range_int{buf[(range_int{pos} + range_int<1, 2>{}).index()]}.to<i64>() - '0',
+                    &tens) ||
+                !Digit::try_from_i64(
+                    range_int{buf[(range_int{pos} + range_int<2, 3>{}).index()]}.to<i64>() - '0',
+                    &units)))
             return ParseStatus::Error;
-        u16 code = static_cast<u16>(d0 * 100 + d1 * 10 + d2);
-        if (UNLIKELY(code < 100 || code > 599)) return ParseStatus::Error;
-        resp->status_code = code;
+        const auto code = hundreds.scaled_by<100>() + tens.scaled_by<10>() + units;
+        if (UNLIKELY(code.value() < 100 || code.value() > 599)) return ParseStatus::Error;
+        resp->status_code = code.to<u16>();
     }
-    pos = static_cast<u32>(static_cast<i64>(pos) + 3);
+    pos = (range_int(pos) + range_int<3, 4>{}).min(range_int(len)).to<u32>();
 
     // Require the RFC status-line separator, then retain the exact reason phrase.
     if (UNLIKELY(pos >= len)) return ParseStatus::Incomplete;
     if (buf[pos] != ' ' && buf[pos] != '\r') return ParseStatus::Error;
     {
-        const u32 reason_start =
-            static_cast<u32>(static_cast<i64>(pos) + (buf[pos] == ' ' ? 1 : 0));
+        u32 reason_start = pos;
+        if (buf[pos] == ' ') ++reason_start;
         u32 scan = pos;
         while (scan < len && buf[scan] != '\r') scan++;
-        if (UNLIKELY(static_cast<i64>(scan) + 1 >= static_cast<i64>(len)))
+        if (UNLIKELY((range_int{scan} + range_int<1, 2>{}).to<i64>() >= input_length))
             return ParseStatus::Incomplete;
-        if (UNLIKELY(buf[static_cast<i64>(scan) + 1] != '\n')) return ParseStatus::Error;
-        resp->reason = {reinterpret_cast<const char*>(buf + static_cast<i64>(reason_start)),
-                        static_cast<u32>(static_cast<i64>(scan) - static_cast<i64>(reason_start))};
-        pos = static_cast<u32>(static_cast<i64>(scan) + 2);  // past \r\n
+        if (UNLIKELY(buf[(range_int{scan} + range_int<1, 2>{}).index()] != '\n'))
+            return ParseStatus::Error;
+        u32 reason_length;
+        if (UNLIKELY(!(range_int(scan) - range_int(reason_start)).to(&reason_length)))
+            return ParseStatus::Error;
+        resp->reason = {reinterpret_cast<const char*>(buf + range_int{reason_start}.index()),
+                        reason_length};
+        pos = (range_int(scan) + range_int<2, 3>{}).min(range_int(len)).to<u32>();  // past \r\n
     }
 
     // --- Headers (single-pass, same as request parser) ---
     for (;;) {
-        if (UNLIKELY(static_cast<i64>(pos) + 2 > static_cast<i64>(len))) {
+        if (UNLIKELY((range_int{pos} + range_int<2, 3>{}).to<i64>() > input_length)) {
             return ParseStatus::Incomplete;
         }
 
         // End of headers?
         if (buf[pos] == '\r') {
-            if (LIKELY(buf[static_cast<i64>(pos) + 1] == '\n')) {
-                pos = static_cast<u32>(static_cast<i64>(pos) + 2);
+            if (LIKELY(buf[(range_int{pos} + range_int<1, 2>{}).index()] == '\n')) {
+                pos = (range_int(pos) + range_int<2, 3>{}).min(range_int(len)).to<u32>();
                 break;
             }
             return ParseStatus::Error;
@@ -708,10 +727,12 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
         // Header name
         u32 name_start = pos;
         u32 colon_pos = fast_scan_header_name(buf, pos, len);
-        if (UNLIKELY(colon_pos == static_cast<u32>(-1))) goto maybe_incomplete;
-        if (UNLIKELY(colon_pos == name_start)) return ParseStatus::Error;
-        u32 name_len = static_cast<u32>(static_cast<i64>(colon_pos) - static_cast<i64>(name_start));
-        pos = static_cast<u32>(static_cast<i64>(colon_pos) + 1);
+        if (UNLIKELY(colon_pos == UINT32_MAX)) goto maybe_incomplete;
+        u32 name_len;
+        if (UNLIKELY(colon_pos == name_start ||
+                     !(range_int(colon_pos) - range_int(name_start)).to(&name_len)))
+            return ParseStatus::Error;
+        pos = (range_int(colon_pos) + range_int<1, 2>{}).min(range_int(len)).to<u32>();
         const u32 raw_value_start = pos;
 
         // Skip OWS
@@ -726,32 +747,39 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
             // Header value — SIMD scan for \r
             u32 value_start = pos;
             u32 cr_pos = simd::scan_header_value(buf, pos, len);
-            if (cr_pos == static_cast<u32>(-1)) return ParseStatus::Error;
-            if (UNLIKELY(cr_pos >= len || static_cast<i64>(cr_pos) + 1 >= static_cast<i64>(len)))
-                goto maybe_incomplete;
-            if (UNLIKELY(buf[static_cast<i64>(cr_pos) + 1] != '\n')) return ParseStatus::Error;
+            if (cr_pos == UINT32_MAX) return ParseStatus::Error;
+            const auto after_cr = range_int{cr_pos} + range_int<1, 2>{};
+            if (UNLIKELY(after_cr.to<i64>() >= input_length)) goto maybe_incomplete;
+            if (UNLIKELY(buf[after_cr.index()] != '\n')) return ParseStatus::Error;
             pos = cr_pos;
 
             // Trim trailing OWS
             u32 value_end = pos;
-            if (UNLIKELY(value_end > value_start && buf[static_cast<i64>(value_end) - 1] <= ' ')) {
-                while (value_end > value_start && (buf[static_cast<i64>(value_end) - 1] == ' ' ||
-                                                   buf[static_cast<i64>(value_end) - 1] == '\t')) {
-                    value_end = static_cast<u32>(static_cast<i64>(value_end) - 1);
+            if (UNLIKELY(value_end > value_start &&
+                         buf[range_int{value_end}.to<i64>() - 1] <= ' ')) {
+                while (value_end > value_start &&
+                       (buf[range_int{value_end}.to<i64>() - 1] == ' ' ||
+                        buf[range_int{value_end}.to<i64>() - 1] == '\t')) {
+                    --value_end;
                 }
             }
+
+            u32 value_len;
+            u32 raw_value_len;
+            if (UNLIKELY(!(range_int(value_end) - range_int(value_start)).to(&value_len) ||
+                         !(range_int(cr_pos) - range_int(raw_value_start)).to(&raw_value_len)))
+                return ParseStatus::Error;
 
             // Store header (skip storage if at capacity — proxy only needs
             // semantic headers, so exceeding kMaxHeaders is not an error).
             if (LIKELY(hdr_count < kMaxHeaders)) {
                 headers[hdr_count].name = {
-                    reinterpret_cast<const char*>(buf + static_cast<i64>(name_start)), name_len};
+                    reinterpret_cast<const char*>(buf + range_int{name_start}.index()), name_len};
                 headers[hdr_count].value = {
-                    reinterpret_cast<const char*>(buf + static_cast<i64>(value_start)),
-                    static_cast<u32>(static_cast<i64>(value_end) - static_cast<i64>(value_start))};
+                    reinterpret_cast<const char*>(buf + range_int{value_start}.index()), value_len};
                 headers[hdr_count].raw_value = {
-                    reinterpret_cast<const char*>(buf + static_cast<i64>(raw_value_start)),
-                    static_cast<u32>(static_cast<i64>(cr_pos) - static_cast<i64>(raw_value_start))};
+                    reinterpret_cast<const char*>(buf + range_int{raw_value_start}.index()),
+                    raw_value_len};
                 hdr_count++;
             } else {
                 // Beyond capacity: keep parsing (semantic headers still apply
@@ -760,20 +788,21 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
             }
 
             // Semantic header detection (always runs, even if header not stored)
-            ParseStatus sem = apply_semantic_header_response(
-                buf + static_cast<i64>(name_start),
-                name_len,
-                buf + static_cast<i64>(value_start),
-                static_cast<u32>(static_cast<i64>(value_end) - static_cast<i64>(value_start)),
-                resp);
+            ParseStatus sem = apply_semantic_header_response(buf + range_int{name_start}.index(),
+                                                             name_len,
+                                                             buf + range_int{value_start}.index(),
+                                                             value_len,
+                                                             resp);
             if (UNLIKELY(sem == ParseStatus::Error)) return ParseStatus::Error;
             if (name_len == 14 &&
-                str_ci_eq(buf + static_cast<i64>(name_start) + 1, "ontent-length", 13)) {
+                str_ci_eq(buf + (range_int{name_start} + range_int<1, 2>{}).index(),
+                          "ontent-length",
+                          13)) {
                 if (resp->content_length_count != 255) resp->content_length_count++;
             }
         }
 
-        pos = static_cast<u32>(static_cast<i64>(pos) + 2);  // skip \r\n
+        pos = (range_int(pos) + range_int<2, 3>{}).min(range_int(len)).to<u32>();  // skip \r\n
     }
 
     resp->header_count = hdr_count;

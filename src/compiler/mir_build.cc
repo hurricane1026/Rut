@@ -1,6 +1,7 @@
 #include "rut/compiler/mir_build.h"
 
 #include "core/expected.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/ws_message.h"
 #include "rut/compiler/diagnostic.h"
@@ -1947,18 +1948,15 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             for (u32 i = 0; i < term.response_headers.len; i++) {
                 const auto& p = term.response_headers[i];
                 const bool ok = out->response_headers.push({p.key, p.value});
-                // Unreachable given the static_assert above; use a
-                // builtin trap in debug/release rather than `(void)ok`
-                // so a regression surfaces immediately instead of
-                // silently shipping a truncated header set.
-                if (!ok) __builtin_trap();
+                if (!ok) RUT_TRAP("MIR response headers exceed the HIR header capacity");
             }
             // forward(set_header:) overrides — same cap on both sides (the
             // static_assert above covers kMaxHeaders), straight copy.
             out->forward_set_headers.len = 0;
             for (u32 i = 0; i < term.forward_set_headers.len; i++) {
                 const auto& p = term.forward_set_headers[i];
-                if (!out->forward_set_headers.push({p.key, p.value})) __builtin_trap();
+                if (!out->forward_set_headers.push({p.key, p.value}))
+                    RUT_TRAP("MIR forward header overrides exceed the HIR header capacity");
             }
         };
         auto set_arm_effects = [&](MirBlock* out, const HirMatchArm& arm) -> FrontendResult<void> {
@@ -2679,7 +2677,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     auto loop_binding =
                         push_ctx_binding(&ctx, fl.loop_var_ref_index, elem.value(), fl.span);
                     if (!loop_binding) return core::make_unexpected(loop_binding.error());
-                    iter_slots[slot_base + ai].first_rel = static_cast<u32>(steps.len - top_base);
+                    iter_slots[slot_base + ai].first_rel = u32{steps.len - top_base};
                     const auto stamp = [&](RouteStep* step) {
                         step->top_loop = top_loop;
                         step->iter_slot = slot_base + ai;
@@ -2810,13 +2808,13 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                         if (!steps.push(step))
                             return frontend_error(FrontendError::TooManyItems, fl.span);
                     }
-                    iter_slots[slot_base + ai].after_rel = static_cast<u32>(steps.len - top_base);
+                    iter_slots[slot_base + ai].after_rel = u32{steps.len - top_base};
                     if (loop_done) break;
                 }
                 // `break` leaves the whole instance, so every iteration of this
                 // instance shares the position after its last emitted step.
                 for (u32 ai = slot_base; ai < slot_base + iter_count; ai++)
-                    iter_slots[ai].exit_rel = static_cast<u32>(steps.len - top_base);
+                    iter_slots[ai].exit_rel = u32{steps.len - top_base};
                 return {};
             };
             for (u32 gi = 0; gi < source_route.guards.len; gi++) {
@@ -2838,7 +2836,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
             for (u32 fi = 0; fi < source_route.for_loops.len; fi++) {
                 if (for_loop_is_child[fi]) continue;
-                const u32 top_base = static_cast<u32>(steps.len);
+                const u32 top_base = u32{steps.len};
                 auto emitted = emit_for_loop(emit_for_loop,
                                              fi,
                                              nullptr,

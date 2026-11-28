@@ -2,6 +2,8 @@
 
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/send_progress.h"
@@ -158,8 +160,7 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
         return -err;
     }
     if (last != nullptr) {
-        u32 next = 0;
-        (void)__builtin_add_overflow(last->gen, u32{1}, &next);
+        const u32 next = wrapping_add(last->gen, u32{1});
         *last = {fd, events, ev.data.u64, next};
     }
     return 0;
@@ -352,8 +353,9 @@ void EpollBackend::arm_yield_timerfd(u64 deadline_ns) {
     struct itimerspec ts;
     __builtin_memset(&ts, 0, sizeof(ts));
     if (deadline_ns > 0) {
-        ts.it_value.tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000ull);
-        ts.it_value.tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000ull);
+        if (!bounded_quotient<1'000'000'000>(deadline_ns).try_to_signed(&ts.it_value.tv_sec))
+            return;
+        ts.it_value.tv_nsec = bounded_remainder<1'000'000'000>(deadline_ns).value();
     }
     // TFD_TIMER_ABSTIME — deadline_ns is absolute CLOCK_MONOTONIC. A zero
     // value disarms the timer. it_interval stays zero → one-shot.
@@ -686,7 +688,7 @@ bool EpollBackend::add_send_upstream(
     // its completion slot without needing a separate reservation counter.
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
-    if (nw == static_cast<ssize_t>(len)) {
+    if (nw == ssize_t{len}) {
         return queue_pending_completion(pending_completions,
                                         pending_count,
                                         conn_id,
@@ -822,7 +824,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool mo
     // producer can append; partial/EAGAIN uses epoll and consumes no slot.
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL | extra_flags);
 
-    if (nw == static_cast<ssize_t>(len)) {
+    if (nw == ssize_t{len}) {
         return queue_pending_completion(
             pending_completions, pending_count, conn_id, IoEventType::Send, static_cast<i32>(nw));
     }
@@ -1228,7 +1230,7 @@ u32 EpollBackend::wait(
             i32 fd = (type == IoEventType::HandlerTimer) ? yield_timer_fd : timer_fd;
             u64 ticks = 0;
             ssize_t rr = read(fd, &ticks, sizeof(ticks));
-            if (rr != static_cast<ssize_t>(sizeof(ticks))) continue;
+            if (rr != ssize_t{sizeof(ticks)}) continue;
             if (out < max_events) {
                 events[out] = {};
                 events[out].conn_id = 0;
@@ -1608,7 +1610,7 @@ u32 EpollBackend::wait(
                     ssize_t nw;
                     do {
                         nw = send(ss.fd,
-                                  ss.src + static_cast<i64>(ss.offset),
+                                  ss.src + i64{ss.offset},
                                   ss.remaining,
                                   MSG_NOSIGNAL | ss.msg_flags);
                     } while (nw < 0 && errno == EINTR);

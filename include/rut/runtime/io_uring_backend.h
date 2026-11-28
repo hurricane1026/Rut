@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/connection_capacity.h"
@@ -24,11 +25,7 @@ namespace rut {
 struct IoUringPosition {
     u32 value;
 
-    constexpr IoUringPosition advanced_by(u32 count) const {
-        u32 next = 0;
-        (void)__builtin_add_overflow(value, count, &next);
-        return {next};
-    }
+    constexpr IoUringPosition advanced_by(u32 count) const { return {wrapping_add(value, count)}; }
 
     constexpr bool operator==(const IoUringPosition&) const = default;
 
@@ -37,9 +34,7 @@ struct IoUringPosition {
         return *this;
     }
 
-    constexpr u32 distance_to(u32 end) const {
-        return static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(value));
-    }
+    constexpr u32 distance_to(u32 end) const { return wrapping_sub(end, value); }
 
     constexpr u32 slot(u32 mask) const { return value & mask; }
 };
@@ -403,14 +398,14 @@ struct IoUringBackend {
     // Complete a downstream send the caller already started with a direct
     // write of `written` bytes: a NOP injecting `len` when all bytes were
     // written, else a Send of the remainder whose completion reports `len`.
-    bool add_send_after_direct_write(i32 fd,
-                                     u32 conn_id,
-                                     const u8* buf,
-                                     u32 len,
-                                     u32 written,
-                                     u32 generation,
-                                     BufferedSendVector* vector = nullptr,
-                                     u32 extra_flags = 0);
+    [[nodiscard]] bool add_send_after_direct_write(i32 fd,
+                                                   u32 conn_id,
+                                                   const u8* buf,
+                                                   u32 len,
+                                                   u32 written,
+                                                   u32 generation,
+                                                   BufferedSendVector* vector = nullptr,
+                                                   u32 extra_flags = 0);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
     // Submit a connect to upstream.
@@ -463,12 +458,12 @@ struct IoUringBackend {
     // A nonzero monotonic deadline bounds an otherwise blocking wait.
     // conns: connection table — recv completions using provided buffers are
     // copied into conns[conn_id].recv_buf. max_conns: table size for bounds checking.
-    u32 wait(IoEvent* events,
-             u32 max_events,
-             Connection* conns,
-             u32 max_conns,
-             bool wait_for_event = true,
-             u64 deadline_ns = 0);
+    [[nodiscard]] u32 wait(IoEvent* events,
+                           u32 max_events,
+                           Connection* conns,
+                           u32 max_conns,
+                           bool wait_for_event = true,
+                           u64 deadline_ns = 0);
 
     i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
 

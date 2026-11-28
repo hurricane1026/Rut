@@ -292,7 +292,7 @@ TEST(syscall_fault, clock_gettime_invalid_timespec_fails_with_efault) {
     using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
     ClockGettimeFn injected_clock_gettime = &clock_gettime;
     errno = 0;
-    auto* invalid_ts = reinterpret_cast<struct timespec*>(static_cast<uintptr_t>(1));
+    auto* invalid_ts = reinterpret_cast<struct timespec*>(uintptr_t{1});
     CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, invalid_ts), -1);
     CHECK_EQ(errno, EFAULT);
 }

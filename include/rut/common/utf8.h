@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -8,15 +9,17 @@ namespace rut {
 // reassembled message (rejecting overlong forms, surrogates, and out-of-range code
 // points), so a terminating gateway fails the connection instead of forwarding or
 // handing malformed text to a DSL filter.
-inline bool utf8_valid(const u8* s, u64 n) {
-    if (!s && n != 0) return false;
-    for (u64 i = 0; i < n;) {
-        const u8 c = s[i];
-        u64 extra;
+[[nodiscard]] inline bool utf8_valid(const u8* s, u64 n) {
+    if (n == 0) return true;
+    range_int<0> length;
+    if (!s || !range_int<0>::try_from_u64(n, &length)) return false;
+    const u8* const end = s + length.value();
+    while (s != end) {
+        const u8 c = *s++;
+        u8 extra;
         u32 cp;
         u32 min_cp;
         if (c < 0x80) {
-            i++;
             continue;
         } else if ((c & 0xE0) == 0xC0) {
             extra = 1;
@@ -33,22 +36,15 @@ inline bool utf8_valid(const u8* s, u64 n) {
         } else {
             return false;  // 0x80-0xBF lead, or 0xF8+ (5/6-byte forms)
         }
-        u64 remaining = 0;
-        if (__builtin_sub_overflow(n, i, &remaining) || extra >= remaining)
-            return false;  // truncated multibyte sequence
-        for (u64 k = 1; k <= extra; k++) {
-            u64 offset = 0;
-            if (__builtin_add_overflow(i, k, &offset)) return false;
-            const u8 cc = s[offset];
+        if (end - s < extra) return false;  // truncated multibyte sequence
+        for (u8 k = 0; k < extra; ++k) {
+            const u8 cc = *s++;
             if ((cc & 0xC0) != 0x80) return false;  // not a continuation byte
+            // RUT_INTEGER_RANGE: at most three shifts follow a lead of at most five bits.
             cp = (cp << 6) | (cc & 0x3F);
         }
-        if (cp < min_cp) return false;                   // overlong encoding
-        if (cp > 0x10FFFF) return false;                 // beyond Unicode
-        if (cp >= 0xD800 && cp <= 0xDFFF) return false;  // UTF-16 surrogate half
-        u64 step = 0;
-        if (__builtin_add_overflow(extra, u64{1}, &step) || __builtin_add_overflow(i, step, &i))
-            return false;
+        // Reject overlong encodings, code points beyond Unicode, and surrogates.
+        if (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
     }
     return true;
 }

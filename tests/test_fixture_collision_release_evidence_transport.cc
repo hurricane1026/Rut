@@ -435,9 +435,8 @@ bool test_deadlines_and_eof() {
     {
         int descriptors[2] = {-1, -1};
         ok &= check(open_pair(descriptors), "payload deadline socketpair");
-        const Bytes header = wire_header(transport::kEvidenceFrameType,
-                                         expected,
-                                         static_cast<worker::u32>(evidence::kEnvelopeBytes));
+        const Bytes header = wire_header(
+            transport::kEvidenceFrameType, expected, worker::u32{evidence::kEnvelopeBytes});
         ok &= check(write_all(descriptors[0], header.data(), header.size()),
                     "payload deadline header");
         HookState state;
@@ -491,9 +490,8 @@ bool test_deadlines_and_eof() {
     {
         int descriptors[2] = {-1, -1};
         ok &= check(open_pair(descriptors), "truncated header socketpair");
-        const Bytes header = wire_header(transport::kEvidenceFrameType,
-                                         expected,
-                                         static_cast<worker::u32>(evidence::kEnvelopeBytes));
+        const Bytes header = wire_header(
+            transport::kEvidenceFrameType, expected, worker::u32{evidence::kEnvelopeBytes});
         ok &= check(write_all(descriptors[0], header.data(), 7u), "truncated header write");
         ::close(descriptors[0]);
         descriptors[0] = -1;
@@ -568,42 +566,42 @@ bool test_protocol_rejections() {
          worker::kVersion,
          transport::kEvidenceFrameType,
          &expected,
-         static_cast<worker::u32>(evidence::kEnvelopeBytes),
+         worker::u32{evidence::kEnvelopeBytes},
          transport::DiagnosticCode::BadMagic},
         {"bad version",
          worker::kMagic,
          worker::kVersion + 1u,
          transport::kEvidenceFrameType,
          &expected,
-         static_cast<worker::u32>(evidence::kEnvelopeBytes),
+         worker::u32{evidence::kEnvelopeBytes},
          transport::DiagnosticCode::BadVersion},
         {"bad type",
          worker::kMagic,
          worker::kVersion,
          58u,
          &expected,
-         static_cast<worker::u32>(evidence::kEnvelopeBytes),
+         worker::u32{evidence::kEnvelopeBytes},
          transport::DiagnosticCode::BadType},
         {"bad token",
          worker::kMagic,
          worker::kVersion,
          transport::kEvidenceFrameType,
          &wrong,
-         static_cast<worker::u32>(evidence::kEnvelopeBytes),
+         worker::u32{evidence::kEnvelopeBytes},
          transport::DiagnosticCode::BadToken},
         {"short payload",
          worker::kMagic,
          worker::kVersion,
          transport::kEvidenceFrameType,
          &expected,
-         static_cast<worker::u32>(evidence::kEnvelopeBytes - 1u),
+         worker::u32{evidence::kEnvelopeBytes - 1u},
          transport::DiagnosticCode::PayloadTooSmall},
         {"large payload",
          worker::kMagic,
          worker::kVersion,
          transport::kEvidenceFrameType,
          &expected,
-         static_cast<worker::u32>(worker::kMaxPayload + 1u),
+         worker::u32{worker::kMaxPayload + 1u},
          transport::DiagnosticCode::PayloadTooLarge},
         {"u32 max payload",
          worker::kMagic,
@@ -1099,7 +1097,7 @@ bool test_partial_terminal_errors() {
                                 "partial send cumulative bytes");
         std::array<unsigned char, 10> peer_bytes{};
         ok &= check(::recv(descriptors[1], peer_bytes.data(), peer_bytes.size(), MSG_WAITALL) ==
-                        static_cast<ssize_t>(peer_bytes.size()),
+                        ssize_t{peer_bytes.size()},
                     "partial send peer bytes");
         const Bytes expected_header =
             wire_header(value.type, expected, static_cast<worker::u32>(value.payload.size()));

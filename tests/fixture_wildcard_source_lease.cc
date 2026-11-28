@@ -24,39 +24,36 @@ void fail(Diagnostic& diagnostic, FailurePhase phase, int error_number = 0) {
 }
 
 DirectoryIdentity make_directory_identity(const struct stat& status) {
-    return {static_cast<std::uint64_t>(status.st_dev),
-            static_cast<std::uint64_t>(status.st_ino),
-            static_cast<std::uint64_t>(status.st_mode),
-            static_cast<std::uint64_t>(status.st_uid),
-            static_cast<std::uint64_t>(status.st_gid)};
+    return {std::uint64_t{status.st_dev},
+            std::uint64_t{status.st_ino},
+            std::uint64_t{status.st_mode},
+            std::uint64_t{status.st_uid},
+            std::uint64_t{status.st_gid}};
 }
 
 SourceIdentity make_source_identity(const struct stat& status) {
-    return {static_cast<std::uint64_t>(status.st_dev),
-            static_cast<std::uint64_t>(status.st_ino),
-            static_cast<std::uint64_t>(status.st_mode),
-            static_cast<std::uint64_t>(status.st_uid),
-            static_cast<std::uint64_t>(status.st_gid),
+    return {std::uint64_t{status.st_dev},
+            std::uint64_t{status.st_ino},
+            std::uint64_t{status.st_mode},
+            std::uint64_t{status.st_uid},
+            std::uint64_t{status.st_gid},
             static_cast<std::uint64_t>(status.st_size)};
 }
 
 bool same_directory(const struct stat& status, const DirectoryIdentity& expected) {
-    return S_ISDIR(status.st_mode) &&
-           static_cast<std::uint64_t>(status.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(status.st_ino) == expected.inode &&
-           static_cast<std::uint64_t>(status.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(status.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(status.st_gid) == expected.gid &&
-           (status.st_mode & 0777) == 0700;
+    return S_ISDIR(status.st_mode) && std::uint64_t{status.st_dev} == expected.device &&
+           std::uint64_t{status.st_ino} == expected.inode &&
+           std::uint64_t{status.st_mode} == expected.mode &&
+           std::uint64_t{status.st_uid} == expected.uid &&
+           std::uint64_t{status.st_gid} == expected.gid && (status.st_mode & 0777) == 0700;
 }
 
 bool same_source(const struct stat& status, const SourceIdentity& expected, bool require_link) {
-    return S_ISREG(status.st_mode) &&
-           static_cast<std::uint64_t>(status.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(status.st_ino) == expected.inode &&
-           static_cast<std::uint64_t>(status.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(status.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(status.st_gid) == expected.gid && status.st_size >= 0 &&
+    return S_ISREG(status.st_mode) && std::uint64_t{status.st_dev} == expected.device &&
+           std::uint64_t{status.st_ino} == expected.inode &&
+           std::uint64_t{status.st_mode} == expected.mode &&
+           std::uint64_t{status.st_uid} == expected.uid &&
+           std::uint64_t{status.st_gid} == expected.gid && status.st_size >= 0 &&
            static_cast<std::uint64_t>(status.st_size) == expected.size &&
            status.st_nlink == (require_link ? 1u : 0u) && (status.st_mode & 0777) == 0600;
 }
@@ -64,22 +61,20 @@ bool same_source(const struct stat& status, const SourceIdentity& expected, bool
 bool same_source_object(const struct stat& status,
                         const SourceIdentity& expected,
                         bool require_link) {
-    return S_ISREG(status.st_mode) &&
-           static_cast<std::uint64_t>(status.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(status.st_ino) == expected.inode &&
-           static_cast<std::uint64_t>(status.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(status.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(status.st_gid) == expected.gid && status.st_size >= 0 &&
+    return S_ISREG(status.st_mode) && std::uint64_t{status.st_dev} == expected.device &&
+           std::uint64_t{status.st_ino} == expected.inode &&
+           std::uint64_t{status.st_mode} == expected.mode &&
+           std::uint64_t{status.st_uid} == expected.uid &&
+           std::uint64_t{status.st_gid} == expected.gid && status.st_size >= 0 &&
            status.st_nlink == (require_link ? 1u : 0u) && (status.st_mode & 0777) == 0600;
 }
 
 bool same_owned_source_descriptor(const struct stat& status, const SourceIdentity& expected) {
-    return S_ISREG(status.st_mode) &&
-           static_cast<std::uint64_t>(status.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(status.st_ino) == expected.inode &&
-           static_cast<std::uint64_t>(status.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(status.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(status.st_gid) == expected.gid && status.st_size >= 0 &&
+    return S_ISREG(status.st_mode) && std::uint64_t{status.st_dev} == expected.device &&
+           std::uint64_t{status.st_ino} == expected.inode &&
+           std::uint64_t{status.st_mode} == expected.mode &&
+           std::uint64_t{status.st_uid} == expected.uid &&
+           std::uint64_t{status.st_gid} == expected.gid && status.st_size >= 0 &&
            (status.st_mode & 0777) == 0600;
 }
 

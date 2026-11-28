@@ -12,9 +12,9 @@ struct ListenerSpec;
 // Returns fd on success, Error on failure.
 // reuse_port enables SO_REUSEPORT on Linux so shards can share a port.
 // Pass false for an exclusive listener (including a single-shard server).
-core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared,
-                                                u16 requested_port,
-                                                bool reuse_port = true);
+[[nodiscard]] core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared,
+                                                              u16 requested_port,
+                                                              bool reuse_port = true);
 
 // Behavior-compatible IPv4-wildcard wrapper for legacy callers.
 core::Expected<i32, Error> create_listen_socket(u16 port);

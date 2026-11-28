@@ -1153,7 +1153,7 @@ TEST(replay_gap, proxy_route_enters_proxy_path) {
     conn->recv_buf.reset();
     const char req[] = "GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     rl.loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = rl.loop.backend.wait(events, 8);
@@ -1326,7 +1326,7 @@ TEST(replay_gap, upstream_name_truncation_boundary) {
     conn->recv_buf.reset();
     const char req[] = "GET /up/test HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     rl.loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = rl.loop.backend.wait(events, 8);

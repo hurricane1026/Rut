@@ -1,5 +1,6 @@
 #include "rut/jit/codegen.h"
 
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
@@ -911,7 +912,7 @@ struct Ctx {
                 if (call_frame_fields[inst.result.id])
                     set_value(inst.result, value);
                 else
-                    call_phi_incoming[static_cast<u64>(inst.result.id) * 2 + incoming] = value;
+                    call_phi_incoming[u64{inst.result.id} * 2 + incoming] = value;
             }
         }
     }
@@ -925,14 +926,14 @@ struct Ctx {
         // Pack: action=ReturnStatus, status_code=code, rest=0
         u64 packed = 0;
         packed |= static_cast<u64>(HandlerAction::ReturnStatus);  // action
-        packed |= static_cast<u64>(code) << 8;                    // status_code
+        packed |= u64{code} << 8;                                 // status_code
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
     LLVMValueRef make_result_forward(u16 upstream) {
         u64 packed = 0;
         packed |= static_cast<u64>(HandlerAction::Forward);  // action
-        packed |= static_cast<u64>(upstream) << 24;          // upstream_id
+        packed |= u64{upstream} << 24;                       // upstream_id
         return LLVMConstInt(i64_ty, packed, 0);
     }
 
@@ -942,8 +943,8 @@ struct Ctx {
     LLVMValueRef make_result_yield(u16 next_state, u8 yield_kind, u32 payload) {
         u64 packed = 0;
         packed |= static_cast<u64>(HandlerAction::Yield);  // action
-        packed |= static_cast<u64>(payload) << 8;          // status + upstream slots
-        packed |= static_cast<u64>(next_state) << 40;      // next_state
+        packed |= u64{payload} << 8;                       // status + upstream slots
+        packed |= u64{next_state} << 40;                   // next_state
         packed |= static_cast<u64>(yield_kind) << 56;      // yield_kind
         return LLVMConstInt(i64_ty, packed, 0);
     }
@@ -1004,7 +1005,8 @@ struct Ctx {
                     // 16 is 2x headroom; if frontend capacity ever grows, raise
                     // this in lockstep. Trap instead of silently truncating.
                     static constexpr u32 kMaxStructFields = 16;
-                    if (sd->field_count > kMaxStructFields) __builtin_trap();
+                    if (sd->field_count > kMaxStructFields)
+                        RUT_TRAP("JIT struct field count exceeds %u", kMaxStructFields);
                     LLVMTypeRef fields[kMaxStructFields]{};
                     for (u32 i = 0; i < sd->field_count; i++) {
                         fields[i] = map_type(sd->fields()[i].type);
@@ -1346,7 +1348,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef has_slot = LLVMBuildICmp(
                 c.builder, LLVMIntUGT, count, LLVMConstInt(c.i32_ty, slot, 0), "ctx.has.slot");
 
-            const u32 byte_offset = static_cast<u32>(sizeof(HandlerCtx)) + slot * 8u;
+            const u32 byte_offset = u32{sizeof(HandlerCtx)} + slot * 8u;
             LLVMValueRef off = LLVMConstInt(c.i32_ty, byte_offset, 0);
             LLVMValueRef ptr =
                 LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ctx.slot.ptr");
@@ -1909,10 +1911,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef args[8];
             for (u32 i = 0; i < 4; ++i) {
                 LLVMValueRef value = c.get_value(inst.operand(i));
-                args[static_cast<size_t>(i) * 2] =
-                    LLVMBuildExtractValue(c.builder, value, 0, "hmac.ptr");
-                args[static_cast<size_t>(i) * 2 + 1] =
-                    LLVMBuildExtractValue(c.builder, value, 1, "hmac.len");
+                args[size_t{i} * 2] = LLVMBuildExtractValue(c.builder, value, 0, "hmac.ptr");
+                args[size_t{i} * 2 + 1] = LLVMBuildExtractValue(c.builder, value, 1, "hmac.len");
             }
             LLVMValueRef fn = c.get_hmac_sha256_matches();
             LLVMValueRef result =
@@ -1927,10 +1927,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef args[10];
             for (u32 i = 0; i < 5; ++i) {
                 LLVMValueRef value = c.get_value(inst.operand(i));
-                args[static_cast<size_t>(i) * 2] =
-                    LLVMBuildExtractValue(c.builder, value, 0, "hmac.ptr");
-                args[static_cast<size_t>(i) * 2 + 1] =
-                    LLVMBuildExtractValue(c.builder, value, 1, "hmac.len");
+                args[size_t{i} * 2] = LLVMBuildExtractValue(c.builder, value, 0, "hmac.ptr");
+                args[size_t{i} * 2 + 1] = LLVMBuildExtractValue(c.builder, value, 1, "hmac.len");
             }
             LLVMValueRef fn = c.get_standard_webhook_valid();
             LLVMValueRef result =
@@ -1946,9 +1944,9 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             args[0] = c.get_value(inst.operand(0));
             for (u32 i = 1; i < 8; ++i) {
                 LLVMValueRef value = c.get_value(inst.operand(i));
-                args[1 + static_cast<size_t>(i - 1) * 2] =
+                args[1 + size_t{i - 1} * 2] =
                     LLVMBuildExtractValue(c.builder, value, 0, "signed_request.ptr");
-                args[2 + static_cast<size_t>(i - 1) * 2] =
+                args[2 + size_t{i - 1} * 2] =
                     LLVMBuildExtractValue(c.builder, value, 1, "signed_request.len");
             }
             LLVMValueRef fn = c.get_signed_request_valid();
@@ -1966,7 +1964,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef args[8];
             for (u32 i = 0; i < 3; ++i) {
                 LLVMValueRef value = c.get_value(inst.operand(i));
-                const size_t kArgIndex = static_cast<size_t>(i) * 2;
+                const size_t kArgIndex = size_t{i} * 2;
                 args[kArgIndex] = LLVMBuildExtractValue(c.builder, value, 0, "jwt.claims.ptr");
                 args[kArgIndex + 1] = LLVMBuildExtractValue(c.builder, value, 1, "jwt.claims.len");
             }
@@ -2380,7 +2378,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMTypeRef w = is64 ? c.i64_ty : c.i32_ty;
             LLVMValueRef zero = LLVMConstInt(w, 0, 0);
             LLVMValueRef int_min =
-                LLVMConstInt(w, is64 ? 0x8000000000000000ull : static_cast<u64>(0x80000000u), 0);
+                LLVMConstInt(w, is64 ? 0x8000000000000000ull : u64{0x80000000u}, 0);
             LLVMValueRef neg_one = LLVMConstAllOnes(w);
             LLVMValueRef is_zero = LLVMBuildICmp(c.builder, LLVMIntEQ, b, zero, "arith.div.zero");
             LLVMValueRef is_min = LLVMBuildICmp(c.builder, LLVMIntEQ, a, int_min, "arith.div.min");
@@ -3647,7 +3645,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef count = LLVMBuildLoad2(c.builder, c.i32_ty, count_ptr, "ctx.slot.count");
             LLVMValueRef has_slot = LLVMBuildICmp(
                 c.builder, LLVMIntUGT, count, LLVMConstInt(c.i32_ty, slot, 0), "ctx.has.slot");
-            const u32 byte_offset = static_cast<u32>(sizeof(HandlerCtx)) + slot * 8u;
+            const u32 byte_offset = u32{sizeof(HandlerCtx)} + slot * 8u;
             LLVMValueRef off = LLVMConstInt(c.i32_ty, byte_offset, 0);
             LLVMValueRef ptr =
                 LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ctx.slot.ptr");
@@ -3736,7 +3734,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 status = LLVMBuildAnd(
                     c.builder, status, LLVMConstInt(c.i32_ty, 0xffffu, 0), "code.mask");
             } else {
-                const u64 packed = static_cast<u64>(inst.imm.i64_val);
+                const i64 packed = inst.imm.i64_val;
                 const u32 status_u = static_cast<u32>(packed & 0xffffu);
                 body_idx_imm = static_cast<u32>((packed >> 16) & 0xffffu);
                 headers_idx_imm = static_cast<u32>((packed >> 32) & 0xffffu);
@@ -3749,13 +3747,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMBuildShl(c.builder, status_ext, LLVMConstInt(c.i64_ty, 8, 0), "st.shl");
             LLVMValueRef result = LLVMBuildOr(c.builder, action, status_shifted, "result.st");
             if (body_idx_imm != 0) {
-                LLVMValueRef body_slot =
-                    LLVMConstInt(c.i64_ty, static_cast<u64>(body_idx_imm) << 24, 0);
+                LLVMValueRef body_slot = LLVMConstInt(c.i64_ty, u64{body_idx_imm} << 24, 0);
                 result = LLVMBuildOr(c.builder, result, body_slot, "result.body");
             }
             if (headers_idx_imm != 0) {
-                LLVMValueRef headers_slot =
-                    LLVMConstInt(c.i64_ty, static_cast<u64>(headers_idx_imm) << 40, 0);
+                LLVMValueRef headers_slot = LLVMConstInt(c.i64_ty, u64{headers_idx_imm} << 40, 0);
                 result = LLVMBuildOr(c.builder, result, headers_slot, "result.headers");
             }
             c.emit_parse_unprime();
@@ -3940,7 +3936,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::YieldTimer: {
-            const u64 packed = static_cast<u64>(inst.imm.i64_val);
+            const i64 packed = inst.imm.i64_val;
             const u32 payload = static_cast<u32>(packed & 0xffffffffu);
             const u16 next_state = static_cast<u16>((packed >> 32) & 0xffffu);
             u8 yield_kind = static_cast<u8>((packed >> 48) & 0xffu);
@@ -4324,11 +4320,10 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             if (inst.op != rir::Opcode::Phi ||
                 (c.call_frame && c.call_frame_fields[inst.result.id]))
                 continue;
-            LLVMValueRef values[] = {
-                c.call_frame ? c.call_phi_incoming[static_cast<u64>(inst.result.id) * 2]
-                             : c.get_value(inst.operands[0]),
-                c.call_frame ? c.call_phi_incoming[static_cast<u64>(inst.result.id) * 2 + 1]
-                             : c.get_value(inst.operands[1])};
+            LLVMValueRef values[] = {c.call_frame ? c.call_phi_incoming[u64{inst.result.id} * 2]
+                                                  : c.get_value(inst.operands[0]),
+                                     c.call_frame ? c.call_phi_incoming[u64{inst.result.id} * 2 + 1]
+                                                  : c.get_value(inst.operands[1])};
             LLVMBasicBlockRef incoming[] = {exits[inst.imm.block_targets[0].id],
                                             exits[inst.imm.block_targets[1].id]};
             if (!values[0] || !values[1] || !incoming[0] || !incoming[1]) return false;
@@ -4715,7 +4710,7 @@ bool emit_ws_body(LLVMModuleRef module,
     __builtin_memcpy(body_name, wrapper_name, kNameLen);
     static constexpr char kSuffix[] = "_body";
     __builtin_memcpy(body_name + kNameLen, kSuffix, sizeof(kSuffix));
-    const Str kBodyName{body_name, kNameLen + static_cast<u32>(sizeof(kSuffix) - 1)};
+    const Str kBodyName{body_name, kNameLen + u32{sizeof(kSuffix) - 1}};
     char body_symbol[256];
     if (format_handler_symbol(kBodyName, body_symbol, sizeof(body_symbol)) == 0 ||
         LLVMGetNamedFunction(module, body_symbol) != nullptr)
@@ -4830,8 +4825,8 @@ bool emit_ws_body(LLVMModuleRef module,
                       action,
                       LLVMConstInt(i64_ty, static_cast<u8>(HandlerAction::ReturnStatus), 0),
                       "action.ok");
-    LLVMValueRef extra = LLVMBuildAnd(
-        builder, result, LLVMConstInt(i64_ty, ~static_cast<u64>(0xffffffu), 0), "extra");
+    LLVMValueRef extra =
+        LLVMBuildAnd(builder, result, LLVMConstInt(i64_ty, ~u64{0xffffffu}, 0), "extra");
     LLVMValueRef extra_ok =
         LLVMBuildICmp(builder, LLVMIntEQ, extra, LLVMConstInt(i64_ty, 0, 0), "extra.ok");
     LLVMValueRef verdict =

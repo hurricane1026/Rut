@@ -17,7 +17,7 @@ bool password_hash_random(
         return false;
     u8 salt[kPasswordSaltBytes]{};
     bool ok = false;
-    if (read_entropy(salt, kPasswordSaltBytes) == static_cast<i32>(kPasswordSaltBytes))
+    if (read_entropy(salt, kPasswordSaltBytes) == i32{kPasswordSaltBytes})
         ok = password_hash(password,
                            {reinterpret_cast<const char*>(salt), kPasswordSaltBytes},
                            output,

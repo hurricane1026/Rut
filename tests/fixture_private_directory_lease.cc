@@ -21,14 +21,13 @@ Identity identity_of(const struct stat& value) {
     return {U(value.st_dev), U(value.st_ino), U(value.st_mode), U(value.st_uid), U(value.st_gid)};
 }
 bool same_object(const struct stat& value, const Identity& expected) {
-    return S_ISDIR(value.st_mode) && static_cast<std::uint64_t>(value.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(value.st_ino) == expected.inode &&
-           static_cast<std::uint64_t>(value.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(value.st_gid) == expected.gid;
+    return S_ISDIR(value.st_mode) && std::uint64_t{value.st_dev} == expected.device &&
+           std::uint64_t{value.st_ino} == expected.inode &&
+           std::uint64_t{value.st_uid} == expected.uid &&
+           std::uint64_t{value.st_gid} == expected.gid;
 }
 bool same_private(const struct stat& value, const Identity& expected) {
-    return same_object(value, expected) &&
-           static_cast<std::uint64_t>(value.st_mode) == expected.mode &&
+    return same_object(value, expected) && std::uint64_t{value.st_mode} == expected.mode &&
            (value.st_mode & 0777) == 0700;
 }
 bool same_metadata(const struct stat& left, const struct stat& right) {

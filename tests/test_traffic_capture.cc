@@ -608,7 +608,7 @@ TEST(capture_integration, keepalive_captures_both) {
         const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
         conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
 
-        IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+        IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
         loop.backend.inject(recv_ev);
         IoEvent events[8];
         u32 n = loop.backend.wait(events, 8);
@@ -701,7 +701,7 @@ TEST(capture_control, enable_captures_disable_stops) {
     conn->recv_buf.reset();
     const char req[] = "GET /on HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -718,7 +718,7 @@ TEST(capture_control, enable_captures_disable_stops) {
     conn->recv_buf.reset();
     const char req2[] = "GET /off HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req2), sizeof(req2) - 1);
-    recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req2) - 1));
+    recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req2) - 1});
     loop.backend.inject(recv_ev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
@@ -764,7 +764,7 @@ TEST(capture_control, conn_before_enable_gets_backfilled) {
     conn->recv_buf.reset();
     const char req[] = "GET /backfill HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -954,7 +954,7 @@ TEST(capture_transition, disable_mid_request) {
     conn->recv_buf.reset();
     const char req[] = "GET /mid HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -1115,7 +1115,7 @@ TEST(capture_transition, stale_header_len_across_disable_reenable) {
     conn->recv_buf.reset();
     const char r1[] = "GET /staged HTTP/1.1\r\nHost: x\r\nX-Big: aaaa\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(r1), sizeof(r1) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(r1) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(r1) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -1405,7 +1405,7 @@ TEST(capture_cross, enable_between_header_and_complete) {
     conn->recv_buf.reset();
     const char req[] = "GET /between HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -1527,7 +1527,7 @@ TEST(capture_cross, close_with_staged_headers) {
     conn->recv_buf.reset();
     const char req[] = "GET /close HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -1566,7 +1566,7 @@ TEST(capture_cross, proxy_cycle_captured) {
     conn->recv_buf.reset();
     const char req[] = "GET /proxy HTTP/1.1\r\nHost: upstream\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -1583,13 +1583,11 @@ TEST(capture_cross, proxy_cycle_captured) {
 
     // Proxy cycle: connect → send to upstream → recv response → send to client
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(sizeof(req) - 1)));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, i32{sizeof(req) - 1}));
     inject_upstream_response(loop, *conn);
 
     // Complete: send proxy response to client
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, i32{kMockHttpResponseLen}));
 
     // Proxy response captured with correct headers
     CHECK_EQ(ring->available(), 1u);
@@ -1630,7 +1628,7 @@ TEST(capture_cross, proxy_502_captured) {
     conn->recv_buf.reset();
     const char req[] = "GET /fail HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -2213,7 +2211,7 @@ TEST(capture_gap, upstream_name_copied) {
     conn->recv_buf.reset();
     const char req[] = "GET /up HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(req) - 1));
+    IoEvent recv_ev = make_ev(conn->id, IoEventType::Recv, i32{sizeof(req) - 1});
     loop.backend.inject(recv_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);

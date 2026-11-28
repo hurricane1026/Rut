@@ -42,8 +42,7 @@ inline bool control_rewind(FILE* file) {
 
 inline ControlProcfsCapability probe_control_procfs_capability() {
     char path[64] = {};
-    const int length =
-        snprintf(path, sizeof(path), "/proc/self/task/%ld/children", static_cast<long>(getpid()));
+    const int length = snprintf(path, sizeof(path), "/proc/self/task/%ld/children", long{getpid()});
     if (length < 0 || static_cast<size_t>(length) >= sizeof(path))
         return ControlProcfsCapability::Error;
     FILE* file = fopen(path, "r");
@@ -239,10 +238,8 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
     if (sigaction(SIGTERM, &action, nullptr) != 0) return 125;
     const pid_t supervisor = getpid();
     char children_path[96];
-    snprintf(children_path,
-             sizeof(children_path),
-             "/proc/self/task/%ld/children",
-             static_cast<long>(supervisor));
+    snprintf(
+        children_path, sizeof(children_path), "/proc/self/task/%ld/children", long{supervisor});
     ScopedControlFile children_owner(control_proc_open_failures > 0 ? nullptr
                                                                     : fopen(children_path, "r"));
     FILE* children = children_owner.get();

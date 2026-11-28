@@ -1,5 +1,7 @@
 #include "rut/runtime/ws_frame.h"
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/http_parser.h"
 
@@ -15,8 +17,7 @@ ParseStatus ws_parse_header(
     // RFC 7692 owns RSV1 only; no negotiated extension owns RSV2 or RSV3.
     if ((b0 & 0x30) != 0) return ParseStatus::Error;
 
-    const u8 opcode_bits = b0 & 0x0F;
-    const WsOpcode opcode = static_cast<WsOpcode>(opcode_bits);
+    const WsOpcode opcode{bounded_remainder<16>(b0).to<u8>()};
     if (!ws_opcode_valid(opcode)) return ParseStatus::Error;
     const bool kCompressed = (b0 & 0x40) != 0;
     if (kCompressed &&
@@ -40,13 +41,13 @@ ParseStatus ws_parse_header(
     // MUST NOT be.
     if (require_mask != masked) return ParseStatus::Error;
 
-    u64 payload_len = 0;
-    u32 offset = 2;
+    i64 payload_len = 0;
+    u8 offset = 2;
     if (len7 < 126) {
-        payload_len = len7;
+        payload_len = range_int{len7}.to<i64>();
     } else if (len7 == 126) {
         if (len < 4) return ParseStatus::Incomplete;
-        payload_len = (static_cast<u64>(buf[2]) << 8) | static_cast<u64>(buf[3]);
+        payload_len = (range_int{buf[2]}.scaled_by<256>() + range_int{buf[3]}).to<i64>();
         offset = 4;
         // §5.2: the minimal number of length bytes MUST be used — a 16-bit length below
         // 126 is a non-canonical encoding.
@@ -54,30 +55,35 @@ ParseStatus ws_parse_header(
     } else {  // len7 == 127
         if (len < 10) return ParseStatus::Incomplete;
         // §5.2: the most significant bit of a 64-bit length MUST be 0.
-        if ((buf[2] & 0x80) != 0) return ParseStatus::Error;
-        for (u32 i = 0; i < 8; i++) {
-            payload_len = (payload_len << 8) |
-                          static_cast<u64>(buf[static_cast<i64>(2) + static_cast<i64>(i)]);
+        u64 wire_length = 0;
+        for (u8 i = 0; i < 8; ++i) {
+            const auto kPosition = range_int<2, 3>{} + range_int(i);
+            // RUT_INTEGER_RANGE: each iteration appends one of exactly eight wire bytes.
+            wire_length = (wire_length << 8) | buf[kPosition.index()];
         }
+        range_int<0> length;
+        if (!range_int<0>::try_from_u64(wire_length, &length)) return ParseStatus::Error;
+        payload_len = length.to<i64>();
         offset = 10;
         // Minimal-length rule: a 64-bit length that fits in 16 bits is non-canonical.
         if (payload_len <= 0xFFFF) return ParseStatus::Error;
     }
 
+    u32 header_length = offset;
     if (masked) {
-        if (static_cast<i64>(len) < static_cast<i64>(offset) + 4) return ParseStatus::Incomplete;
-        for (u32 i = 0; i < 4; i++)
-            out->mask_key[i] = buf[static_cast<i64>(offset) + static_cast<i64>(i)];
-        offset = static_cast<u32>(static_cast<i64>(offset) + 4);
+        const auto kMaskedLength = range_int(offset) + range_int<4, 5>{};
+        if (len < kMaskedLength.value()) return ParseStatus::Incomplete;
+        header_length = kMaskedLength.to<u32>();
+        __builtin_memmove(out->mask_key, buf + range_int{offset}.index(), sizeof(out->mask_key));
     } else {
-        for (u32 i = 0; i < 4; i++) out->mask_key[i] = 0;
+        for (i32 i = 0; i < 4; ++i) out->mask_key[i] = 0;
     }
 
     out->fin = fin;
     out->masked = masked;
     out->opcode = opcode;
     out->payload_len = payload_len;
-    out->header_len = offset;
+    out->header_len = header_length;
     out->compressed = kCompressed;
     return ParseStatus::Complete;
 }
@@ -87,9 +93,12 @@ void ws_unmask(u8* payload, u64 len, const u8 mask_key[4]) {
 }
 
 void ws_unmask_chunk(u8* payload, u64 len, const u8 mask_key[4], u64 offset) {
-    const u32 phase = static_cast<u32>(offset & 3);
-    for (u64 i = 0; i < len; i++)
-        payload[i] ^= mask_key[(static_cast<i64>(phase) + static_cast<i64>(i & 3)) & 3];
+    constexpr u64 kKeySize = 4;
+    const auto phase = bounded_remainder<kKeySize>(offset);
+    for (u64 i = 0; i < len; i++) {
+        const auto combined = phase + bounded_remainder<kKeySize>(i);
+        payload[i] ^= mask_key[bounded_remainder<kKeySize>(combined.to_u64()).index()];
+    }
 }
 
 u32 ws_write_header(u8* out,
@@ -111,31 +120,33 @@ u32 ws_write_header(u8* out,
         if (op == WsOpcode::Close && payload_len == 1)
             return 0;  // Close body needs the 2-byte code
     }
-    if (payload_len >= (static_cast<u64>(1) << 63)) return 0;  // 64-bit length MSB is reserved zero
+    if (payload_len >= (u64{1} << 63)) return 0;  // 64-bit length MSB is reserved zero
 
-    out[0] = static_cast<u8>((fin ? 0x80 : 0x00) | (compressed ? 0x40 : 0) | static_cast<u8>(op));
+    const u64 flags = (fin ? u64{0x80} : 0) | (compressed ? u64{0x40} : 0);
+    out[0] = bounded_remainder<256>(flags | range_int{std::to_underlying(op)}.to_u64()).to<u8>();
     const u8 mask_bit = masked ? 0x80 : 0x00;
-    u32 offset;
+    u8 offset;
     if (payload_len <= 125) {
-        out[1] = static_cast<u8>(mask_bit | static_cast<u8>(payload_len));
+        out[1] = bounded_remainder<256>(mask_bit | payload_len).to<u8>();
         offset = 2;
     } else if (payload_len <= 0xFFFF) {
-        out[1] = static_cast<u8>(mask_bit | 126);
-        out[2] = static_cast<u8>((payload_len >> 8) & 0xFF);
-        out[3] = static_cast<u8>(payload_len & 0xFF);
+        out[1] = bounded_remainder<256>(mask_bit | 126).to<u8>();
+        out[2] = bounded_remainder<256>(payload_len >> 8).to<u8>();
+        out[3] = bounded_remainder<256>(payload_len).to<u8>();
         offset = 4;
     } else {
-        out[1] = static_cast<u8>(mask_bit | 127);
-        for (u32 i = 0; i < 8; i++) {
-            out[static_cast<i64>(2) + static_cast<i64>(i)] =
-                static_cast<u8>((payload_len >> ((7 - static_cast<i64>(i)) * 8)) & 0xFF);
+        out[1] = bounded_remainder<256>(mask_bit | 127).to<u8>();
+        for (u8 i = 0; i < 8; ++i) {
+            const auto kPosition = range_int<2, 3>{} + range_int(i);
+            const auto kShift = (range_int<7, 8>{} - range_int(i)).scaled_by<8>();
+            // RUT_INTEGER_RANGE: the loop bounds the shift count to [0, 56].
+            out[kPosition.index()] = bounded_remainder<256>(payload_len >> kShift.value()).to<u8>();
         }
         offset = 10;
     }
     if (masked) {
-        for (u32 i = 0; i < 4; i++)
-            out[static_cast<i64>(offset) + static_cast<i64>(i)] = mask_key[i];
-        offset = static_cast<u32>(static_cast<i64>(offset) + 4);
+        __builtin_memmove(out + range_int{offset}.index(), mask_key, 4);
+        return (range_int(offset) + range_int<4, 5>{}).to<u32>();
     }
     return offset;
 }
@@ -146,7 +157,8 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
                                 WsOpcode* out_opcode,
                                 u64* out_total_len) {
     // Control frames are handled per-frame, never reassembled (§5.4).
-    if (!ws_opcode_valid(h.opcode) || ws_opcode_is_control(h.opcode)) return WsMessageStatus::Error;
+    if (!ws_opcode_valid(h.opcode) || ws_opcode_is_control(h.opcode) || h.payload_len < 0)
+        return WsMessageStatus::Error;
 
     if (h.opcode == WsOpcode::Continuation) {
         // A continuation is only meaningful once a message has been started.
@@ -159,10 +171,9 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
         m.in_fragmented = true;
     }
 
-    // Reject integer overflow even with an unbounded size, and enforce the configured
-    // cap without underflow if a caller supplies a smaller cap on a later fragment.
+    // RUT_INTEGER_RANGE: an unbounded message may use the full u64 accumulator.
     u64 total = 0;
-    if (__builtin_add_overflow(m.accumulated_len, h.payload_len, &total) ||
+    if (add_overflow(m.accumulated_len, h.payload_len, &total) ||
         (max_message_size != 0 && total > max_message_size)) {
         m.reset();
         return WsMessageStatus::Error;

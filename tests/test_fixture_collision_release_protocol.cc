@@ -498,9 +498,8 @@ bool canonical_and_rejection_matrix() {
         set_field(wrong_profile, 2u, 2u);
         if (!frame_rejection_is_terminal(prefix, next, wrong_profile)) return false;
         worker::Frame wrong_sequence = event_frame(next, expected_token);
-        set_field(wrong_sequence,
-                  wrong_sequence.payload.size() / sizeof(u64) - 1u,
-                  static_cast<u64>(next + 101u));
+        set_field(
+            wrong_sequence, wrong_sequence.payload.size() / sizeof(u64) - 1u, u64{next + 101u});
         if (!frame_rejection_is_terminal(prefix, next, wrong_sequence)) return false;
 
         if (next > 0u && !rejection_is_terminal(prefix, next, next, kTransaction + 1u))

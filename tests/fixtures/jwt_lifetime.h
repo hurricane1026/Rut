@@ -39,7 +39,7 @@ inline std::string make_token(const std::string& claims) {
     unsigned int signature_len = 0;
     if (HMAC(EVP_sha256(),
              kSecret,
-             static_cast<int>(sizeof(kSecret) - 1),
+             int{sizeof(kSecret) - 1},
              reinterpret_cast<const unsigned char*>(signing_input.data()),
              signing_input.size(),
              signature,

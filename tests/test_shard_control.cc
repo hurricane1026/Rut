@@ -62,7 +62,7 @@ struct EpochLoopF {
         if (conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u) !=
             sizeof(kRequest) - 1u)
             return false;
-        loop.dispatch(make_ev(conn.id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1u)));
+        loop.dispatch(make_ev(conn.id, IoEventType::Recv, i32{sizeof(kRequest) - 1u}));
         return true;
     }
 };
@@ -1762,7 +1762,7 @@ void rs256_reload_activates_only_the_adopting_shard(rut::test::TestCase* _tc) {
     u32 length = 0;
     auto verify = [&](Rs256Policies& owner, u32 shard, Str policy, Str jwt) {
         return owner.verify(
-            shard, policy, document, jwt, 2000000000, payload, sizeof(payload), length);
+            shard, policy, document, jwt, 2000000000, payload, sizeof(payload), &length);
     };
     const Str old_token =
         old_key.sign(test::Rs256Fixture::header, test::Rs256Fixture::claims, token);
@@ -1853,9 +1853,9 @@ void es256_reload_cancels_retired_refresh(rut::test::TestCase* _tc) {
     REQUIRE(token.len);
     u32 length = 0;
     CHECK(new_owner.verify(
-        3, new_key.policy, document, token, 2000000000, payload, sizeof(payload), length));
+        3, new_key.policy, document, token, 2000000000, payload, sizeof(payload), &length));
     CHECK(!new_owner.verify(
-        4, new_key.policy, document, token, 2000000000, payload, sizeof(payload), length));
+        4, new_key.policy, document, token, 2000000000, payload, sizeof(payload), &length));
 }
 }  // namespace
 

@@ -1,6 +1,7 @@
 #include "rut/runtime/regex_capture.h"
 
 #include "core/placement_new.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/string_ops.h"
@@ -92,21 +93,27 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
     Match matches[64]{};
     u32 count = 0;
     u32 search = 0;
-    i64 size = static_cast<i64>(subject.len);
+    i64 size = i64{subject.len};
     while (search <= subject.len) {
         re2::StringView found;
         if (!regex.Match(
                 CaptureProgram::view(text), search, text.len, re2::RE2::UNANCHORED, &found, 1))
             break;
         if (count == 64 || !found.data()) return 0;
-        const i64 start = static_cast<i64>(found.data() - text.ptr);
-        const i64 end = start + static_cast<i64>(found.size());
-        if (start < static_cast<i64>(search) || end > static_cast<i64>(text.len)) return 0;
-        matches[count++] = {static_cast<u32>(start), static_cast<u32>(end)};
-        size = size - (end - start) + static_cast<i64>(replacement.len);
+        const i64 start_offset = found.data() - text.ptr;
+        if (start_offset < search || start_offset > text.len) return 0;
+        u32 start;
+        if (!range_int(start_offset).to(&start)) return 0;
+        const auto available = (range_int(text.len) - range_int(start)).max(range_int<0, 1>{});
+        if (found.size() > available.to_u64()) return 0;
+        range_int<0, i64{UINT32_MAX} + 1> length;
+        if (!decltype(length)::try_from_u64(found.size(), &length)) return 0;
+        const u32 end = (range_int(start) + length).min(range_int(text.len)).to<u32>();
+        matches[count++] = {start, end};
+        size += (range_int(replacement.len) - length).value();
         if (end == start) {
             if (end == text.len) break;
-            search = static_cast<u32>(end + 1);
+            search = static_cast<u32>(i64{end} + 1);
         } else
             search = end;
     }
@@ -121,15 +128,15 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
     i64 written = 0;
     for (u32 i = 0; i < count; ++i) {
         const auto match = matches[i];
-        const i64 length = static_cast<i64>(match.start) - static_cast<i64>(copied);
+        const i64 length = i64{match.start} - i64{copied};
         if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
         written += length;
         if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
-        written += static_cast<i64>(replacement.len);
-        copied = static_cast<i64>(match.end);
+        written += i64{replacement.len};
+        copied = i64{match.end};
     }
-    if (static_cast<i64>(text.len) > copied)
-        __builtin_memcpy(data + written, text.ptr + copied, static_cast<i64>(text.len) - copied);
+    if (i64{text.len} > copied)
+        __builtin_memcpy(data + written, text.ptr + copied, i64{text.len} - copied);
     *output = {data, static_cast<u32>(size)};
     return 1;
 }

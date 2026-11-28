@@ -5,6 +5,8 @@
 // Run:    ./build/bench/bench_connection
 
 #include "bench.h"
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/event_loop.h"
@@ -51,10 +53,14 @@ static u64 rss_bytes() {
     while (buf[i] == ' ') i++;
     u64 pages = 0;
     while (buf[i] >= '0' && buf[i] <= '9') {
-        pages = pages * 10 + static_cast<u64>(buf[i] - '0');
+        const auto digit = bounded_remainder<16>(byte_value(buf[i]));
+        if (mul_overflow(pages, 10, &pages) || add_overflow(pages, digit.to_u64(), &pages))
+            return 0;
         i++;
     }
-    return pages * static_cast<u64>(sysconf(_SC_PAGESIZE));
+    const long page_size = sysconf(_SC_PAGESIZE);
+    u64 bytes;
+    return page_size > 0 && !mul_overflow(pages, page_size, &bytes) ? bytes : 0;
 }
 
 int main() {

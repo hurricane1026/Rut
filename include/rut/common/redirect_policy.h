@@ -108,7 +108,7 @@ inline bool redirect_policy_safe_static_authority(Str value) {
     for (u32 i = 0; i < value.len; i++) {
         const u8 c = static_cast<u8>(value.ptr[i]);
         if (c == '.') {
-            if (label_len == 0 || value.ptr[static_cast<i64>(i) - 1] == '-') return false;
+            if (label_len == 0 || value.ptr[i64{i} - 1] == '-') return false;
             label_len = 0;
             continue;
         }
@@ -118,7 +118,7 @@ inline bool redirect_policy_safe_static_authority(Str value) {
             return false;
         label_len++;
     }
-    return label_len != 0 && value.ptr[static_cast<i64>(value.len) - 1] != '-';
+    return label_len != 0 && value.ptr[i64{value.len} - 1] != '-';
 }
 
 inline bool redirect_policy_safe_body(Str value) {
@@ -178,9 +178,7 @@ inline bool redirect_policy_table_valid(const RedirectPolicySpec* specs, u32 cou
                               specs[i].target_path,
                               specs[i].body};
         for (const Str field : fields) {
-            if (static_cast<i64>(field.len) >
-                static_cast<i64>(kRedirectPolicyBytes) - static_cast<i64>(total))
-                return false;
+            if (i64{field.len} > i64{kRedirectPolicyBytes} - i64{total}) return false;
             total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(field.len));
         }
         for (u32 j = 0; j < i; j++) {

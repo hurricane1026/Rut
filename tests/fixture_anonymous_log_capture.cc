@@ -20,21 +20,21 @@ void fail(Diagnostic& diagnostic, FailurePhase phase, int error_number = 0) {
 }
 
 Identity make_identity(const struct stat& status) {
-    return {static_cast<std::uint64_t>(status.st_dev),
-            static_cast<std::uint64_t>(status.st_ino),
-            static_cast<std::uint64_t>(status.st_mode),
-            static_cast<std::uint64_t>(status.st_uid),
-            static_cast<std::uint64_t>(status.st_gid)};
+    return {std::uint64_t{status.st_dev},
+            std::uint64_t{status.st_ino},
+            std::uint64_t{status.st_mode},
+            std::uint64_t{status.st_uid},
+            std::uint64_t{status.st_gid}};
 }
 
 bool same_identity(const struct stat& status, const Identity& expected) {
     return S_ISREG(status.st_mode) && status.st_dev != 0 && status.st_ino != 0 &&
-           static_cast<std::uint64_t>(status.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(status.st_ino) == expected.inode &&
-           static_cast<std::uint64_t>(status.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(status.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(status.st_gid) == expected.gid &&
-           (status.st_mode & 07777) == 0600 && status.st_nlink == 0;
+           std::uint64_t{status.st_dev} == expected.device &&
+           std::uint64_t{status.st_ino} == expected.inode &&
+           std::uint64_t{status.st_mode} == expected.mode &&
+           std::uint64_t{status.st_uid} == expected.uid &&
+           std::uint64_t{status.st_gid} == expected.gid && (status.st_mode & 07777) == 0600 &&
+           status.st_nlink == 0;
 }
 
 bool valid_fd_flags(int fd, int& error_number) {
@@ -79,8 +79,8 @@ bool fd_matches_object(int fd, const Identity& expected, int& error_number) {
     // Refuse only a missing/replaced numeric descriptor; matching dev/inode of
     // the regular, unlinked memfd is the stable object identity.
     if (!S_ISREG(status.st_mode) || status.st_nlink != 0 || status.st_dev == 0 ||
-        status.st_ino == 0 || static_cast<std::uint64_t>(status.st_dev) != expected.device ||
-        static_cast<std::uint64_t>(status.st_ino) != expected.inode) {
+        status.st_ino == 0 || std::uint64_t{status.st_dev} != expected.device ||
+        std::uint64_t{status.st_ino} != expected.inode) {
         error_number = EINVAL;
         return false;
     }

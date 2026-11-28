@@ -616,7 +616,7 @@ u32 build(u8* buf, WsOpcode op, bool fin, bool masked, const u8* payload, u32 le
 // Parse one frame from buf; copy its unmasked payload into pl. Return total frame bytes.
 u32 parse_one(const u8* buf, u32 len, bool masked, WsFrameHeader* h, u8* pl) {
     if (ws_parse_header(buf, len, masked, h) != ParseStatus::Complete) return 0;
-    for (u64 i = 0; i < h->payload_len; i++) pl[i] = buf[h->header_len + i];
+    for (i64 i = 0; i < h->payload_len; i++) pl[i] = buf[h->header_len + i];
     if (h->masked) ws_unmask(pl, h->payload_len, h->mask_key);
     return h->header_len + static_cast<u32>(h->payload_len);
 }
@@ -702,7 +702,7 @@ TEST(ws_terminate, json_number_text_rewrite_preserves_lexeme_and_copies_for_both
             char expected[96];
             const int expected_len = snprintf(expected, sizeof(expected), "<%s>", token);
             REQUIRE(expected_len > 0);
-            CHECK_EQ(h.payload_len, static_cast<u64>(expected_len));
+            CHECK_EQ(h.payload_len, expected_len);
             CHECK(memcmp(decoded, expected, static_cast<u32>(expected_len)) == 0);
             u8 stable[128];
             memcpy(stable, out, produced);
@@ -3128,7 +3128,7 @@ TEST(ws_terminate, affix_rewrite_rejects_invalid_binary_text_size_utf8_and_trunc
         if (invalid == 5) {
             st.forward_text = {{oversized, sizeof(oversized)}, {}, {}, WsTextSource::MessageText};
         }
-        const u8 input[] = {invalid == 0 ? static_cast<u8>(0xff) : static_cast<u8>('x')};
+        const u8 input[] = {invalid == 0 ? u8{0xff} : u8{'x'}};
         u8 in[32], out[128], msg[32];
         const u32 n = build(in, op, true, false, input, 1);
         u32 used = 0, produced = 0;

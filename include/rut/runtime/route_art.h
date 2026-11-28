@@ -80,9 +80,8 @@ using ArtChildRef = u16;
 constexpr ArtChildRef kArtInvalidChildRef = 0xffffu;
 
 constexpr u32 kArtTypeBits = 2;
-constexpr u32 kArtIdxBits = static_cast<u32>(static_cast<i64>(16) - static_cast<i64>(kArtTypeBits));
-constexpr ArtChildRef kArtIdxMask =
-    static_cast<ArtChildRef>(static_cast<ArtChildRef>(static_cast<i64>(1u << kArtIdxBits) - 1));
+constexpr u32 kArtIdxBits = u32{i64{16} - i64{kArtTypeBits}};
+constexpr ArtChildRef kArtIdxMask = ArtChildRef{ArtChildRef{i64{1u << kArtIdxBits} - 1}};
 
 enum ArtNodeType : u8 {
     kArtN4 = 0,

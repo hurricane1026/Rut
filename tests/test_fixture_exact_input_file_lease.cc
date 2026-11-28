@@ -181,10 +181,10 @@ bool normal_lifecycle_and_ordering_test() {
              (held.st_mode & 0777) == 0600 &&
              held.st_uid == static_cast<uid_t>(lease.identity().uid) &&
              held.st_gid == static_cast<gid_t>(lease.identity().gid) && held.st_nlink == 1u &&
-             held.st_size == static_cast<off_t>(sizeof(kBytes) - 1u) &&
-             (fd_flags & FD_CLOEXEC) != 0 && (status_flags & O_ACCMODE) == O_RDONLY &&
-             lease.revalidate(diagnostic) && lease.revalidate(diagnostic) &&
-             lease.cleanup(diagnostic) && lease.cleanup(diagnostic) && complete(receipt);
+             held.st_size == off_t{sizeof(kBytes) - 1u} && (fd_flags & FD_CLOEXEC) != 0 &&
+             (status_flags & O_ACCMODE) == O_RDONLY && lease.revalidate(diagnostic) &&
+             lease.revalidate(diagnostic) && lease.cleanup(diagnostic) &&
+             lease.cleanup(diagnostic) && complete(receipt);
         {
             input::ExactInputFileLease destructor_lease;
             ok = ok && create(7u, owner, destructor_lease, diagnostic);
@@ -442,17 +442,16 @@ bool exact_ofd_tests() {
             state.error_number = error_number;
             struct stat named{};
             std::vector<int> before, after;
-            const bool denied =
-                fd_snapshot(before) && !lease.cleanup(diagnostic) &&
-                failed(diagnostic, input::FailurePhase::DescriptorClose) &&
-                diagnostic.error_number == error_number &&
-                stat_at(owner.descriptor(), name, named) &&
-                static_cast<std::uint64_t>(named.st_dev) == lease.identity().device &&
-                static_cast<std::uint64_t>(named.st_ino) == lease.identity().inode &&
-                !lease.cleanup_receipt()->path_quarantined &&
-                !lease.cleanup_receipt()->exact_unlinked &&
-                !lease.cleanup_receipt()->settlement_complete && fd_snapshot(after) &&
-                before == after;
+            const bool denied = fd_snapshot(before) && !lease.cleanup(diagnostic) &&
+                                failed(diagnostic, input::FailurePhase::DescriptorClose) &&
+                                diagnostic.error_number == error_number &&
+                                stat_at(owner.descriptor(), name, named) &&
+                                std::uint64_t{named.st_dev} == lease.identity().device &&
+                                std::uint64_t{named.st_ino} == lease.identity().inode &&
+                                !lease.cleanup_receipt()->path_quarantined &&
+                                !lease.cleanup_receipt()->exact_unlinked &&
+                                !lease.cleanup_receipt()->settlement_complete &&
+                                fd_snapshot(after) && before == after;
             if (!check(denied, "denied exact-OFD proof mutated namespace or descriptors"))
                 return false;
         }

@@ -1,8 +1,11 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
+#include <utility>
 
 #include <errno.h>
 #include <sys/mman.h>  // mmap, munmap
@@ -28,13 +31,12 @@ struct MmapBackend {
 
     // Acquire a block of at least `needed` bytes. Returns raw ptr + actual size.
     // The caller embeds a Block header at the start.
-    u8* acquire(u64 needed, u64* out_size) {
+    [[nodiscard]] u8* acquire(u64 needed, u64* out_size) {
         u64 size = default_block_size > needed ? default_block_size : needed;
         // Page-align
-        if (size > static_cast<u64>(-1) - 4095) return nullptr;
         u64 aligned = 0;
-        if (__builtin_add_overflow(size, static_cast<u64>(4095), &aligned)) return nullptr;
-        size = aligned & ~static_cast<u64>(4095);
+        if (add_overflow(size, u64{4095}, &aligned)) return nullptr;
+        size = aligned & ~u64{4095};
         void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
         *out_size = size;
@@ -82,23 +84,21 @@ template <typename Backend>
 struct Arena {
     struct Block {
         Block* prev;
-        u64 size;  // total block size (including this header)
-        u64 used;  // bytes allocated after header
+        // Published blocks satisfy kHeaderSize <= size and 0 <= used <= size - kHeaderSize.
+        range_int<0> size;  // total block size (including this header)
+        i64 used;           // payload bytes reserved so far, also the next allocation offset
 
-        static constexpr u64 kHeaderSize = (sizeof(Block) + 15) & ~u64(15);
-        u8* data() { return reinterpret_cast<u8*>(this) + static_cast<i64>(kHeaderSize); }
-        u64 capacity() const {
-            u64 result = 0;
-            return size >= kHeaderSize && !__builtin_sub_overflow(size, kHeaderSize, &result)
-                       ? result
-                       : 0;
-        }
-        u64 remaining() const {
-            const u64 available = capacity();
-            u64 result = 0;
-            return used <= available && !__builtin_sub_overflow(available, used, &result) ? result
-                                                                                          : 0;
-        }
+        static_assert(sizeof(decltype(size)) == sizeof(i64));
+        static_assert(alignof(decltype(size)) == alignof(i64));
+
+        static constexpr i64 kHeaderSize = [] {
+            constexpr i64 kBlockSize = sizeof(Block);
+            static_assert(kBlockSize <= UINT32_MAX);
+            return (kBlockSize + 15) / 16 * 16;
+        }();
+        u8* data() { return reinterpret_cast<u8*>(this) + kHeaderSize; }
+        [[nodiscard]] i64 capacity() const { return size.value() - kHeaderSize; }
+        i64 remaining() const { return capacity() - used; }
     };
 
     Block* current = nullptr;
@@ -110,63 +110,49 @@ struct Arena {
     core::Expected<void, Error> init(Args&&... args) {
         total_allocated = 0;
         current = nullptr;
-        auto r = backend.init(static_cast<Args&&>(args)...);
+        auto r = backend.init(std::forward<Args>(args)...);
         if (!r) return r;
-        current = alloc_block(Block::kHeaderSize, nullptr);
+        constexpr auto kHeader = range_int<Block::kHeaderSize, Block::kHeaderSize + 1>{};
+        current = alloc_block(kHeader, nullptr);
         if (!current) return core::make_unexpected(Error::from_errno(Error::Source::Arena));
         return {};
     }
 
     // Bump allocate, 8-byte aligned.
-    void* alloc(u64 size) {
-        if (!current) return nullptr;
-        if (size > static_cast<u64>(-1) - 7) return nullptr;
-        u64 aligned = 0;
-        if (__builtin_add_overflow(size, static_cast<u64>(7), &aligned)) return nullptr;
-        size = aligned & ~static_cast<u64>(7);
-        if (current->remaining() >= size) {
-            void* p = current->data() + static_cast<i64>(current->used);
-            u64 next_used = 0;
-            if (__builtin_add_overflow(current->used, size, &next_used)) return nullptr;
-            current->used = next_used;
-            return p;
-        }
-        u64 needed = 0;
-        if (__builtin_add_overflow(Block::kHeaderSize, size, &needed)) return nullptr;
-        Block* b = alloc_block(needed, current);
-        if (!b || b->capacity() < size) {
-            if (b) backend.release(reinterpret_cast<u8*>(b), b->size);
-            return nullptr;
-        }
-        current = b;
-        void* p = current->data() + static_cast<i64>(current->used);
-        u64 next_used = 0;
-        if (__builtin_add_overflow(current->used, size, &next_used)) return nullptr;
-        current->used = next_used;
-        return p;
+    [[nodiscard]] void* alloc(i64 requested_size) {
+        AllocationSize size;
+        if (!current || !AllocationSize::try_from_i64(requested_size, &size)) return nullptr;
+        return alloc_aligned(size);
+    }
+
+    template <typename Size>
+        requires(__is_same(Size, unsigned long) || __is_same(Size, unsigned long long))
+    [[nodiscard]] void* alloc(Size requested_size) {
+        AllocationSize size;
+        if (!current || !AllocationSize::try_from_u64(requested_size, &size)) return nullptr;
+        return alloc_aligned(size);
     }
 
     // Typed bump alloc + placement new.
     template <typename T, typename... Args>
-    T* alloc_t(Args&&... args) {
-        void* p = alloc(sizeof(T));
+    [[nodiscard]] T* alloc_t(Args&&... args) {
+        constexpr auto kBytes = range_int<sizeof(T), sizeof(T) + 1>{};
+        void* p = alloc(kBytes.template to<i64>());
         if (!p) return nullptr;
-        return ::new (p) T(static_cast<Args&&>(args)...);
+        return ::new (p) T(std::forward<Args>(args)...);
     }
 
     // Array bump alloc, value-initialized via placement new.
     template <typename T>
-    T* alloc_array(u32 count) {
-        T* a = nullptr;
-        // NOLINTNEXTLINE(bugprone-sizeof-expression)
-        if (count > 0 && sizeof(a[0]) > static_cast<u64>(-1) / count) return nullptr;
-        // NOLINTNEXTLINE(bugprone-sizeof-expression)
-        void* p = alloc(static_cast<u64>(sizeof(a[0])) * count);
-        if (!p) return nullptr;
-        a = static_cast<T*>(p);
+    [[nodiscard]] T* alloc_array(u32 count) {
+        const auto elements = range_int{count};
+        if (elements.to_u64() > u64{INT64_MAX} / sizeof(T)) return nullptr;
+        const u64 bytes = elements.to_u64() * sizeof(T);
+        auto* a = static_cast<T*>(alloc(bytes));
+        if (!a) return nullptr;
         for (u32 i = 0; i < count; i++) {
             // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
-            void* slot = static_cast<void*>(a + static_cast<i64>(i));
+            void* slot = a + range_int{i}.index();
             ::new (slot) T{};
         }
         return a;
@@ -177,53 +163,89 @@ struct Arena {
         if (!current) return;
         while (current->prev) {
             Block* prev = current->prev;
-            u64 sz = current->size;
-            backend.release(reinterpret_cast<u8*>(current), sz);
-            if (__builtin_sub_overflow(total_allocated, sz, &total_allocated)) total_allocated = 0;
+            backend.release(reinterpret_cast<u8*>(current), current->size.to_u64());
             current = prev;
         }
         current->used = 0;
+        // Only the original block remains. Its validated size is the total.
+        total_allocated = current->size.to_u64();
     }
 
     // Free everything.
     void destroy() {
         while (current) {
             Block* prev = current->prev;
-            backend.release(reinterpret_cast<u8*>(current), current->size);
+            backend.release(reinterpret_cast<u8*>(current), current->size.to_u64());
             current = prev;
         }
         current = nullptr;
         total_allocated = 0;
     }
 
-    u64 space_used() const {
-        u64 t = 0;
-        for (Block* b = current; b; b = b->prev) {
-            if (__builtin_add_overflow(t, b->used, &t)) return UINT64_MAX;
+    // Valid usage is below the allocated total because each block includes a header.
+    // The sentinel makes budget checks fail closed when the accounting is invalid.
+    static constexpr u64 kInvalidSpaceUsed = UINT64_MAX;
+
+    [[nodiscard]] u64 space_used() const {
+        u64 used = 0;
+        for (const Block* b = current; b; b = b->prev) {
+            range_int<0> block_used;
+            if (!decltype(block_used)::try_from_i64(b->used, &block_used)) return kInvalidSpaceUsed;
+            const u64 bytes = block_used.to_u64();
+            if (add_overflow(used, bytes, &used)) return kInvalidSpaceUsed;
         }
-        return t;
+        return used;
     }
 
     u64 space_allocated() const { return total_allocated; }
 
 private:
-    Block* alloc_block(u64 needed, Block* prev) {
+    static constexpr i64 kAllocationAlignment = 8;
+    using AllocationSize = range_int<0, kI64ExclusiveEnd - (kAllocationAlignment - 1)>;
+
+    [[nodiscard]] void* alloc_aligned(AllocationSize request) {
+        constexpr auto kPadding =
+            range_int<kAllocationAlignment - 1,
+                      kAllocationAlignment>::constant<kAllocationAlignment - 1>();
+        const auto padded = request + kPadding;
+        const i64 aligned_size = padded.value() / kAllocationAlignment * kAllocationAlignment;
+        if (aligned_size <= current->remaining()) {
+            void* p = current->data() + current->used;
+            current->used += aligned_size;
+            return p;
+        }
+        i64 needed;
+        if (add_overflow(Block::kHeaderSize, aligned_size, &needed)) return nullptr;
+        range_int<Block::kHeaderSize> block_bytes;
+        if (!decltype(block_bytes)::try_from_i64(needed, &block_bytes)) return nullptr;
+        // alloc_block releases undersized blocks before returning, so any returned block
+        // has at least aligned_size bytes of payload.
+        Block* b = alloc_block(block_bytes, current);
+        if (!b) return nullptr;
+        b->used = aligned_size;
+        current = b;
+        return b->data();
+    }
+
+    [[nodiscard]] Block* alloc_block(range_int<Block::kHeaderSize> needed, Block* prev) {
         u64 actual_size = 0;
-        u8* mem = backend.acquire(needed, &actual_size);
+        u8* mem = backend.acquire(needed.to_u64(), &actual_size);
         if (!mem) return nullptr;
         // Every block embeds its header before the payload. A backend that
-        // returns a non-null short block cannot safely be used, even if its
-        // acquire call itself succeeded.
-        if (actual_size < Block::kHeaderSize || actual_size < needed) {
+        // reports a short block or a size outside the signed offset range
+        // cannot be used.
+        range_int<0> block_size;
+        if (!decltype(block_size)::try_from_u64(actual_size, &block_size) ||
+            block_size.value() < needed.value()) {
             backend.release(mem, actual_size);
             return nullptr;
         }
         auto* b = reinterpret_cast<Block*>(mem);
         b->prev = prev;
-        b->size = actual_size;
+        b->size = block_size;
         b->used = 0;
         u64 next_total = 0;
-        if (__builtin_add_overflow(total_allocated, actual_size, &next_total)) {
+        if (add_overflow(total_allocated, actual_size, &next_total)) {
             backend.release(mem, actual_size);
             return nullptr;
         }

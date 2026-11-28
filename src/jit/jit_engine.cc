@@ -2,6 +2,7 @@
 
 #include "rut/jit/native_helper_symbols.h"
 #include "rut/jit/runtime_helpers.h"
+#include "rut/platform/write.h"
 #include "rut/runtime/crypto_c.h"
 
 #include <llvm-c/Analysis.h>
@@ -17,26 +18,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>  // write (for error logging)
 
 namespace rut::jit {
 
 // ── Error logging (no stdlib) ──────────────────────────────────────
 
 static void log_error(const char* prefix, LLVMErrorRef err) {
-    auto write_str = [](const char* s) {
-        int len = 0;
-        while (s[len]) len++;
-        (void)::write(2, s, len);
-    };
-    write_str(prefix);
+    platform::write_diagnostic(prefix);
     if (err) {
         char* msg = LLVMGetErrorMessage(err);
-        write_str(": ");
-        write_str(msg);
+        platform::write_diagnostic(": ");
+        platform::write_diagnostic(msg);
         LLVMDisposeErrorMessage(msg);
     }
-    write_str("\n");
+    platform::write_diagnostic("\n");
 }
 
 // ── Runtime Helper Symbol Table ────────────────────────────────────
@@ -128,7 +123,7 @@ static bool extract_regex_pattern(LLVMValueRef global, const char** out_ptr, u32
 JitEngine::RegexSlot* JitEngine::alloc_regex_slot() {
     if (regex_slot_count == regex_slot_cap) {
         u32 next_cap = regex_slot_cap ? regex_slot_cap * 2 : 16;
-        size_t bytes = static_cast<size_t>(next_cap) * sizeof(RegexSlot*);
+        size_t bytes = size_t{next_cap} * sizeof(RegexSlot*);
         auto** next =
             static_cast<RegexSlot**>(realloc(reinterpret_cast<void*>(regex_slots), bytes));
         if (!next) return nullptr;
@@ -360,7 +355,7 @@ bool emit_native_object(LLVMModuleRef mod, const char* output, OptLevel level) {
     bool ok =
         !LLVMTargetMachineEmitToFile(tm, mod, const_cast<char*>(output), LLVMObjectFile, &error);
     if (error) {
-        (void)::write(2, error, strlen(error));
+        platform::write_diagnostic(error);
         LLVMDisposeMessage(error);
     }
     LLVMDisposeTargetMachine(tm);
@@ -387,14 +382,9 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     // LLVM may populate OutMessage even when verification succeeds (observed as a
     // 1-byte empty strdup on LLVM 22), so it must always be disposed when set.
     if (verify_failed && verify_msg) {
-        auto write_str = [](const char* s) {
-            int len = 0;
-            while (s[len]) len++;
-            (void)::write(2, s, len);
-        };
-        write_str("jit: module verification failed: ");
-        write_str(verify_msg);
-        write_str("\n");
+        platform::write_diagnostic("jit: module verification failed: ");
+        platform::write_diagnostic(verify_msg);
+        platform::write_diagnostic("\n");
     }
     if (verify_msg) LLVMDisposeMessage(verify_msg);
     if (verify_failed) {
@@ -468,7 +458,7 @@ void* JitEngine::lookup(const char* name) {
     // Cast via uintptr_t. The NOLINT suppresses performance-no-int-to-ptr
     // which is unavoidable here — the LLVM C API returns addresses as u64.
     return reinterpret_cast<void*>(  // NOLINT(performance-no-int-to-ptr)
-        static_cast<uintptr_t>(addr));
+        uintptr_t{addr});
 }
 
 void JitEngine::shutdown() {

@@ -38,12 +38,12 @@ struct LiveAccessLogPeek {
 // pop before I/O succeeds.
 struct alignas(64) LiveAccessLogRing {
     static constexpr u32 kCapacity = 512;
-    static constexpr u32 kMask = static_cast<u32>(static_cast<i64>(kCapacity) - 1);
+    static constexpr u32 kMask = u32{i64{kCapacity} - 1};
 
     alignas(64) std::atomic<u64> published_pos;
-    char _published_pad[static_cast<i64>(64) - static_cast<i64>(sizeof(std::atomic<u64>))]{};
+    char _published_pad[i64{64} - i64{sizeof(std::atomic<u64>)}]{};
     alignas(64) std::atomic<u64> committed_pos;
-    char _committed_pad[static_cast<i64>(64) - static_cast<i64>(sizeof(std::atomic<u64>))]{};
+    char _committed_pad[i64{64} - i64{sizeof(std::atomic<u64>)}]{};
     AccessLogEntry entries[kCapacity];
 
     void init();
@@ -61,16 +61,14 @@ struct alignas(64) LiveAccessLogRing {
 };
 
 static_assert(LiveAccessLogRing::kCapacity == 512u);
-static_assert((LiveAccessLogRing::kCapacity &
-               static_cast<u32>(static_cast<i64>(LiveAccessLogRing::kCapacity) - 1)) == 0u);
+static_assert((LiveAccessLogRing::kCapacity & u32{i64{LiveAccessLogRing::kCapacity} - 1}) == 0u);
 static_assert(std::atomic<u64>::is_always_lock_free);
 static_assert(alignof(LiveAccessLogRing) == 64u);
 static_assert(offsetof(LiveAccessLogRing, published_pos) == 0u);
 static_assert(offsetof(LiveAccessLogRing, committed_pos) == 64u);
 static_assert(offsetof(LiveAccessLogRing, entries) == 128u);
 static_assert(sizeof(LiveAccessLogRing) >=
-              static_cast<i64>(128) + static_cast<i64>(LiveAccessLogRing::kCapacity) *
-                                          static_cast<i64>(sizeof(AccessLogEntry)));
+              i64{128} + i64{LiveAccessLogRing::kCapacity} * i64{sizeof(AccessLogEntry)});
 static_assert(std::is_trivially_copyable_v<LiveAccessLogTicket>);
 
 }  // namespace rut

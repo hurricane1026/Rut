@@ -1,5 +1,8 @@
 #include "rut/runtime/hpack.h"
 
+#include "rut/common/range_int.h"
+#include "rut/common/trap.h"
+
 namespace rut::hpack {
 
 namespace {
@@ -68,7 +71,7 @@ constexpr HuffCode kHuff[kSymCount] = {
     {0x3ffffee, 26},  {0x3fffffff, 30},
 };
 
-constexpr u32 kEosSym = 256;
+constexpr i16 kEosSym = 256;
 
 // Compile-time decode trie. Each node has two children (bit 0 / bit 1); a leaf
 // stores its symbol. Built once at compile time from kHuff — no runtime init,
@@ -77,10 +80,11 @@ constexpr u32 kMaxNodes = 600;  // <= 2*257-1 internal+leaf nodes
 struct HuffTrie {
     i16 child[kMaxNodes][2];
     i16 sym[kMaxNodes];
-    u16 node_count;
+    i16 node_count;
 };
 
-constexpr HuffTrie build_trie() {
+[[nodiscard]] consteval HuffTrie build_trie() {
+    static_assert(kMaxNodes <= INT16_MAX && kSymCount <= INT16_MAX);
     HuffTrie t{};
     for (u32 i = 0; i < kMaxNodes; i++) {
         t.child[i][0] = -1;
@@ -89,18 +93,24 @@ constexpr HuffTrie build_trie() {
     }
     t.node_count = 1;  // node 0 = root
     for (u32 s = 0; s < kSymCount; s++) {
+        range_int<0, kSymCount> bounded_symbol;
+        if (!bounded_symbol.try_from_u64(s, &bounded_symbol))
+            RUT_TRAP("HPACK Huffman symbol exceeds its signed range");
+        const i16 symbol = bounded_symbol.to<i16>();
         const u32 kCode = kHuff[s].code;
         const u8 kBits = kHuff[s].bits;
         i16 node = 0;
-        for (i32 b = static_cast<i32>(kBits) - 1; b >= 0; b--) {
-            const u32 kBit = (kCode >> static_cast<u32>(b)) & 1u;
+        for (i32 b = i32{kBits} - 1; b >= 0; b--) {
+            const u32 kBit = (kCode >> b) & 1u;
             if (t.child[node][kBit] < 0) {
-                t.child[node][kBit] = static_cast<i16>(t.node_count);
+                if (t.node_count == i32{kMaxNodes})
+                    RUT_TRAP("HPACK Huffman tree exceeds its node capacity");
+                t.child[node][kBit] = t.node_count;
                 t.node_count++;
             }
             node = t.child[node][kBit];
         }
-        t.sym[node] = static_cast<i16>(s);
+        t.sym[node] = symbol;
     }
     return t;
 }
@@ -109,40 +119,42 @@ constexpr HuffTrie kTrie = build_trie();
 
 // Table-driven Huffman decode FSM (nghttp2-style), built at compile time from
 // the bit trie. Each step consumes a 4-bit nibble: from state `node`, fsm_next
-// is the resulting trie node and fsm_sym (>=0) the symbol completed during the
+// is the resulting trie node and fsm_sym (<256) the symbol completed during the
 // nibble (at most one, since the shortest code is 5 bits). fsm_fail marks an
 // EOS symbol completing in the stream (a decode error). pad_ok[node] marks a
 // state that is a valid trailing-padding position (root, or 1..7 ones along the
 // EOS prefix). The HPACK Huffman code is complete, so every nibble transition
 // is valid mid-stream — no failure path except EOS and end-of-input padding.
+constexpr u16 kNoHuffmanByte = 256;
+
 struct HuffFsm {
     i16 next[kMaxNodes][16];
-    i16 sym[kMaxNodes][16];
+    u16 sym[kMaxNodes][16];
     u8 fail[kMaxNodes][16];
     u8 pad_ok[kMaxNodes];
 };
 
-constexpr HuffFsm build_fsm() {
+[[nodiscard]] constexpr HuffFsm build_fsm() {
     HuffFsm f{};
     for (u32 n = 0; n < kMaxNodes; n++) {
         f.pad_ok[n] = 0;
         for (u32 v = 0; v < 16; v++) {
             f.next[n][v] = 0;
-            f.sym[n][v] = -1;
+            f.sym[n][v] = kNoHuffmanByte;
             f.fail[n][v] = 0;
         }
     }
-    for (u32 n = 0; n < kTrie.node_count; n++) {
+    for (i16 n = 0; n < kTrie.node_count; n++) {
         for (u32 v = 0; v < 16; v++) {
-            i16 cur = static_cast<i16>(n);
-            i16 emitted = -1;
+            i16 cur = n;
+            u16 emitted = kNoHuffmanByte;
             u8 failed = 0;
             for (i32 b = 3; b >= 0; b--) {
-                const u32 kBit = (v >> static_cast<u32>(b)) & 1u;
+                const u32 kBit = (v >> b) & 1u;
                 cur = kTrie.child[cur][kBit];
                 if (cur < 0) break;  // unreachable: code is complete
                 if (kTrie.sym[cur] >= 0) {
-                    if (kTrie.sym[cur] == static_cast<i16>(kEosSym))
+                    if (kTrie.sym[cur] == kEosSym)
                         failed = 1;
                     else
                         emitted = kTrie.sym[cur];
@@ -170,139 +182,147 @@ constexpr HuffFsm kFsm = build_fsm();
 
 }  // namespace
 
-u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
-    if (len == 0) return 0;
-    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
+[[nodiscard]] u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
+    if (len == 0 || prefix_bits == 0 || prefix_bits > 8) return 0;
+    // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
+    const u32 kMask = ~(~u32{0} << prefix_bits);
     u32 value = in[0] & kMask;
     if (value < kMask) {
         *out = value;
         return 1;
     }
     // Continuation octets: 7 bits each, low-order first; high bit = "more".
-    i64 acc = kMask;
+    i64 acc = range_int{kMask}.to<i64>();
     i64 shift = 0;
     u32 i = 1;
     while (true) {
         if (i >= len) return 0;  // truncated
         const u8 kB = in[i++];
-        acc += static_cast<i64>(kB & 0x7f) << shift;
+        // RUT_INTEGER_RANGE: acc <= UINT32_MAX and at most 7 bits are added at shift <= 28.
+        acc += bounded_remainder<128>(kB).to<i64>() << shift;
         if (acc > 0xffffffffLL) return 0;  // exceeds 32 bits
         if ((kB & 0x80) == 0) break;
         shift += 7;
         if (shift > 28) return 0;  // would overflow on next octet
     }
-    *out = static_cast<u32>(acc);
-    return static_cast<u32>(i);
+    if (!range_int(acc).to(out)) return 0;
+    return i;
 }
 
-u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
-    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
+[[nodiscard]] u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
+    if (prefix_bits == 0 || prefix_bits > 8) return 0;
+    // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
+    const u32 kMask = ~(~u32{0} << prefix_bits);
     if (value < kMask) {
-        out[0] = static_cast<u8>(prefix_top | value);
+        out[0] = bounded_remainder<256>(range_int{prefix_top}.to_u64() | value).to<u8>();
         return 1;
     }
-    out[0] = static_cast<u8>(prefix_top | kMask);
-    i64 remainder = static_cast<i64>(value) - static_cast<i64>(kMask);
-    i64 i = 1;
+    out[0] = bounded_remainder<256>(range_int{prefix_top}.to_u64() | kMask).to<u8>();
+    const auto kRemainder = range_int(value) - range_int(kMask);
+    u32 remainder = kRemainder.max(range_int<0, 1>{}).to<u32>();
+    u32 i = 1;
     while (remainder >= 128) {
-        out[i++] = static_cast<u8>((remainder & 0x7f) | 0x80);
+        out[i++] = (bounded_remainder<128>(remainder) + range_int<128, 129>{}).to<u8>();
         remainder >>= 7;
     }
-    out[i++] = static_cast<u8>(remainder);
-    return static_cast<u32>(i);
+    out[i++] = bounded_remainder<128>(remainder).to<u8>();
+    return i;
 }
 
-i64 huffman_encoded_len(const u8* src, u32 len) {
+[[nodiscard]] i64 huffman_encoded_len(const u8* src, u32 len) {
     // The longest HPACK code is 30 bits, so the full u32 input range fits in
     // signed 64-bit arithmetic: UINT32_MAX * 30 < INT64_MAX.
     i64 bits = 0;
-    for (u32 i = 0; i < len; i++) bits += static_cast<i64>(kHuff[src[i]].bits);
+    for (u32 i = 0; i < len; i++) bits += range_int{kHuff[src[i]].bits}.to<i64>();
 
     return huffman_encoded_bytes_from_bits(bits);
 }
 
-i64 huffman_encode(u8* out, const u8* src, u32 len) {
+[[nodiscard]] i64 huffman_encode(u8* out, const u8* src, u32 len) {
     u64 acc = 0;    // bit accumulator, MSB-first
     i64 nbits = 0;  // valid bits in acc
     i64 o = 0;
     for (u32 i = 0; i < len; i++) {
         const HuffCode kEntry = kHuff[src[i]];
         acc = (acc << kEntry.bits) | kEntry.code;
-        nbits += static_cast<i64>(kEntry.bits);
+        nbits += range_int{kEntry.bits}.to<i64>();
         while (nbits >= 8) {
             nbits -= 8;
-            out[o++] = static_cast<u8>((acc >> nbits) & 0xff);
+            out[o++] = bounded_remainder<256>(acc >> nbits).to<u8>();
         }
     }
     if (nbits > 0) {
         // Pad the remaining bits with the EOS prefix (all 1s) to an octet.
         const i64 kPad = 8 - nbits;
-        const i64 kMask = (i64{1} << kPad) - i64{1};
-        acc = (acc << kPad) | static_cast<u64>(kMask);
-        out[o++] = static_cast<u8>(acc & 0xff);
+        const u64 kMask = ~(~u64{0} << kPad);
+        acc = (acc << kPad) | kMask;
+        out[o++] = bounded_remainder<256>(acc).to<u8>();
     }
     return o;
 }
 
-i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
+[[nodiscard]] i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
+    // The signed result reports -1 on failure and otherwise carries the exact length.
+    const i32 limit = range_int{cap}.min(range_int<INT32_MAX, INT32_MAX + 1LL>{}).to<i32>();
     i16 node = 0;
-    u32 o = 0;
+    i32 o = 0;
     for (u32 i = 0; i < len; i++) {
         const u8 kByte = src[i];
         // High nibble then low nibble — one FSM step each.
         const u32 kHi = kByte >> 4;
         if (kFsm.fail[node][kHi]) return -1;  // EOS symbol in the stream
-        if (kFsm.sym[node][kHi] >= 0) {
-            if (o >= cap) return -1;
-            out[o++] = static_cast<u8>(kFsm.sym[node][kHi]);
+        const u16 kHiSymbol = kFsm.sym[node][kHi];
+        if (kHiSymbol < kNoHuffmanByte) {
+            if (o >= limit) return -1;
+            out[o++] = bounded_remainder<256>(kHiSymbol).to<u8>();
         }
         node = kFsm.next[node][kHi];
         const u32 kLo = kByte & 0xf;
         if (kFsm.fail[node][kLo]) return -1;
-        if (kFsm.sym[node][kLo] >= 0) {
-            if (o >= cap) return -1;
-            out[o++] = static_cast<u8>(kFsm.sym[node][kLo]);
+        const u16 kLoSymbol = kFsm.sym[node][kLo];
+        if (kLoSymbol < kNoHuffmanByte) {
+            if (o >= limit) return -1;
+            out[o++] = bounded_remainder<256>(kLoSymbol).to<u8>();
         }
         node = kFsm.next[node][kLo];
     }
     // Trailing bits must be a valid EOS-prefix padding (root or 1..7 ones).
     if (!kFsm.pad_ok[node]) return -1;
-    return static_cast<i32>(o);
+    return o;
 }
 
-u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
+[[nodiscard]] u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     if (len == 0) return 0;
     const bool kHuffman = (in[0] & 0x80) != 0;
     u32 slen = 0;
     const u32 kHdr = decode_integer(in, len, 7, &slen);
     if (kHdr == 0) return 0;
-    if (static_cast<i64>(kHdr) > static_cast<i64>(len) ||
-        static_cast<i64>(slen) > static_cast<i64>(len) - static_cast<i64>(kHdr))
-        return 0;  // truncated payload
-    const u8* data = in + static_cast<i64>(kHdr);
+    const auto kConsumed = range_int(kHdr) + range_int(slen);
+    if (kConsumed.value() > len) return 0;  // truncated payload
+    const u8* data = in + range_int{kHdr}.index();
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);
-        if (kN < 0) return 0;
-        *out_len = static_cast<u32>(kN);
+        if (!range_int(kN).to(out_len)) return 0;
     } else {
         if (slen > cap) return 0;
         for (i64 i = 0; i < slen; i++) out[i] = data[i];
         *out_len = slen;
     }
-    return static_cast<u32>(static_cast<i64>(kHdr) + static_cast<i64>(slen));
+    return kConsumed.min(range_int(len)).to<u32>();
 }
 
-i64 encode_string(u8* out, const u8* src, u32 len) {
+[[nodiscard]] i64 encode_string(u8* out, const u8* src, u32 len) {
     const i64 kHlen = huffman_encoded_len(src, len);
-    if (kHlen < static_cast<i64>(len)) {
-        // kHlen < len <= UINT32_MAX proves this narrowing is representable.
-        const i64 kHdr = encode_integer(out, static_cast<u32>(kHlen), 7, 0x80);  // H=1
+    u32 encoded_length;
+    if (kHlen < len && range_int(kHlen).to(&encoded_length)) {
+        const i64 kHdr = encode_integer(out, encoded_length, 7, 0x80);  // H=1
         const i64 kN = huffman_encode(out + kHdr, src, len);
         return kHdr + kN;
     }
-    const i64 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
-    for (i64 i = 0; i < len; i++) out[kHdr + i] = src[i];
-    return kHdr + static_cast<i64>(len);
+    const auto header = range_int{encode_integer(out, len, 7, 0x00)};  // H=0
+    u8* const data = out + header.index();
+    for (u32 i = 0; i < len; i++) data[i] = src[i];
+    return (header + range_int{len}).to<i64>();
 }
 
 namespace {
@@ -382,7 +402,7 @@ constexpr StaticEntry kStatic[] = {
 
 constexpr u32 kStaticCount = sizeof(kStatic) / sizeof(kStatic[0]);  // 61
 
-bool str_eq(Str a, const char* b, u16 blen) {
+[[nodiscard]] bool str_eq(Str a, const char* b, u16 blen) {
     if (a.len != blen) return false;
     for (u32 i = 0; i < blen; i++)
         if (a.ptr[i] != b[i]) return false;
@@ -397,130 +417,149 @@ void dyn_clear(DynamicTable& d) {
     d.table_size = 0;
 }
 
-void dyn_evict_oldest(DynamicTable& d) {
-    if (d.nent == 0) return;
-    const DynamicTable::Entry kOld = d.ents[0];
-    const i64 kBlen = static_cast<i64>(kOld.nlen) + static_cast<i64>(kOld.vlen);
-    __builtin_memmove(d.buf, d.buf + kBlen, static_cast<i64>(d.byte_used) - kBlen);
-    d.byte_used = static_cast<u32>(static_cast<i64>(d.byte_used) - kBlen);
-    const i64 kOldCost = kBlen + 32;
-    d.table_size = static_cast<u32>(static_cast<i64>(d.table_size) - kOldCost);
-    for (u32 i = 1; i < d.nent; i++) {
-        const i64 kPrevious = static_cast<i64>(i) - 1;
-        d.ents[kPrevious] = d.ents[i];
-        d.ents[kPrevious].off = static_cast<u32>(static_cast<i64>(d.ents[kPrevious].off) - kBlen);
+[[nodiscard]] bool dyn_evict_oldest(DynamicTable& d) {
+    if (d.nent == 0 || d.nent > DynamicTable::kMaxEntries || d.byte_used > DynamicTable::kByteCap)
+        return false;
+    const auto& oldest = d.ents[0];
+    const auto payload = range_int(oldest.nlen) + range_int(oldest.vlen);
+    const auto cost = payload + range_int<32, 33>{};
+    u32 next_used;
+    u32 next_size;
+    if (!(range_int(d.byte_used) - payload).to(&next_used) ||
+        !(range_int(d.table_size) - cost).to(&next_size))
+        return false;
+    u32 destination = 0;
+    for (u32 i = 1; i < d.nent; ++i) {
+        auto entry = d.ents[i];
+        if (!(range_int(entry.off) - payload).to(&entry.off)) {
+            // The metadata was inconsistent. Drop the partial compaction and
+            // report failure so the caller stops using this HPACK context.
+            dyn_clear(d);
+            return false;
+        }
+        d.ents[destination++] = entry;
     }
-    d.nent = static_cast<u32>(static_cast<i64>(d.nent) - 1);
+    __builtin_memmove(d.buf, d.buf + payload.index(), next_used);
+    d.byte_used = next_used;
+    d.table_size = next_size;
+    --d.nent;
+    return true;
 }
 
-void dyn_set_max_size(DynamicTable& d, u32 m) {
-    d.max_size = m;
-    while (d.table_size > d.max_size) dyn_evict_oldest(d);
+[[nodiscard]] bool dyn_set_max_size(DynamicTable& d, u32 size) {
+    while (d.table_size > size)
+        if (!dyn_evict_oldest(d)) return false;
+    d.max_size = size;
+    return true;
 }
 
 // Add (name,value). Caller MUST ensure the source bytes do not alias d.buf.
-void dyn_add(DynamicTable& d, Str name, Str value) {
-    const i64 kPayload = static_cast<i64>(name.len) + static_cast<i64>(value.len);
-    const i64 kCost = kPayload + 32;
-    if (kCost > d.max_size || kPayload > DynamicTable::kByteCap) {
+[[nodiscard]] bool dyn_add(DynamicTable& d, Str name, Str value) {
+    constexpr auto kByteCap = range_int<DynamicTable::kByteCap, i64{DynamicTable::kByteCap} + 1>{};
+    const auto payload = range_int(name.len) + range_int(value.len);
+    const auto cost = payload + range_int<32, 33>{};
+    if (cost.value() > d.max_size || payload.value() > DynamicTable::kByteCap) {
         // §4.4: entry larger than the table empties it. The payload check also
         // keeps the u32 offsets and u16 entry lengths representable.
         dyn_clear(d);
-        return;
+        return true;
     }
-    while (static_cast<i64>(d.table_size) + kCost > d.max_size ||
+    while ((range_int(d.table_size) + cost).value() > d.max_size ||
            d.nent >= DynamicTable::kMaxEntries)
-        dyn_evict_oldest(d);
-    const u32 kPayload32 = static_cast<u32>(kPayload);
-    const u32 kCost32 = static_cast<u32>(kCost);
-    const u32 kOff = d.byte_used;
-    const i64 kOffWide = static_cast<i64>(kOff);
-    __builtin_memcpy(d.buf + kOffWide, name.ptr, name.len);
-    __builtin_memcpy(d.buf + kOffWide + static_cast<i64>(name.len), value.ptr, value.len);
-    d.byte_used = static_cast<u32>(static_cast<i64>(d.byte_used) + static_cast<i64>(kPayload32));
-    d.ents[d.nent].off = kOff;
-    d.ents[d.nent].nlen = static_cast<u16>(name.len);
-    d.ents[d.nent].vlen = static_cast<u16>(value.len);
-    d.nent++;
-    d.table_size = static_cast<u32>(static_cast<i64>(d.table_size) + static_cast<i64>(kCost32));
+        if (!dyn_evict_oldest(d)) return false;
+    const auto offset = range_int(d.byte_used);
+    const auto end = offset + payload;
+    if (end.value() > kByteCap.value()) return false;
+    const auto name_length = range_int(name.len).min(kByteCap);
+    const auto value_length = range_int(value.len).min(kByteCap);
+    __builtin_memcpy(d.buf + offset.index(), name.ptr, name_length.to<u16>());
+    __builtin_memcpy(d.buf + (offset + name_length).index(), value.ptr, value_length.to<u16>());
+    // The eviction loop reserves the entry's full cost, which includes its payload.
+    d.byte_used = end.min(kByteCap).to<u32>();
+    d.ents[d.nent++] = {offset.to<u32>(), name_length.to<u16>(), value_length.to<u16>()};
+    d.table_size = (range_int(d.table_size) + cost).min(range_int(d.max_size)).to<u32>();
+    return true;
 }
 
-bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
-    if (i >= d.nent) return false;
-    const i64 kEntry = static_cast<i64>(d.nent) - 1 - static_cast<i64>(i);
-    const DynamicTable::Entry& e = d.ents[kEntry];
-    name->ptr = reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off));
+[[nodiscard]] bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
+    if (d.nent > DynamicTable::kMaxEntries || i >= d.nent) return false;
+    const auto end = d.ents + range_int{d.nent}.index();
+    const DynamicTable::Entry& e = *(end - range_int{i}.index() - 1);
+    const auto offset = range_int{e.off};
+    name->ptr = reinterpret_cast<const char*>(d.buf + offset.index());
     name->len = e.nlen;
-    value->ptr =
-        reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + static_cast<i64>(e.nlen));
+    value->ptr = reinterpret_cast<const char*>(d.buf + (offset + range_int{e.nlen}).index());
     value->len = e.vlen;
     return true;
 }
 
+// The table index starts at the newest dynamic entry, following all static entries.
+constexpr auto kFirstDynamicIndex =
+    range_int<kStaticCount, i64{kStaticCount} + 1>{} + range_int<1, 2>{};
+
 // Resolve a 1-based HPACK index to (name,value). idx 1..61 = static.
-bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
+[[nodiscard]] bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     if (idx == 0) return false;
-    if (idx <= kStaticCount) {
-        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
+    using StaticIndex = range_int<1, i64{kStaticCount} + 1>;
+    StaticIndex index;
+    if (StaticIndex::try_from_u64(idx, &index)) {
+        const StaticEntry& e = (index - range_int<1, 2>{}).at(kStatic);
         *name = {e.name, e.nlen};
         *value = {e.value, e.vlen};
         return true;
     }
-    return dyn_get(d,
-                   static_cast<u32>(static_cast<i64>(idx) - static_cast<i64>(kStaticCount) - 1),
-                   name,
-                   value);
+    u32 offset;
+    return (range_int{idx} - kFirstDynamicIndex).to(&offset) && dyn_get(d, offset, name, value);
 }
 
-bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
+[[nodiscard]] bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
     Str value;
-    if (idx <= kStaticCount) {
-        if (idx == 0) return false;
-        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
-        *name = {e.name, e.nlen};
-        return true;
-    }
-    return dyn_get(d,
-                   static_cast<u32>(static_cast<i64>(idx) - static_cast<i64>(kStaticCount) - 1),
-                   name,
-                   &value);
+    return resolve_full(d, idx, name, &value);
 }
 
-i32 static_find_full(Str name, Str value) {
-    for (i64 i = 0; i < kStaticCount; i++)
-        if (str_eq(name, kStatic[i].name, kStatic[i].nlen) &&
-            str_eq(value, kStatic[i].value, kStatic[i].vlen))
-            return static_cast<i32>(i + 1);
-    return 0;
-}
-
-i32 static_find_name(Str name) {
-    for (i64 i = 0; i < kStaticCount; i++)
-        if (str_eq(name, kStatic[i].name, kStatic[i].nlen)) return static_cast<i32>(i + 1);
-    return 0;
-}
-
-// Encoder-side dynamic table lookups: return the 1-based HPACK index of a
-// matching entry (dynamic indices follow the 61 static entries; newest = 62),
-// or 0. j counts from the newest entry, matching the protocol index order.
-i32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
-    for (i64 j = 0; j < d.nent; j++) {
-        const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
-        const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
-        const Str kEv{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) +
-                                                    static_cast<i64>(e.nlen)),
-                      e.vlen};
-        if (kEn.eq(name) && kEv.eq(value))
-            return static_cast<i32>(static_cast<i64>(kStaticCount) + 1 + j);
+[[nodiscard]] u32 static_find_full(Str name, Str value) {
+    u32 index = 1;
+    for (const auto& entry : kStatic) {
+        if (str_eq(name, entry.name, entry.nlen) && str_eq(value, entry.value, entry.vlen))
+            return index;
+        ++index;
     }
     return 0;
 }
 
-i32 dyn_find_name(const DynamicTable& d, Str name) {
-    for (i64 j = 0; j < d.nent; j++) {
-        const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
-        const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
-        if (kEn.eq(name)) return static_cast<i32>(static_cast<i64>(kStaticCount) + 1 + j);
+[[nodiscard]] u32 static_find_name(Str name) {
+    u32 index = 1;
+    for (const auto& entry : kStatic) {
+        if (str_eq(name, entry.name, entry.nlen)) return index;
+        ++index;
+    }
+    return 0;
+}
+
+constexpr auto kMaxDynamicEntries =
+    range_int<DynamicTable::kMaxEntries, i64{DynamicTable::kMaxEntries} + 1>{};
+
+[[nodiscard]] u32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
+    u32 remaining = range_int{d.nent}.min(kMaxDynamicEntries).to<u32>();
+    for (u32 index = kFirstDynamicIndex.to<u32>(); remaining > 0; ++index) {
+        const auto& entry = d.ents[--remaining];
+        const auto offset = range_int{entry.off};
+        const Str entry_name{reinterpret_cast<const char*>(d.buf + offset.index()), entry.nlen};
+        const Str entry_value{
+            reinterpret_cast<const char*>(d.buf + (offset + range_int{entry.nlen}).index()),
+            entry.vlen};
+        if (entry_name.eq(name) && entry_value.eq(value)) return index;
+    }
+    return 0;
+}
+
+[[nodiscard]] u32 dyn_find_name(const DynamicTable& d, Str name) {
+    u32 remaining = range_int{d.nent}.min(kMaxDynamicEntries).to<u32>();
+    for (u32 index = kFirstDynamicIndex.to<u32>(); remaining > 0; ++index) {
+        const auto& entry = d.ents[--remaining];
+        const Str entry_name{reinterpret_cast<const char*>(d.buf + range_int{entry.off}.index()),
+                             entry.nlen};
+        if (entry_name.eq(name)) return index;
     }
     return 0;
 }
@@ -535,26 +574,29 @@ void DynamicTable::init(u32 settings_max) {
     table_size = 0;
 }
 
-bool decode_header_block(DynamicTable& dyn,
-                         const u8* in,
-                         u32 len,
-                         u8* out_buf,
-                         u32 out_cap,
-                         Header* headers,
-                         u32 max_headers,
-                         u32* count) {
+[[nodiscard]] bool decode_header_block(DynamicTable& dyn,
+                                       const u8* in,
+                                       u32 len,
+                                       u8* out_buf,
+                                       u32 out_cap,
+                                       Header* headers,
+                                       u32 max_headers,
+                                       u32* count) {
+    const i64 input_size = range_int{len}.to<i64>();
+    const i64 output_capacity = range_int{out_cap}.to<i64>();
     i64 pos = 0;
     i64 op = 0;  // out_buf write cursor
     u32 hc = 0;
-    while (pos < len) {
+    while (pos < input_size) {
+        u32 input_length;
+        if (!range_int{input_size - pos}.to(&input_length)) return false;
         const u8 kByte = in[pos];
         if (kByte & 0x80) {
             // §6.1 Indexed Header Field.
             u32 idx = 0;
-            const u32 kC =
-                decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), 7, &idx);
+            const u32 kC = decode_integer(in + pos, input_length, 7, &idx);
             if (kC == 0 || idx == 0) return false;
-            pos += static_cast<i64>(kC);
+            pos += range_int{kC}.to<i64>();
             Str name, value;
             if (!resolve_full(dyn, idx, &name, &value)) return false;
             if (hc >= max_headers) return false;
@@ -564,11 +606,10 @@ bool decode_header_block(DynamicTable& dyn,
         if (kByte & 0x20 && !(kByte & 0x40)) {
             // §6.3 Dynamic Table Size Update (001xxxxx).
             u32 sz = 0;
-            const u32 kC =
-                decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), 5, &sz);
+            const u32 kC = decode_integer(in + pos, input_length, 5, &sz);
             if (kC == 0 || sz > dyn.hard_max) return false;
-            pos += static_cast<i64>(kC);
-            dyn_set_max_size(dyn, sz);
+            pos += range_int{kC}.to<i64>();
+            if (!dyn_set_max_size(dyn, sz)) return false;
             continue;
         }
         // Literal field: incremental indexing (§6.2.1, 0x40, 6-bit name index)
@@ -576,48 +617,49 @@ bool decode_header_block(DynamicTable& dyn,
         const bool kIncremental = (kByte & 0x40) != 0;
         const u8 kPrefix = kIncremental ? 6 : 4;
         u32 nidx = 0;
-        const u32 kNc =
-            decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), kPrefix, &nidx);
+        const u32 kNc = decode_integer(in + pos, input_length, kPrefix, &nidx);
         if (kNc == 0) return false;
-        pos += static_cast<i64>(kNc);
+        pos += range_int{kNc}.to<i64>();
 
         Str name;
         if (nidx == 0) {
             u32 nlen = 0;
-            const u32 kSc = decode_string(in + pos,
-                                          static_cast<u32>(static_cast<i64>(len) - pos),
-                                          out_buf + op,
-                                          static_cast<u32>(static_cast<i64>(out_cap) - op),
-                                          &nlen);
+            u32 output_length;
+            if (!range_int{input_size - pos}.to(&input_length) ||
+                !range_int{output_capacity - op}.to(&output_length))
+                return false;
+            const u32 kSc =
+                decode_string(in + pos, input_length, out_buf + op, output_length, &nlen);
             if (kSc == 0) return false;
-            pos += static_cast<i64>(kSc);
+            pos += range_int{kSc}.to<i64>();
             name = {reinterpret_cast<const char*>(out_buf + op), nlen};
-            op += static_cast<i64>(nlen);
+            op += range_int{nlen}.to<i64>();
         } else if (!resolve_name(dyn, nidx, &name)) {
             return false;
         }
         // Value is always a literal string.
         u32 vlen = 0;
-        const u32 kVc = decode_string(in + pos,
-                                      static_cast<u32>(static_cast<i64>(len) - pos),
-                                      out_buf + op,
-                                      static_cast<u32>(static_cast<i64>(out_cap) - op),
-                                      &vlen);
+        u32 output_length;
+        if (!range_int{input_size - pos}.to(&input_length) ||
+            !range_int{output_capacity - op}.to(&output_length))
+            return false;
+        const u32 kVc = decode_string(in + pos, input_length, out_buf + op, output_length, &vlen);
         if (kVc == 0) return false;
-        pos += static_cast<i64>(kVc);
+        pos += range_int{kVc}.to<i64>();
         Str value = {reinterpret_cast<const char*>(out_buf + op), vlen};
-        op += static_cast<i64>(vlen);
+        op += range_int{vlen}.to<i64>();
 
         if (kIncremental) {
             // The name may alias dyn.buf (table reference); copy it into out_buf
             // so dyn_add's eviction/compaction can't corrupt the source.
             if (nidx != 0) {
-                if (op + static_cast<i64>(name.len) > static_cast<i64>(out_cap)) return false;
+                const i64 next_output = op + range_int{name.len}.to<i64>();
+                if (next_output > output_capacity) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};
-                op += static_cast<i64>(name.len);
+                op = next_output;
             }
-            dyn_add(dyn, name, value);
+            if (!dyn_add(dyn, name, value)) return false;
         }
         if (hc >= max_headers) return false;
         headers[hc++] = {name, value};
@@ -626,38 +668,38 @@ bool decode_header_block(DynamicTable& dyn,
     return true;
 }
 
-i64 encode_header(u8* out, Str name, Str value) {
-    const i32 kFull = static_find_full(name, value);
-    if (kFull > 0) return encode_integer(out, static_cast<u32>(kFull), 7, 0x80);
+[[nodiscard]] i64 encode_header(u8* out, Str name, Str value) {
+    const u32 kFull = static_find_full(name, value);
+    if (kFull > 0) return encode_integer(out, kFull, 7, 0x80);
 
-    const i32 kNameIdx = static_find_name(name);
+    const u32 kNameIdx = static_find_name(name);
     // Literal without indexing (0000xxxx): name index (0 = literal name).
-    i64 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
-    if (kNameIdx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
+    i64 o = encode_integer(out, kNameIdx, 4, 0x00);
+    if (kNameIdx == 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
     return o;
 }
 
-i64 Encoder::encode(u8* out, Str name, Str value) {
+[[nodiscard]] i64 Encoder::encode(u8* out, Str name, Str value) {
     // Exact (name,value) match → Indexed Header Field (§6.1, 1 byte for small
     // indices). Check the dynamic table first: in steady state most fields hit
     // it, and it is far smaller than the 61-entry static table, so this skips
     // the static scan on the common path. Either index is valid per §2.3.3.
-    const i32 kDynFull = dyn_find_full(dyn, name, value);
-    if (kDynFull > 0) return encode_integer(out, static_cast<u32>(kDynFull), 7, 0x80);
-    const i32 kStaticFull = static_find_full(name, value);
-    if (kStaticFull > 0) return encode_integer(out, static_cast<u32>(kStaticFull), 7, 0x80);
+    const u32 kDynFull = dyn_find_full(dyn, name, value);
+    if (kDynFull > 0) return encode_integer(out, kDynFull, 7, 0x80);
+    const u32 kStaticFull = static_find_full(name, value);
+    if (kStaticFull > 0) return encode_integer(out, kStaticFull, 7, 0x80);
 
     // Otherwise Literal with Incremental Indexing (§6.2.1, 6-bit name index)
     // and add the field so the next occurrence indexes to 1 byte.
-    i32 nidx = static_find_name(name);
+    u32 nidx = static_find_name(name);
     if (nidx == 0) nidx = dyn_find_name(dyn, name);
-    i64 o = encode_integer(out, static_cast<u32>(nidx > 0 ? nidx : 0), 6, 0x40);
-    if (nidx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
+    i64 o = encode_integer(out, nidx, 6, 0x40);
+    if (nidx == 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
     // Index resolution above used the pre-add table — the same order the peer's
     // decoder sees — so adding now keeps both tables in sync.
-    dyn_add(dyn, name, value);
+    if (!dyn_add(dyn, name, value)) return -1;
     return o;
 }
 
@@ -671,35 +713,41 @@ i64 Encoder::encode(u8* out, Str name, Str value) {
 // limit: we shrink to match (evicting entries that no longer fit) and arm a §6.3
 // dynamic table size update so the next header block tells the peer's decoder the
 // new size in lockstep. Without that the two tables desync and decoding breaks.
-void Encoder::set_table_size(u32 settings_max) {
-    const u32 kNew = settings_max < DynamicTable::kHardCap ? settings_max : DynamicTable::kHardCap;
+[[nodiscard]] bool Encoder::set_table_size(u32 settings_max) {
+    constexpr auto kCap = range_int<DynamicTable::kHardCap, i64{DynamicTable::kHardCap} + 1>{};
+    const auto size = range_int(settings_max).min(kCap);
+    const i32 next = size.to<i32>();
     // The size currently in effect for the peer's decoder is the final pending
     // value if one is armed, else our live table limit. No net change → nothing
     // to do (avoids spurious size updates on duplicate SETTINGS).
-    const i32 kCurrent =
-        pending_size_update >= 0 ? pending_size_update : static_cast<i32>(dyn.max_size);
-    if (static_cast<i32>(kNew) == kCurrent) return;
-    dyn_set_max_size(dyn, kNew);  // shrinking evicts entries that no longer fit
-    // Track the smallest size reached since the last emit. A shrink-then-grow
-    // between header blocks must signal the minimum first (§4.2), otherwise the
-    // peer decoder never evicts at the shrink and its table diverges from ours.
-    if (pending_size_update < 0 || static_cast<i32>(kNew) < pending_min_size)
-        pending_min_size = static_cast<i32>(kNew);
-    pending_size_update = static_cast<i32>(kNew);
+    const i64 kCurrent =
+        pending_size_update >= 0 ? pending_size_update : range_int{dyn.max_size}.to<i64>();
+    if (next == kCurrent) return true;
+    if (!dyn_set_max_size(dyn, size.to<u32>())) return false;
+    // A shrink-then-grow between header blocks must signal the minimum first
+    // so the decoder evicts identically (§4.2).
+    if (pending_size_update < 0 || next < pending_min_size) pending_min_size = next;
+    pending_size_update = next;
+    return true;
 }
 
-u32 Encoder::emit_pending_size_update(u8* out) {
+[[nodiscard]] u32 Encoder::emit_pending_size_update(u8* out) {
     if (pending_size_update < 0) return 0;
     // §6.3 dynamic table size update: pattern 001 (0x20) + 5-bit prefix integer.
     // Signal the smallest size reached first (so the decoder evicts identically),
     // then the final size when it differs.
-    i64 n = 0;
-    if (pending_min_size >= 0 && pending_min_size != pending_size_update)
-        n += static_cast<i64>(encode_integer(out + n, static_cast<u32>(pending_min_size), 5, 0x20));
-    n += static_cast<i64>(encode_integer(out + n, static_cast<u32>(pending_size_update), 5, 0x20));
+    const auto final_size = range_int(pending_size_update).max(range_int<0, 1>{});
+    u32 first = 0;
+    if (pending_min_size >= 0 && pending_min_size != pending_size_update) {
+        const auto minimum_size = range_int(pending_min_size).max(range_int<0, 1>{});
+        first = encode_integer(out, minimum_size.to<u32>(), 5, 0x20);
+    }
+    const u32 final = encode_integer(out + range_int{first}.index(), final_size.to<u32>(), 5, 0x20);
     pending_size_update = -1;
     pending_min_size = -1;
-    return static_cast<u32>(n);
+    // A 32-bit prefix integer uses at most six octets, including its first byte.
+    constexpr auto kMaxPair = range_int<12, 13>{};
+    return (range_int(first) + range_int(final)).min(kMaxPair).to<u32>();
 }
 
 }  // namespace rut::hpack

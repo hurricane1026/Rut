@@ -1,7 +1,9 @@
 #include "rut/common/shard_limits.h"
 #include "rut/platform/socket.h"
+#include "rut/platform/write.h"
 #include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/connection_capacity.h"
+#include "rut/runtime/format_integer.h"
 #ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_backend.h"
@@ -46,19 +48,18 @@ static constexpr u32 kDefaultDrainSecs = 30;
 
 // Status messages go to stderr to avoid mixing with structured JSON access logs on stdout.
 static void write_str(const char* s) {
-    u32 len = 0;
-    while (s[len]) len++;
-    (void)write(2, s, len);
+    platform::write_diagnostic(s);
 }
 
 static void write_u64(u64 val) {
     char buf[21];
-    i32 n = 0;
+    char* cursor = buf + sizeof(buf);
+    *--cursor = '\0';
     do {
-        buf[n++] = static_cast<char>('0' + val % 10);
+        *--cursor = last_decimal_digit(val);
         val /= 10;
     } while (val);
-    for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
+    write_str(cursor);
 }
 
 static void write_u32(u32 val) {
@@ -172,7 +173,7 @@ static void write_memlock_limit(rlim_t v) {
     if (v == RLIM_INFINITY) {
         write_str("unlimited");
     } else {
-        write_u64(static_cast<u64>(v) / 1024);
+        write_u64(u64{v} / 1024);
         write_str(" KiB");
     }
 }
@@ -391,29 +392,29 @@ static void report_source_live_start_error(const SourceLiveAccessLogStartError& 
 }
 
 template <typename EventLoopType>
-static RunShardsOutcome run_shards(ListenerSpec listener,
-                                   u32 shard_count,
-                                   bool pin_cpus,
-                                   u32 drain_secs,
-                                   u32 pool_prealloc,
-                                   u32 connection_capacity,
-                                   bool upstream_idle_timeout_set,
-                                   u32 upstream_idle_timeout,
-                                   u32 upstream_pool_capacity,
-                                   i32 upstream_max_requests,
-                                   TlsServerContext* tls_server,
-                                   bool allow_io_uring_fallback,
-                                   const char* access_log_path,
-                                   bool access_log_compress,
-                                   i32 access_log_level,
-                                   bool access_log_path_only,
-                                   const char* access_log_syslog,
-                                   AccessLogSyslogFormat access_log_syslog_format,
-                                   SourceAccessLogFd* source_live_fd,
-                                   AccessLogFormatProfile source_live_format,
-                                   const RouteConfig* route_config,
-                                   bool serve_metrics,
-                                   bool relay_stats_enabled) {
+[[nodiscard]] static RunShardsOutcome run_shards(ListenerSpec listener,
+                                                 u32 shard_count,
+                                                 bool pin_cpus,
+                                                 u32 drain_secs,
+                                                 u32 pool_prealloc,
+                                                 u32 connection_capacity,
+                                                 bool upstream_idle_timeout_set,
+                                                 u32 upstream_idle_timeout,
+                                                 u32 upstream_pool_capacity,
+                                                 i32 upstream_max_requests,
+                                                 TlsServerContext* tls_server,
+                                                 bool allow_io_uring_fallback,
+                                                 const char* access_log_path,
+                                                 bool access_log_compress,
+                                                 i32 access_log_level,
+                                                 bool access_log_path_only,
+                                                 const char* access_log_syslog,
+                                                 AccessLogSyslogFormat access_log_syslog_format,
+                                                 SourceAccessLogFd* source_live_fd,
+                                                 AccessLogFormatProfile source_live_format,
+                                                 const RouteConfig* route_config,
+                                                 bool serve_metrics,
+                                                 bool relay_stats_enabled) {
     u16 port = listener.port;
     ListenerContext bound_listener_context{};
     Shard<EventLoopType> shards[kMaxShards];
@@ -604,6 +605,12 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         source_live_ring_count = 0u;
         return success;
     };
+    const auto fail_source_live_startup = [&]() -> RunShardsOutcome {
+        if (!release_source_live_rings())
+            write_str("SourceLive access log startup cleanup was incomplete\n");
+        for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+        return {RunShardsOutcomeKind::Failure};
+    };
     if (source_live_fd != nullptr) {
         for (u32 i = 0; i < shard_count; i++) {
             auto ring = shards[i].init_live_access_log_ring();
@@ -613,9 +620,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 write_str(" (reason=");
                 write_u32(static_cast<u32>(ring.error()));
                 write_str(")\n");
-                (void)release_source_live_rings();
-                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-                return {RunShardsOutcomeKind::Failure};
+                return fail_source_live_startup();
             }
             source_live_ring_count++;
             if (source_live_host_profile) {
@@ -626,9 +631,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                     write_str(" (reason=");
                     write_u32(static_cast<u32>(host_ring.error()));
                     write_str(")\n");
-                    (void)release_source_live_rings();
-                    for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-                    return {RunShardsOutcomeKind::Failure};
+                    return fail_source_live_startup();
                 }
                 source_live_host_bindings[i] = shards[i].live_access_log_host_binding();
             } else {
@@ -656,9 +659,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                             source_live_ring_count);
         if (!started) {
             report_source_live_start_error(started.error());
-            (void)release_source_live_rings();
-            for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
-            return {RunShardsOutcomeKind::Failure};
+            return fail_source_live_startup();
         }
         source_live_started = true;
         for (u32 i = 0; i < shard_count; i++) {
@@ -675,9 +676,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 source_live_started = false;
                 if (finished.status == SourceLiveAccessLogFinishStatus::Fatal)
                     report_source_live_fatal(finished.fatal);
-                (void)release_source_live_rings();
-                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-                return {RunShardsOutcomeKind::Failure};
+                return fail_source_live_startup();
             }
         }
     }
@@ -713,7 +712,10 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 write_u64(static_cast<u64>(log_flusher.syslog_send_failures()));
                 write_str("\n");
             }
-            close(access_log_fd);
+            if (close(access_log_fd) != 0) {
+                write_str("Failed to close access log output\n");
+                success = false;
+            }
             access_log_fd = -1;
         }
         if (!finish_source_live()) success = false;
@@ -850,7 +852,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             // Stop all already-spawned shards
             for (u32 j = 0; j < i; j++) shards[j].stop();
             for (u32 j = 0; j < i; j++) shards[j].join();
-            (void)finish_access_logs_and_shutdown();
+            if (!finish_access_logs_and_shutdown()) write_str("Startup cleanup was incomplete\n");
             return {RunShardsOutcomeKind::Failure};
         }
     }
@@ -862,7 +864,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             write_error("Failed to start access log flusher", flusher_rc.error());
             for (u32 i = 0; i < shard_count; i++) shards[i].stop();
             for (u32 i = 0; i < shard_count; i++) shards[i].join();
-            (void)finish_access_logs_and_shutdown();
+            if (!finish_access_logs_and_shutdown()) write_str("Startup cleanup was incomplete\n");
             return {RunShardsOutcomeKind::Failure};
         }
     }
@@ -948,14 +950,14 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         if (sig == SIGINT || sig == SIGTERM) break;
         if (sig < 0 && errno != EAGAIN && errno != EINTR) {
             write_str("Failed to wait for shutdown signal\n");
-            (void)stop_all_shards();
+            if (!stop_all_shards()) write_str("Shutdown cleanup was incomplete\n");
             return {RunShardsOutcomeKind::Failure};
         }
     }
 
     if (source_live_fatal.kind != SourceLiveAccessLogFatalKind::None || backend_error != 0) {
         report_runtime_failures();
-        (void)stop_all_shards();
+        if (!stop_all_shards()) write_str("Shutdown cleanup was incomplete\n");
         return {RunShardsOutcomeKind::Failure};
     }
 
@@ -1039,7 +1041,7 @@ int main(int argc, char** argv) {
     bool upstream_dns_specified = false;
     bool ebpf_plan_requested = false;
     const char* ebpf_output_prefix = nullptr;
-    u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
+    [[maybe_unused]] u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [program.rut | --compile PATH]
     //                      [--shards N] [--no-pin] [--drain N]
@@ -1264,16 +1266,18 @@ int main(int argc, char** argv) {
                         "4096\n");
                     return 1;
                 }
-                u32 parsed = 0;
+                using Capacity = range_int<0, i64{UpstreamPool::kMaxConns} + 1>;
+                Capacity parsed;
                 for (const char* p = value; *p; ++p) {
-                    const u32 digit = static_cast<u32>(*p - '0');
-                    if (parsed > (UpstreamPool::kMaxConns - digit) / 10u) {
+                    range_int<0, 10> digit;
+                    if (!decltype(digit)::try_from_i64(*p - '0', &digit) ||
+                        !Capacity::try_from_i64((parsed.scaled_by<10>() + digit).value(),
+                                                &parsed)) {
                         write_str("--upstream-keepalive-pool-size must be between 0 and 4096\n");
                         return 1;
                     }
-                    parsed = parsed * 10u + digit;
                 }
-                upstream_pool_capacity = parsed;
+                upstream_pool_capacity = parsed.to<u32>();
                 ++i;
             } else if (str_eq(argv[i], "--access-log")) {
                 if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
@@ -1336,7 +1340,7 @@ int main(int argc, char** argv) {
                 access_log_level = 0;
                 cli_access_log_level_present = true;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
-                    access_log_level = access_log_level * 10 + static_cast<i32>(*p - '0');
+                    access_log_level = access_log_level * 10 + i32{*p - '0'};
             } else if (str_eq(argv[i], "--opt")) {
                 if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
                     write_str("--opt requires a numeric argument (0-3)\n");
@@ -1533,7 +1537,6 @@ int main(int argc, char** argv) {
         write_str("No .rut program given — serving default routes only.\n");
     }
 #else
-    (void)opt_level;
     if (config_path) {
         write_str("This build has no JIT (RUT_ENABLE_JIT=OFF); cannot load ");
         write_str(config_path);

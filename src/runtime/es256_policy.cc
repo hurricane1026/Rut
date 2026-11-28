@@ -1,5 +1,6 @@
 #include "rut/runtime/es256_policy.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/runtime/json.h"
@@ -283,16 +284,16 @@ bool Es256Policies::activate(u32 shard) {
     return true;
 }
 
-bool Es256Policies::verify(u32 shard,
-                           Str configuration,
-                           json::Document& document,
-                           Str token,
-                           i64 now,
-                           char* payload,
-                           u32 capacity,
-                           u32& length,
-                           u64 monotonic_ms) {
-    length = 0;
+[[nodiscard]] bool Es256Policies::verify(u32 shard,
+                                         Str configuration,
+                                         json::Document& document,
+                                         Str token,
+                                         i64 now,
+                                         char* payload,
+                                         u32 capacity,
+                                         u32* length,
+                                         u64 monotonic_ms) {
+    *length = 0;
     document.valid = false;
     document.count = 0;
     document.source = {};
@@ -306,8 +307,8 @@ bool Es256Policies::verify(u32 shard,
             u64 age = 0;
             if (!monotonic_ms || !remote->last_success || remote->empty ||
                 monotonic_ms < remote->last_success ||
-                __builtin_sub_overflow(monotonic_ms, remote->last_success, &age) ||
-                age >= static_cast<u64>(policies[i].remote().max_age_seconds) * 1000)
+                sub_overflow(monotonic_ms, remote->last_success, &age) ||
+                age >= u64{policies[i].remote().max_age_seconds} * 1000)
                 return false;
             if (remote->use_alternate) verifiers = &remote->alternate;
         }
@@ -320,12 +321,12 @@ bool Es256Policies::verify(u32 shard,
                                    now,
                                    payload,
                                    capacity,
-                                   length,
+                                   *length,
                                    kid,
                                    policies[i].required_type()) &&
             policies[i].permits(document))
             return true;
-        length = 0;
+        *length = 0;
         document.valid = false;
         document.count = 0;
         document.source = {};

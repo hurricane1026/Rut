@@ -1140,7 +1140,7 @@ TEST(jit, return_200) {
 }
 
 TEST(jit, redirect_abi_and_compiled_action_are_fail_closed) {
-    for (u16 id : {static_cast<u16>(1), static_cast<u16>(65535)}) {
+    for (u16 id : {u16{1}, u16{65535}}) {
         const auto packed = HandlerResult::make_redirect(id).pack();
         const auto decoded = HandlerResult::unpack(packed);
         CHECK(HandlerResult::redirect_fields_valid(decoded));
@@ -2492,7 +2492,7 @@ TEST(jit, frontend_time_minmax_gcra_shape_executes) {
                                                reinterpret_cast<const u8*>(kGetApiRequest),
                                                sizeof(kGetApiRequest) - 1,
                                                nullptr));
-        return static_cast<u32>(r.status_code);
+        return u32{r.status_code};
     };
     CHECK_EQ(call_route("handler_route_0"), 200u);  // t2 == t1 (latched now)
     CHECK_EQ(call_route("handler_route_1"), 200u);  // t1 > 0
@@ -9536,7 +9536,7 @@ TEST(helpers, http_call_frame_reanchors_only_request_backed_route_params) {
     TestHandlerCtxFrame frame{};
     static const char external[] = "configured";
     char request[] = "GET /items/42 HTTP/1.1\r\nHost: test\r\n\r\n";
-    const u32 length = static_cast<u32>(sizeof(request) - 1);
+    const u32 length = u32{sizeof(request) - 1};
     const char* route_value = request + 11;
     frame.ctx.route_param_count = 2;
     frame.ctx.route_params[0] = {"id", 2, route_value, 2};
@@ -10509,7 +10509,7 @@ TEST(result, pack_unpack_yield) {
 TEST(result, pack_matches_codegen_layout) {
     // Verify pack() produces the same bit layout as the codegen's i64.
     // Codegen for RetStatus(200): action(0) | (200 << 8)
-    u64 codegen_200 = 0 | (static_cast<u64>(200) << 8);
+    u64 codegen_200 = 0 | (u64{200} << 8);
     auto r = HandlerResult::unpack(codegen_200);
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
@@ -11969,7 +11969,7 @@ TEST(jit, target_transform_effect_records_and_fails_closed) {
     };
     add("proxy_transform_valid", 1, false);
     add("proxy_transform_zero", 0, false);
-    add("proxy_transform_wide", static_cast<i32>(kMaxForwardTargetTransforms + 1), false);
+    add("proxy_transform_wide", i32{kMaxForwardTargetTransforms + 1}, false);
     add("proxy_transform_duplicate", 1, true);
 
     auto* bounds = V(b.create_function(lit("proxy_transform_bounds"), lit("/"), 'G'));
@@ -17984,7 +17984,7 @@ route GET "/users" {
     auto r = HandlerResult::unpack(handler(nullptr,
                                            nullptr,
                                            reinterpret_cast<const u8*>(kGetApiRequest),
-                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           u32{sizeof(kGetApiRequest) - 1},
                                            nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
@@ -18022,7 +18022,7 @@ route GET "/users" {
     auto r = HandlerResult::unpack(handler(nullptr,
                                            nullptr,
                                            reinterpret_cast<const u8*>(kGetApiRequest),
-                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           u32{sizeof(kGetApiRequest) - 1},
                                            nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
@@ -18061,7 +18061,7 @@ route GET "/users" {
     auto r = HandlerResult::unpack(handler(nullptr,
                                            nullptr,
                                            reinterpret_cast<const u8*>(kGetApiRequest),
-                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           u32{sizeof(kGetApiRequest) - 1},
                                            nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
@@ -18100,7 +18100,7 @@ route GET "/users" {
     auto r = HandlerResult::unpack(handler(nullptr,
                                            nullptr,
                                            reinterpret_cast<const u8*>(kGetApiRequest),
-                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           u32{sizeof(kGetApiRequest) - 1},
                                            nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
@@ -18139,7 +18139,7 @@ route GET "/users" {
     auto r = HandlerResult::unpack(handler(nullptr,
                                            nullptr,
                                            reinterpret_cast<const u8*>(kGetApiRequest),
-                                           static_cast<u32>(sizeof(kGetApiRequest) - 1),
+                                           u32{sizeof(kGetApiRequest) - 1},
                                            nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
@@ -22620,7 +22620,7 @@ TEST(jit, websocket_json_number_text_guard_is_exact_and_typed) {
     long_needle.pattern = "/n";
     long_needle.pattern_len = 2;
     long_needle.value = kLongNeedle;
-    long_needle.value_len = static_cast<u32>(sizeof(kLongNeedle));
+    long_needle.value_len = u32{sizeof(kLongNeedle)};
     long_needle.verdict = static_cast<u8>(WsFrameAction::Drop);
     CodegenResult long_needle_generated = codegen_ws_handler(0, &long_needle, 1, 18);
     REQUIRE(long_needle_generated.ok);
@@ -22644,7 +22644,7 @@ TEST(jit, websocket_json_number_text_guard_is_exact_and_typed) {
     WsLenGuardSpec long_path{};
     long_path.accessor = 24;
     long_path.pattern = kLongPath;
-    long_path.pattern_len = static_cast<u32>(sizeof(kLongPath));
+    long_path.pattern_len = u32{sizeof(kLongPath)};
     long_path.verdict = static_cast<u8>(WsFrameAction::Drop);
     CodegenResult long_path_generated = codegen_ws_handler(0, &long_path, 1, 19);
     REQUIRE(long_path_generated.ok);
@@ -26277,7 +26277,7 @@ TEST(jit, lexer_accepts_large_input_and_auth_imports) {
 import "middleware/auth.rut"
 route GET "/auth" { return 200 }
 )rut";
-    auto tokens = lex({source, static_cast<u32>(sizeof(source) - 1)});
+    auto tokens = lex({source, u32{sizeof(source) - 1}});
     REQUIRE(tokens);
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
@@ -27076,7 +27076,7 @@ route POST "/empty-meta" { let identity = auth.rotatingSignedRequest(config("cur
         const auto handler = reinterpret_cast<HandlerFn>(
             engine.lookup(("handler_route_" + std::to_string(route)).c_str()));
         CHECK(handler != nullptr);
-        if (handler == nullptr) return static_cast<u16>(0);
+        if (handler == nullptr) return u16{0};
         std::string request =
             "POST " + uri + " HTTP/1.1\r\nHost: local\r\nAuthorization: " + headers.authorization +
             "\r\nDate: " + headers.date + "\r\nDigest: " + headers.digest +
@@ -27807,7 +27807,7 @@ TEST(jit, consumer_group_denials_preserve_identity_and_take_precedence) {
         check(i, "Authorization: Bearer wrong\r\n", 401);
         check(i, "Authorization: Bearer a\r\nauthorization: Bearer b\r\n", 401);
     }
-    const auto count = static_cast<u32>(sizeof(policies) / sizeof(policies[0]));
+    const auto count = u32{sizeof(policies) / sizeof(policies[0])};
     check(count, "Authorization: Bearer c\r\nX-Consumer-ID: bob\r\n", 403);
     check(count, "Authorization: Bearer a\r\n", 401);
     check(count + 1, "", 403);
@@ -27909,7 +27909,7 @@ route GET "/large" {
     timespec now{};
     REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
     REQUIRE(now.tv_sec > 1000);
-    const auto current = static_cast<std::int64_t>(now.tv_sec);
+    const auto current = std::int64_t{now.tv_sec};
     check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 3600), 204);
     check_claims(::rut::test::jwt_lifetime::claims(current - 400, current + 3600), 401);
     check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 8000), 401);
@@ -28947,7 +28947,7 @@ route POST "/same" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
 
     const std::string id = "evt_standard_1";
-    const std::string timestamp = std::to_string(static_cast<i64>(time(nullptr)));
+    const std::string timestamp = std::to_string(i64{time(nullptr)});
     const auto signature_for =
         [&](const std::string& body, std::string& signature, const char* key = "trusted-raw-key") {
             const std::string message = id + "." + timestamp + "." + body;
@@ -30339,7 +30339,7 @@ TEST(jit, password_header_prefix_suspends_before_effects_and_resumes_once) {
             CHECK(result.yield_kind == YieldKind::Timer);
             CHECK(result.next_state == 0);
             CHECK(result.yield_payload_u32() > 0 && result.yield_payload_u32() <= 10);
-            if (monotonic_us() > deadline) return static_cast<u16>(599);
+            if (monotonic_us() > deadline) return u16{599};
             usleep(result.yield_payload_u32() * 1000);
         }
     };
@@ -34382,9 +34382,8 @@ TEST(jit, string_core_executes_owned_and_borrowed_results_at_both_optimization_l
                 memset(request.data(), 'z', request.size());
                 CHECK(connection->jit_response_body.eq(item.output));
                 const u64 expected_storage =
-                    item.route == 4
-                        ? 0
-                        : ((static_cast<u64>(item.output.len ? item.output.len : 1) + 7) & ~u64{7});
+                    item.route == 4 ? 0
+                                    : ((u64{item.output.len ? item.output.len : 1} + 7) & ~u64{7});
                 CHECK_EQ(arena.space_used(), expected_storage);
             }
         }

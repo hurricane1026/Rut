@@ -1,7 +1,9 @@
 #include "rut/runtime/ws_extensions.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_parser.h"
 
 #include <string.h>
@@ -10,9 +12,9 @@ namespace rut {
 namespace {
 struct Value {
     bool present = false;
-    u32 number = 0;
+    i32 number = 0;
     bool decimal = true;
-    u32 digits = 0;
+    i64 digits = 0;
     bool leading_zero = false;
 };
 struct Cursor {
@@ -22,20 +24,21 @@ struct Cursor {
         while (offset < value.len && (value.ptr[offset] == ' ' || value.ptr[offset] == '\t'))
             ++offset;
     }
-    Str token() {
+    [[nodiscard]] Str token() {
         const u32 kStart = offset;
-        while (offset < value.len && is_http_tchar(static_cast<u8>(value.ptr[offset]))) ++offset;
-        return {value.ptr + static_cast<i64>(kStart),
-                static_cast<u32>(static_cast<i64>(offset) - static_cast<i64>(kStart))};
+        while (offset < value.len && is_http_tchar(byte_value(value.ptr[offset]))) ++offset;
+        const auto start = range_int(kStart);
+        const auto length = (range_int(offset) - start).max(range_int<0, 1>{});
+        return {value.ptr + start.index(), length.to<u32>()};
     }
-    bool parameter_value(Value& result) {
+    [[nodiscard]] bool parameter_value(Value& result) {
         result.present = true;
         if (offset >= value.len) return false;
         const bool kQuoted = value.ptr[offset] == '"';
         if (kQuoted) ++offset;
         bool closed = !kQuoted;
         while (offset < value.len) {
-            u8 byte = static_cast<u8>(value.ptr[offset]);
+            u8 byte = byte_value(value.ptr[offset]);
             if (kQuoted && byte == '"') {
                 ++offset;
                 closed = true;
@@ -43,7 +46,7 @@ struct Cursor {
             }
             if (kQuoted && byte == '\\') {
                 if (++offset == value.len) return false;
-                byte = static_cast<u8>(value.ptr[offset]);
+                byte = byte_value(value.ptr[offset]);
             } else if (!kQuoted && !is_http_tchar(byte)) {
                 break;
             }
@@ -53,8 +56,7 @@ struct Cursor {
             if (byte < '0' || byte > '9' || result.digits >= 2)
                 result.decimal = false;
             else
-                result.number = static_cast<u32>(static_cast<i64>(result.number) * 10 +
-                                                 static_cast<i64>(byte) - '0');
+                result.number = result.number * 10 + (i32{byte} - '0');
             ++result.digits;
             ++offset;
         }
@@ -62,17 +64,23 @@ struct Cursor {
     }
 };
 
-bool window(const Value& value) {
-    return value.present && value.decimal && !value.leading_zero && value.number >= 8 &&
-           value.number <= 15;
+[[nodiscard]] u8 window_bits(const Value& value) {
+    range_int<8, 16> window;
+    if (!value.present || !value.decimal || value.leading_zero ||
+        !decltype(window)::try_from_i64(value.number, &window))
+        return 0;
+    return window.to<u8>();
 }
 
-bool parse(const Header* headers, u32 count, bool response, WsDeflateAgreement* agreement) {
+[[nodiscard]] bool parse(const Header* headers,
+                         u32 count,
+                         bool response,
+                         WsDeflateAgreement* agreement) {
     if (!agreement || count > kMaxHeaders || (!headers && count)) return false;
     *agreement = {};
     WsDeflateAgreement selected{};
-    u32 selections = 0;
-    for (u32 i = 0; i < count; ++i) {
+    i32 selections = 0;
+    for (i64 i = 0; i < count; ++i) {
         const auto& header = headers[i];
         if (!header.name.ptr ||
             !http_header_name_eq_ci(
@@ -114,13 +122,15 @@ bool parse(const Header* headers, u32 count, bool response, WsDeflateAgreement* 
                 } else if (kParameter.eq(lit_str("server_max_window_bits"))) {
                     bit = 4;
                     candidate.server_window_present = true;
-                    supported &= window(value);
-                    if (window(value)) candidate.server_window = static_cast<u8>(value.number);
+                    const u8 bits = window_bits(value);
+                    supported &= bits != 0;
+                    if (bits != 0) candidate.server_window = bits;
                 } else if (kParameter.eq(lit_str("client_max_window_bits"))) {
                     bit = 8;
                     candidate.client_window_present = true;
-                    supported &= (!response && !value.present) || window(value);
-                    if (window(value)) candidate.client_window = static_cast<u8>(value.number);
+                    const u8 bits = window_bits(value);
+                    supported &= (!response && !value.present) || bits != 0;
+                    if (bits != 0) candidate.client_window = bits;
                 } else {
                     supported = false;
                 }
@@ -162,17 +172,15 @@ u32 ws_format_deflate_agreement(const WsDeflateAgreement& agreement, char* outpu
         return 0;
     u32 written = 0;
     auto append = [&](Str text) {
-        if (static_cast<i64>(text.len) > static_cast<i64>(capacity) - static_cast<i64>(written))
-            return false;
-        for (u32 i = 0; i < text.len; ++i) {
-            output[static_cast<i64>(written)] = text.ptr[i];
-            written = static_cast<u32>(static_cast<i64>(written) + 1);
-        }
+        const auto start = range_int(written);
+        const auto end = start + range_int(text.len);
+        if (end.value() > capacity) return false;
+        memcpy(output + start.index(), text.ptr, text.len);
+        written = end.min(range_int(capacity)).to<u32>();
         return true;
     };
     auto number = [&](u8 value) {
-        const char kDigits[] = {static_cast<char>('0' + value / 10),
-                                static_cast<char>('0' + value % 10)};
+        const char kDigits[] = {last_decimal_digit(value / 10), last_decimal_digit(value)};
         return append(value >= 10 ? Str{kDigits, 2} : Str{kDigits + 1, 1});
     };
     if (!append(lit_str("permessage-deflate"))) return 0;
@@ -190,105 +198,104 @@ u32 ws_format_deflate_agreement(const WsDeflateAgreement& agreement, char* outpu
 }
 
 namespace {
-u32 line_end(const u8* buffer, u32 start, u32 header_len) {
-    for (u32 i = start; static_cast<i64>(i) + 1 < static_cast<i64>(header_len); ++i)
-        if (buffer[i] == '\r' && buffer[static_cast<i64>(i) + 1] == '\n') return i;
+[[nodiscard]] i64 line_end(const u8* buffer, i64 start, i64 header_len) {
+    for (i64 i = start; i + 1 < header_len; ++i)
+        if (buffer[i] == '\r' && buffer[i + 1] == '\n') return i;
     return header_len;
 }
-bool field_is(const u8* buffer, u32 start, u32 end, Str name, u32* colon = nullptr) {
-    u32 pos = start;
+[[nodiscard]] bool field_is(const u8* buffer, i64 start, i64 end, Str name, i64* colon = nullptr) {
+    i64 pos = start;
     while (pos < end && buffer[pos] != ':') ++pos;
     if (colon) *colon = pos;
-    return pos < end &&
-           http_header_name_eq_ci(reinterpret_cast<const char*>(buffer + static_cast<i64>(start)),
-                                  static_cast<u32>(static_cast<i64>(pos) - static_cast<i64>(start)),
-                                  name.ptr,
-                                  name.len);
+    return pos < end && pos - start == name.len &&
+           http_header_name_eq_ci(
+               reinterpret_cast<const char*>(buffer + start), name.len, name.ptr, name.len);
 }
 }  // namespace
 
 u32 ws_rewrite_extensions(
     u8* buffer, u32 header_len, u32 total_len, u32 capacity, Str extension_value) {
-    if (!buffer || header_len < 4 || total_len < header_len || total_len > capacity ||
-        (!extension_value.ptr && extension_value.len) ||
-        memcmp(buffer + static_cast<i64>(header_len) - 4, "\r\n\r\n", 4) != 0)
+    if (!buffer || header_len < 4 || total_len > capacity ||
+        (!extension_value.ptr && extension_value.len))
+        return 0;
+    const auto header = range_int{header_len};
+    u32 tail_length;
+    if (!(range_int{total_len} - header).to(&tail_length) ||
+        memcmp(buffer + header.index() - 4, "\r\n\r\n", 4) != 0)
         return 0;
     for (u32 i = 0; i < extension_value.len; ++i) {
-        const u8 kByte = static_cast<u8>(extension_value.ptr[i]);
+        const u8 kByte = byte_value(extension_value.ptr[i]);
         if (kByte < 0x20 || kByte >= 0x7f) return 0;
     }
-    const u32 kFirstEnd = line_end(buffer, 0, header_len);
-    if (kFirstEnd == header_len || kFirstEnd == 0) return 0;
-    u32 removed = 0;
-    for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
-         static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
-        const u32 kEnd = line_end(buffer, pos, header_len);
-        if (kEnd == header_len || kEnd == pos) return 0;
-        if (field_is(buffer, pos, kEnd, lit_str("sec-websocket-extensions")))
-            removed = static_cast<u32>(static_cast<i64>(removed) + static_cast<i64>(kEnd) + 2 -
-                                       static_cast<i64>(pos));
-        pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
+    const auto fields_end = (header - range_int<2, 3>{}).value();
+    const i64 first_end = line_end(buffer, 0, header.to<i64>());
+    if (first_end == header_len || first_end == 0) return 0;
+    const i64 first_field = first_end + 2;
+    i64 removed = 0;
+    for (i64 pos = first_field; pos < fields_end;) {
+        const i64 end = line_end(buffer, pos, header.to<i64>());
+        if (end == header_len || end == pos) return 0;
+        const i64 next = end + 2;
+        if (field_is(buffer, pos, end, lit_str("sec-websocket-extensions"))) removed += next - pos;
+        pos = next;
     }
     constexpr Str kPrefix = lit_str("Sec-WebSocket-Extensions: ");
-    const i64 added = extension_value.len ? static_cast<i64>(kPrefix.len) +
-                                                static_cast<i64>(extension_value.len) + 2
-                                          : 0;
-    const i64 new_header_wide = static_cast<i64>(header_len) - static_cast<i64>(removed) + added;
-    if (new_header_wide < 0 ||
-        new_header_wide + static_cast<i64>(total_len) - static_cast<i64>(header_len) >
-            static_cast<i64>(capacity))
+    constexpr auto kPrefixLen = range_int<kPrefix.len, i64{kPrefix.len} + 1>{};
+    constexpr u32 kLineOverhead = (kPrefixLen + range_int<2, 3>{}).to<u32>();
+    const u32 kOverhead = extension_value.len ? kLineOverhead : 0;
+    const auto added = range_int(extension_value.len) + range_int(kOverhead);
+    // Each removed byte belongs to a distinct scanned field in this header.
+    const i64 new_header = header.value() - removed + added.value();
+    u32 new_header_len;
+    if (!range_int{new_header}.to(&new_header_len) ||
+        (range_int{new_header_len} + range_int{tail_length}).value() > capacity)
         return 0;
-    const u64 kNewHeader = static_cast<u64>(new_header_wide);
-    u32 written = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
-    for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
-         static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
-        const u32 kEnd = line_end(buffer, pos, header_len);
-        if (!field_is(buffer, pos, kEnd, lit_str("sec-websocket-extensions"))) {
-            const u32 line_size =
-                static_cast<u32>(static_cast<i64>(kEnd) + 2 - static_cast<i64>(pos));
-            memmove(buffer + static_cast<i64>(written), buffer + static_cast<i64>(pos), line_size);
-            written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(line_size));
+    i64 written = first_field;
+    for (i64 pos = first_field; pos < fields_end;) {
+        const i64 end = line_end(buffer, pos, header.to<i64>());
+        const i64 next = end + 2;
+        if (!field_is(buffer, pos, end, lit_str("sec-websocket-extensions"))) {
+            const i64 line_size = next - pos;
+            memmove(buffer + written, buffer + pos, line_size);
+            written += line_size;
         }
-        pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
+        pos = next;
     }
     // Shift the tail after scanning the old header; shrinking must not destroy
     // fields still being read, and growing must not overwrite early frame bytes.
-    memmove(buffer + static_cast<i64>(kNewHeader),
-            buffer + static_cast<i64>(header_len),
-            static_cast<u32>(static_cast<i64>(total_len) - static_cast<i64>(header_len)));
+    memmove(buffer + range_int{new_header_len}.index(), buffer + header.index(), tail_length);
     if (extension_value.len) {
-        memcpy(buffer + static_cast<i64>(written), kPrefix.ptr, kPrefix.len);
-        written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(kPrefix.len));
-        memcpy(buffer + static_cast<i64>(written), extension_value.ptr, extension_value.len);
-        written =
-            static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(extension_value.len));
-        memcpy(buffer + static_cast<i64>(written), "\r\n", 2);
-        written = static_cast<u32>(static_cast<i64>(written) + 2);
+        memcpy(buffer + written, kPrefix.ptr, kPrefix.len);
+        written += kPrefixLen.to<i64>();
+        memcpy(buffer + written, extension_value.ptr, extension_value.len);
+        written += range_int{extension_value.len}.to<i64>();
+        memcpy(buffer + written, "\r\n", 2);
+        written += 2;
     }
-    memcpy(buffer + static_cast<i64>(written), "\r\n", 2);
-    return static_cast<u32>(kNewHeader);
+    memcpy(buffer + written, "\r\n", 2);
+    return new_header_len;
 }
 
 Str ws_selected_subprotocol(const u8* header, u32 header_len) {
     if (!header || header_len < 4) return {};
-    const u32 kFirstEnd = line_end(header, 0, header_len);
-    if (kFirstEnd == header_len) return {};
-    for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
-         static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
-        const u32 kEnd = line_end(header, pos, header_len);
-        if (kEnd == header_len || kEnd == pos) return {};
-        u32 colon = 0;
-        if (field_is(header, pos, kEnd, lit_str("sec-websocket-protocol"), &colon)) {
-            u32 start = static_cast<u32>(static_cast<i64>(colon) + 1);
-            u32 end = kEnd;
+    const auto length = range_int{header_len};
+    const auto fields_end = (length - range_int<2, 3>{}).value();
+    const i64 first_end = line_end(header, 0, length.to<i64>());
+    if (first_end == header_len) return {};
+    for (i64 pos = first_end + 2; pos < fields_end;) {
+        const i64 line_stop = line_end(header, pos, length.to<i64>());
+        if (line_stop == header_len || line_stop == pos) return {};
+        i64 colon = 0;
+        if (field_is(header, pos, line_stop, lit_str("sec-websocket-protocol"), &colon)) {
+            i64 start = colon + 1;
+            i64 end = line_stop;
             while (start < end && (header[start] == ' ' || header[start] == '\t')) ++start;
-            while (end > start && (header[static_cast<i64>(end) - 1] == ' ' ||
-                                   header[static_cast<i64>(end) - 1] == '\t'))
-                end = static_cast<u32>(static_cast<i64>(end) - 1);
-            return {reinterpret_cast<const char*>(header + static_cast<i64>(start)),
-                    static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))};
+            while (end > start && (header[end - 1] == ' ' || header[end - 1] == '\t')) --end;
+            u32 len;
+            if (!range_int(end - start).to(&len)) return {};
+            return {reinterpret_cast<const char*>(header + start), len};
         }
-        pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
+        pos = line_stop + 2;
     }
     return {};
 }

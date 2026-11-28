@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rut/common/types.h"
+#include "rut/common/range_int.h"
 
 #ifdef __linux__
 #include <linux/time_types.h>
@@ -16,14 +16,13 @@ using IoTimespec = __kernel_timespec;
 using IoTimespec = timespec;
 #endif
 
-constexpr IoTimespec io_timespec_from_ms(u32 ms) {
-    IoTimespec ts{};
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = static_cast<decltype(ts.tv_nsec)>(ms % 1000) * 1'000'000;
-    return ts;
+[[nodiscard]] constexpr IoTimespec io_timespec_from_ms(u32 ms) {
+    const auto seconds = range_int(ms).divided_by<1000>();
+    const auto nanos = bounded_remainder<1000>(ms).scaled_by<1'000'000>();
+    return {seconds.to<i32>(), nanos.to<i32>()};
 }
 
-constexpr bool valid_positive_io_timespec(const IoTimespec& ts) {
+[[nodiscard]] constexpr bool valid_positive_io_timespec(const IoTimespec& ts) {
     return ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1'000'000'000 &&
            (ts.tv_sec != 0 || ts.tv_nsec != 0);
 }

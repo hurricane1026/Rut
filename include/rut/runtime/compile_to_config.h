@@ -555,7 +555,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
         return false;
     for (u32 i = 0; i < mod.header_set_count; i++) {
         const auto& ref = mod.header_sets[i];
-        if (static_cast<u32>(ref.offset) + ref.count > mod.header_pool_used) return false;
+        if (u32{ref.offset} + ref.count > mod.header_pool_used) return false;
         if (ref.count > RouteConfig::kMaxHeadersPerSet) return false;
     }
 

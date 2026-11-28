@@ -36,6 +36,23 @@
 
 using namespace rut;
 
+TEST(grpc_accounting, overflow_leaves_the_last_exact_total) {
+    u64 bytes = 0;
+    CHECK(grpc_count_bytes(&bytes, u64{UINT32_MAX} + 1));
+    CHECK_EQ(bytes, u64{UINT32_MAX} + 1);
+    bytes = UINT64_MAX - 1;
+    CHECK(grpc_count_bytes(&bytes, 1));
+    CHECK_EQ(bytes, UINT64_MAX);
+    CHECK(!grpc_count_bytes(&bytes, 1));
+    CHECK_EQ(bytes, UINT64_MAX);
+}
+
+static_assert(grpc_stream_slot(GrpcProxyState::kStreamSlots - 1, 1).to<u32>() == 0);
+static_assert(grpc_stream_slot(UINT32_MAX, UINT32_MAX).to<u32>() == 62);
+
+static_assert(grpc_elapsed_us(UINT64_MAX, 0) == UINT64_MAX);
+static_assert(grpc_elapsed_us(0, UINT64_MAX) == 0);
+
 namespace {
 bool grpc_temp_template(char* path, size_t capacity, const char* name) {
     const char* directory = std::getenv("TMPDIR");
@@ -432,7 +449,7 @@ struct EchoServer {
             const auto parsed = ws_parse_header(s->data, s->len, true, &header);
             if (parsed == ParseStatus::Incomplete ||
                 (parsed == ParseStatus::Complete &&
-                 s->len < header.header_len + header.payload_len))
+                 s->len < header.header_len + static_cast<u64>(header.payload_len)))
                 return NGHTTP2_ERR_DEFERRED;
             if (parsed != ParseStatus::Complete || header.opcode != WsOpcode::Close || len < 127)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -446,7 +463,7 @@ struct EchoServer {
             if (nghttp2_session_consume(session, id, amount) != 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             *flags |= NGHTTP2_DATA_FLAG_EOF;
-            return out_header + static_cast<ssize_t>(header.payload_len);
+            return out_header + ssize_t{header.payload_len};
         }
         if (s->wire_message) {
             static constexpr u8 request[] = {0x82, 0x85, 1, 2, 3, 4, 0x69, 0x67, 0x6f, 0x68, 0x6e};
@@ -3931,7 +3948,8 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
                       const hpack::Header* trailers,
                       u32 trailer_count,
                       u8 expected_failure,
-                      bool expect_detached) {
+                      bool expect_detached,
+                      u64 initial_response_bytes = 0) {
         GrpcDriveFixture loop;
         Connection upstream;
         upstream.reset();
@@ -3949,6 +3967,7 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
         x.upstream = &upstream;
         x.downstream = &downstream;
         x.upstream_stream = x.downstream_stream = 1;
+        x.response_bytes = initial_response_bytes;
         x.slot_held = true;
         x.upstream_id = 7;
         REQUIRE(upstream_h2.open_stream(1) != nullptr);
@@ -4010,9 +4029,34 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
     const hpack::Header overflow_headers[] = {
         {{":status", 7}, {"200", 3}},
         {{"content-type", 12}, {"application/grpc", 16}},
-        {{"content-length", 14}, {"4294967296", 10}},
+        {{"content-length", 14}, {"9223372036854775808", 19}},
     };
     run(overflow_headers, 3, false, nullptr, 0, false, nullptr, 0, 13, true);
+
+    const hpack::Header wide_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"4294967296", 10}},
+    };
+    run(wide_headers, 3, false, nullptr, 0, false, nullptr, 0, 0, false);
+
+    const hpack::Header wide_complete_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"4294967297", 10}},
+    };
+    const u8 one_byte[] = {'x'};
+    run(wide_complete_headers,
+        3,
+        false,
+        one_byte,
+        1,
+        false,
+        status_trailers,
+        1,
+        0,
+        false,
+        u64{UINT32_MAX} + 1);
 
     const hpack::Header terminal_headers[] = {
         {{":status", 7}, {"200", 3}},
@@ -4021,6 +4065,81 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
         {{"grpc-status", 11}, {"0", 1}},
     };
     run(terminal_headers, 4, true, nullptr, 0, false, nullptr, 0, 13, false);
+}
+
+TEST(grpc_proxy, rejected_response_data_returns_connection_credit) {
+    auto run = [&_tc](u32 buffered, bool corrupt_accounting) {
+        GrpcDriveFixture loop;
+        Connection upstream;
+        upstream.reset();
+        Http2Conn h;
+        h.init_client();
+        h.peer_settings_seen = true;
+        h.grpc.upstream = true;
+        upstream.h2 = &h;
+        GrpcExchange x;
+        x.init();
+        x.upstream = &upstream;
+        x.upstream_stream = 1;
+        x.request_headers_sent = true;
+        x.slot_held = true;
+        auto* stream = h.open_stream(1);
+        REQUIRE(stream != nullptr);
+        stream->manual_window = true;
+        REQUIRE(grpc_attach(h, &x));
+
+        GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+        h.cb_ctx = &dispatch;
+        h.on_headers = &grpc_response_headers<GrpcDriveFixture>;
+        h.on_data = &grpc_response_data<GrpcDriveFixture>;
+        const hpack::Header headers[] = {
+            {{":status", 7}, {"200", 3}},
+            {{"content-type", 12}, {"application/grpc", 16}},
+            {{"content-length", 14}, buffered ? Str{"1", 1} : Str{"0", 1}},
+        };
+        u8 input[128];
+        u8 output[128];
+        u32 written = 0;
+        const i64 kInitialWindow = h.conn_recv_window;
+        const u32 kHeaderLength = http2_write_headers(input, sizeof(input), 1, headers, 3, false);
+        REQUIRE_GT(kHeaderLength, 0u);
+        REQUIRE_FALSE(h.process(input, kHeaderLength, output, sizeof(output), &written).close);
+        REQUIRE(x.has_response_length);
+
+        const u8 byte = 'x';
+        const u32 kFrameLength = http2_write_data(input, 1, &byte, 1, false);
+        if (buffered) {
+            REQUIRE_FALSE(h.process(input, kFrameLength, output, sizeof(output), &written).close);
+            REQUIRE_EQ(x.download_len, buffered);
+            REQUIRE_EQ(stream->recv_unconsumed, buffered);
+        }
+
+        if (corrupt_accounting) stream->recv_unconsumed = 0;
+        const auto kResult = h.process(input, kFrameLength, output, sizeof(output), &written);
+        CHECK_EQ(kResult.close, corrupt_accounting);
+        CHECK_EQ(x.failure, 13u);
+        CHECK(x.response_end);
+        CHECK(x.upstream == nullptr);
+        CHECK_EQ(loop.released, 1u);
+        CHECK_EQ(x.download_len, buffered);
+        CHECK_EQ(stream->recv_unconsumed, 0u);
+        Http2FrameHeader update{};
+        if (corrupt_accounting) {
+            REQUIRE_EQ(parse_frame_header(output, written, &update), ParseStatus::Complete);
+            CHECK_EQ(Http2FrameType{update.type}, Http2FrameType::Goaway);
+            CHECK(h.goaway_sent);
+            return;
+        }
+        CHECK_EQ(h.conn_recv_window, kInitialWindow);
+        REQUIRE_EQ(parse_frame_header(output, written, &update), ParseStatus::Complete);
+        CHECK_EQ(Http2FrameType{update.type}, Http2FrameType::WindowUpdate);
+        CHECK_EQ(update.stream_id, 0u);
+        CHECK(h.open_stream(3) == stream);
+    };
+
+    run(0, false);
+    run(1, false);
+    run(1, true);
 }
 
 TEST(grpc_proxy, encoded_terminal_response_releases_stream_slot_for_queued_rpc) {
@@ -4820,6 +4939,19 @@ TEST(grpc_proxy, upstream_tls_rejections_epoll) {
 }
 TEST(grpc_proxy, upstream_tls_rejections_iouring) {
     for (u32 mode = 0; mode < 7; mode++) tls_rejection_case<IoUringEventLoop>(_tc, mode);
+}
+
+TEST(grpc_proxy, content_length_preserves_output_on_invalid_input) {
+    i64 length = 0;
+    REQUIRE(grpc_parse_content_length(lit_str("0004294967295"), &length));
+    CHECK_EQ(length, i64{UINT32_MAX});
+    REQUIRE(grpc_parse_content_length(lit_str("4294967296"), &length));
+    CHECK_EQ(length, i64{UINT32_MAX} + 1);
+    REQUIRE(grpc_parse_content_length(lit_str("9223372036854775807"), &length));
+    CHECK_EQ(length, INT64_MAX);
+    CHECK_FALSE(grpc_parse_content_length(lit_str("9223372036854775808"), &length));
+    CHECK_FALSE(grpc_parse_content_length(lit_str("12x"), &length));
+    CHECK_EQ(length, INT64_MAX);
 }
 
 TEST(grpc_proxy, observed_status_metadata) {

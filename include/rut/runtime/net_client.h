@@ -1,5 +1,6 @@
 #pragma once
 #include "core/expected.h"
+#include "rut/common/range_int.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/dns.h"
@@ -20,7 +21,7 @@ struct NetEndpoint {
 bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint);
 enum class NetOp : u8 { Tcp, Udp, Send, Receive, ReadExactly, ReadLine, Close, Release };
 struct NetReply {
-    static constexpr i32 kPending = static_cast<i32>(0x80000000u);
+    static constexpr i32 kPending = INT32_MIN;
     i32 status = -1;  // 0 complete; -1 transport, -2 timeout, -3 capacity, -4 invalid
     u32 retry_ms = 0;
     u32 scalar = 0;
@@ -42,24 +43,26 @@ public:
     void stop();
     void cancel(u32 owner, u64 generation = 0);
     void adopt_config(const void* config);
-    NetReply call(u32 owner,
-                  u64 generation,
-                  NetOp operation,
-                  u32 handle,
-                  const NetEndpoint* endpoint,
-                  Str bytes,
-                  i32 amount,
-                  u64 now_ms,
-                  u32 timeout_ms,
-                  const void* config = nullptr);
+    [[nodiscard]] NetReply call(u32 owner,
+                                u64 generation,
+                                NetOp operation,
+                                u32 handle,
+                                const NetEndpoint* endpoint,
+                                Str bytes,
+                                i32 amount,
+                                u64 now_ms,
+                                u32 timeout_ms,
+                                const void* config = nullptr);
 
 private:
+    using IoCount = range_int<0, i64{kMaxBytes} + 1>;
     enum Phase : u8 { Empty, Queued, Running, Done, Idle, Cancelled };
     struct Slot {
         u32 phase = Empty;
         u32 owner = 0, token = 0;
         u64 generation = 0, started = 0, pool_epoch = 0;
-        u32 timeout = 0, amount = 0, offset = 0, buffered = 0;
+        u32 timeout = 0;
+        IoCount amount, offset, buffered;
         NetOp operation = NetOp::Tcp;
         bool datagram = false, eof = false, dns_ready = false;
         NetEndpoint endpoint{};
@@ -68,7 +71,7 @@ private:
         u64 dns_expires = 0;
         NetReply reply{};
         char pending[kMaxBytes]{};
-        u32 pending_length = 0;
+        IoCount pending_length;
         char buffer[kMaxBytes]{};
         bool (*step)(Slot&) = nullptr;
         int fd = -1;

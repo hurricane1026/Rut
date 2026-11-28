@@ -11,7 +11,7 @@ inline constexpr u32 kUuidRequestBudget = 256 * 1024;
 template <typename ReadEntropy>
 bool generate_uuid(char (&out)[kUuidTextLength], ReadEntropy read_entropy) {
     u8 bytes[16]{};
-    if (read_entropy(bytes, sizeof(bytes)) != static_cast<i32>(sizeof(bytes))) return false;
+    if (read_entropy(bytes, sizeof(bytes)) != i32{sizeof(bytes)}) return false;
     // RFC 9562 UUID v4: 122 random bits, version 4, RFC variant 10xx.
     bytes[6] = static_cast<u8>((bytes[6] & 0x0f) | 0x40);
     bytes[8] = static_cast<u8>((bytes[8] & 0x3f) | 0x80);

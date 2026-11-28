@@ -1,6 +1,7 @@
 #include "rut/runtime/tls.h"
 
 #include "core/expected.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/platform/socket.h"
@@ -60,7 +61,7 @@ bool load_client_crl(SSL_CTX* ctx, const char* path, bool verify_issuer) {
     while (length < sizeof(pem)) {
         const ssize_t kRead =
             read(kFd,
-                 pem + static_cast<i64>(length),
+                 pem + i64{length},
                  static_cast<size_t>(static_cast<i64>(sizeof(pem)) - static_cast<i64>(length)));
         if (kRead < 0 && errno == EINTR) continue;
         if (kRead < 0) ok = false;
@@ -183,7 +184,7 @@ BIO* new_nosigpipe_socket_bio(BIO_METHOD* method, i32 fd) {
     // The descriptor lives in BIO's opaque data pointer; it is never dereferenced.
     BIO_set_data(bio,
                  reinterpret_cast<void*>(  // NOLINT(performance-no-int-to-ptr)
-                     static_cast<intptr_t>(fd)));
+                     intptr_t{fd}));
     BIO_set_init(bio, 1);
     return bio;
 }
@@ -205,8 +206,7 @@ bool client_offers(const u8* in, u32 len, const char* name, u8 nlen) {
         const u8 kEntryLen = in[i];
         if (static_cast<i64>(i) + 1 + static_cast<i64>(kEntryLen) > static_cast<i64>(len))
             break;  // truncated entry
-        if (kEntryLen == nlen && __builtin_memcmp(in + static_cast<i64>(i) + 1, name, nlen) == 0)
-            return true;
+        if (kEntryLen == nlen && __builtin_memcmp(in + i64{i} + 1, name, nlen) == 0) return true;
         i = static_cast<u32>(static_cast<i64>(i) + 1 + static_cast<i64>(kEntryLen));
     }
     return false;
@@ -282,10 +282,11 @@ bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& o
     X509_free(peer);
     if (!kOk) return false;
     static constexpr char kHex[] = "0123456789abcdef";
-    for (size_t i = 0; i < 32; ++i) {
-        const size_t kOffset = static_cast<size_t>(static_cast<i64>(i) * 2);
-        out_hex[kOffset] = kHex[digest[i] >> 4];
-        out_hex[static_cast<i64>(kOffset) + 1] = kHex[digest[i] & 0x0f];
+    constexpr auto kNext = range_int<1, 2>::constant<1>();
+    for (u8 i = 0; i < 32; ++i) {
+        const auto offset = range_int(i).scaled_by<2>();
+        out_hex[offset.index()] = kHex[digest[i] >> 4];
+        out_hex[(offset + kNext).index()] = kHex[digest[i] & 0x0f];
     }
     out_valid = true;
     return true;

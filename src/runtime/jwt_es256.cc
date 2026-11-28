@@ -78,9 +78,8 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
         else
             return false;
     }
-    if (first == 0 || first == token.len ||
-        static_cast<i64>(second) <= static_cast<i64>(first) + 1 ||
-        static_cast<i64>(second) >= static_cast<i64>(token.len) - 1)
+    if (first == 0 || first == token.len || i64{second} <= i64{first} + 1 ||
+        i64{second} >= i64{token.len} - 1)
         return false;
     char header[1024];
     u32 length = 0;
@@ -129,7 +128,7 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
         candidate_id = selected.kid;
     }
     char signature[64];
-    if (!decode({token.ptr + static_cast<i64>(second) + 1,
+    if (!decode({token.ptr + i64{second} + 1,
                  static_cast<u32>(static_cast<i64>(token.len) - static_cast<i64>(second) - 1)},
                 signature,
                 sizeof(signature),
@@ -137,7 +136,7 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
         !verifier->verify({token.ptr, second}, {signature, length}))
         return false;
     const u32 kLimit = capacity < json::kMaxBytes ? capacity : json::kMaxBytes;
-    if (!decode({token.ptr + static_cast<i64>(first) + 1,
+    if (!decode({token.ptr + i64{first} + 1,
                  static_cast<u32>(static_cast<i64>(second) - static_cast<i64>(first) - 1)},
                 payload_out,
                 kLimit,

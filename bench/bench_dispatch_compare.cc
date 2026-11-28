@@ -37,135 +37,135 @@ namespace {
 
 // SaaS-like routes — same shape as bench_art_jit_spike.cc but extended
 // to 128 entries so we can sweep route-count.
-const char* kSaasRoutes[] = {
-    "/api/v1/users",
-    "/api/v1/orders",
-    "/api/v1/products",
-    "/api/v1/sessions",
-    "/api/v1/events",
-    "/api/v1/teams",
-    "/api/v1/projects",
-    "/api/v1/messages",
-    "/api/v1/channels",
-    "/api/v1/files",
-    "/api/v1/uploads",
-    "/api/v1/downloads",
-    "/api/v1/permissions",
-    "/api/v1/roles",
-    "/api/v1/audit",
-    "/api/v1/settings",
-    "/api/v2/users",
-    "/api/v2/orders",
-    "/api/v2/products",
-    "/api/v2/sessions",
-    "/api/v2/events",
-    "/api/v2/teams",
-    "/api/v2/projects",
-    "/api/v2/messages",
-    "/api/v2/channels",
-    "/api/v2/files",
-    "/api/v2/uploads",
-    "/api/v2/downloads",
-    "/api/v2/permissions",
-    "/api/v2/roles",
-    "/api/v2/audit",
-    "/api/v2/settings",
-    "/admin",
-    "/admin/users",
-    "/admin/audit",
-    "/admin/billing",
-    "/admin/settings",
-    "/admin/permissions",
-    "/admin/roles",
-    "/admin/quotas",
-    "/oauth/token",
-    "/oauth/authorize",
-    "/oauth/jwks",
-    "/oauth/revoke",
-    "/oauth/introspect",
-    "/oauth/userinfo",
-    "/oauth/discovery",
-    "/oauth/keys",
-    "/webhooks/stripe",
-    "/webhooks/github",
-    "/webhooks/slack",
-    "/webhooks/twilio",
-    "/webhooks/segment",
-    "/webhooks/intercom",
-    "/webhooks/zendesk",
-    "/webhooks/hubspot",
-    "/health",
-    "/healthz",
-    "/metrics",
-    "/_status",
-    "/_ready",
-    "/_live",
-    "/internal/debug",
-    "/internal/profile",
-    "/internal/heap",
-    "/internal/cpu",
-    "/internal/stacks",
-    "/internal/config",
-    "/internal/version",
-    "/internal/build",
-    "/v1",
-    "/v2",
-    "/v3",
-    "/v4",
-    "/static/css/main.css",
-    "/static/js/main.js",
-    "/static/img/logo.png",
-    "/static/img/favicon.ico",
-    "/static/fonts/inter.woff2",
-    "/static/fonts/mono.woff2",
-    "/api/v1/billing",
-    "/api/v1/invoices",
-    "/api/v1/subscriptions",
-    "/api/v1/customers",
-    "/api/v1/refunds",
-    "/api/v1/disputes",
-    "/api/v1/payouts",
-    "/api/v1/balances",
-    "/api/v2/billing",
-    "/api/v2/invoices",
-    "/api/v2/subscriptions",
-    "/api/v2/customers",
-    "/api/v2/refunds",
-    "/api/v2/disputes",
-    "/api/v2/payouts",
-    "/api/v2/balances",
-    "/api/v1/notifications",
-    "/api/v1/preferences",
-    "/api/v1/integrations",
-    "/api/v1/webhooks",
-    "/api/v1/api-keys",
-    "/api/v1/scim/users",
-    "/api/v1/scim/groups",
-    "/api/v1/saml",
-    "/api/v2/notifications",
-    "/api/v2/preferences",
-    "/api/v2/integrations",
-    "/api/v2/webhooks",
-    "/api/v2/api-keys",
-    "/api/v2/scim/users",
-    "/api/v2/scim/groups",
-    "/api/v2/saml",
-    "/admin/api-keys",
-    "/admin/scim",
-    "/admin/saml",
-    "/admin/integrations",
-    "/admin/webhooks",
-    "/admin/audit-log",
-    "/admin/quotas/users",
-    "/admin/quotas/storage",
-    "/admin/quotas/api",
-    "/admin/quotas/bandwidth",
-    "/admin/regions",
-    "/admin/clusters",
-    "/admin/keys",
-    "/admin/secrets",
-    "/admin/policies",
-    "/admin/audit/exports",
+static constexpr Str kSaasRoutes[] = {
+    lit_str("/api/v1/users"),
+    lit_str("/api/v1/orders"),
+    lit_str("/api/v1/products"),
+    lit_str("/api/v1/sessions"),
+    lit_str("/api/v1/events"),
+    lit_str("/api/v1/teams"),
+    lit_str("/api/v1/projects"),
+    lit_str("/api/v1/messages"),
+    lit_str("/api/v1/channels"),
+    lit_str("/api/v1/files"),
+    lit_str("/api/v1/uploads"),
+    lit_str("/api/v1/downloads"),
+    lit_str("/api/v1/permissions"),
+    lit_str("/api/v1/roles"),
+    lit_str("/api/v1/audit"),
+    lit_str("/api/v1/settings"),
+    lit_str("/api/v2/users"),
+    lit_str("/api/v2/orders"),
+    lit_str("/api/v2/products"),
+    lit_str("/api/v2/sessions"),
+    lit_str("/api/v2/events"),
+    lit_str("/api/v2/teams"),
+    lit_str("/api/v2/projects"),
+    lit_str("/api/v2/messages"),
+    lit_str("/api/v2/channels"),
+    lit_str("/api/v2/files"),
+    lit_str("/api/v2/uploads"),
+    lit_str("/api/v2/downloads"),
+    lit_str("/api/v2/permissions"),
+    lit_str("/api/v2/roles"),
+    lit_str("/api/v2/audit"),
+    lit_str("/api/v2/settings"),
+    lit_str("/admin"),
+    lit_str("/admin/users"),
+    lit_str("/admin/audit"),
+    lit_str("/admin/billing"),
+    lit_str("/admin/settings"),
+    lit_str("/admin/permissions"),
+    lit_str("/admin/roles"),
+    lit_str("/admin/quotas"),
+    lit_str("/oauth/token"),
+    lit_str("/oauth/authorize"),
+    lit_str("/oauth/jwks"),
+    lit_str("/oauth/revoke"),
+    lit_str("/oauth/introspect"),
+    lit_str("/oauth/userinfo"),
+    lit_str("/oauth/discovery"),
+    lit_str("/oauth/keys"),
+    lit_str("/webhooks/stripe"),
+    lit_str("/webhooks/github"),
+    lit_str("/webhooks/slack"),
+    lit_str("/webhooks/twilio"),
+    lit_str("/webhooks/segment"),
+    lit_str("/webhooks/intercom"),
+    lit_str("/webhooks/zendesk"),
+    lit_str("/webhooks/hubspot"),
+    lit_str("/health"),
+    lit_str("/healthz"),
+    lit_str("/metrics"),
+    lit_str("/_status"),
+    lit_str("/_ready"),
+    lit_str("/_live"),
+    lit_str("/internal/debug"),
+    lit_str("/internal/profile"),
+    lit_str("/internal/heap"),
+    lit_str("/internal/cpu"),
+    lit_str("/internal/stacks"),
+    lit_str("/internal/config"),
+    lit_str("/internal/version"),
+    lit_str("/internal/build"),
+    lit_str("/v1"),
+    lit_str("/v2"),
+    lit_str("/v3"),
+    lit_str("/v4"),
+    lit_str("/static/css/main.css"),
+    lit_str("/static/js/main.js"),
+    lit_str("/static/img/logo.png"),
+    lit_str("/static/img/favicon.ico"),
+    lit_str("/static/fonts/inter.woff2"),
+    lit_str("/static/fonts/mono.woff2"),
+    lit_str("/api/v1/billing"),
+    lit_str("/api/v1/invoices"),
+    lit_str("/api/v1/subscriptions"),
+    lit_str("/api/v1/customers"),
+    lit_str("/api/v1/refunds"),
+    lit_str("/api/v1/disputes"),
+    lit_str("/api/v1/payouts"),
+    lit_str("/api/v1/balances"),
+    lit_str("/api/v2/billing"),
+    lit_str("/api/v2/invoices"),
+    lit_str("/api/v2/subscriptions"),
+    lit_str("/api/v2/customers"),
+    lit_str("/api/v2/refunds"),
+    lit_str("/api/v2/disputes"),
+    lit_str("/api/v2/payouts"),
+    lit_str("/api/v2/balances"),
+    lit_str("/api/v1/notifications"),
+    lit_str("/api/v1/preferences"),
+    lit_str("/api/v1/integrations"),
+    lit_str("/api/v1/webhooks"),
+    lit_str("/api/v1/api-keys"),
+    lit_str("/api/v1/scim/users"),
+    lit_str("/api/v1/scim/groups"),
+    lit_str("/api/v1/saml"),
+    lit_str("/api/v2/notifications"),
+    lit_str("/api/v2/preferences"),
+    lit_str("/api/v2/integrations"),
+    lit_str("/api/v2/webhooks"),
+    lit_str("/api/v2/api-keys"),
+    lit_str("/api/v2/scim/users"),
+    lit_str("/api/v2/scim/groups"),
+    lit_str("/api/v2/saml"),
+    lit_str("/admin/api-keys"),
+    lit_str("/admin/scim"),
+    lit_str("/admin/saml"),
+    lit_str("/admin/integrations"),
+    lit_str("/admin/webhooks"),
+    lit_str("/admin/audit-log"),
+    lit_str("/admin/quotas/users"),
+    lit_str("/admin/quotas/storage"),
+    lit_str("/admin/quotas/api"),
+    lit_str("/admin/quotas/bandwidth"),
+    lit_str("/admin/regions"),
+    lit_str("/admin/clusters"),
+    lit_str("/admin/keys"),
+    lit_str("/admin/secrets"),
+    lit_str("/admin/policies"),
+    lit_str("/admin/audit/exports"),
 };
 constexpr u32 kMaxRoutes = sizeof(kSaasRoutes) / sizeof(kSaasRoutes[0]);
 static_assert(kMaxRoutes == 128, "expected exactly 128 routes");
@@ -177,19 +177,20 @@ struct LinearTable {
     const char* routes[kMaxRoutes];
     u32 lens[kMaxRoutes];
     u32 count;
+    static_assert(kMaxRoutes <= UINT16_MAX);
 
     void build(u32 n) {
         count = n;
         for (u32 i = 0; i < n; i++) {
-            routes[i] = kSaasRoutes[i];
-            lens[i] = static_cast<u32>(strlen(kSaasRoutes[i]));
+            routes[i] = kSaasRoutes[i].ptr;
+            lens[i] = kSaasRoutes[i].len;
         }
     }
 
     u16 match(const char* p, u32 plen) const {
-        for (u32 i = 0; i < count; i++) {
+        for (u16 i = 0; i < count; i++) {
             if (lens[i] == plen && std::memcmp(routes[i], p, plen) == 0) {
-                return static_cast<u16>(i);
+                return i;
             }
         }
         return 0xFFFF;
@@ -198,9 +199,9 @@ struct LinearTable {
 
 ArtTrie build_art(u32 n) {
     ArtTrie t;
-    for (u32 i = 0; i < n; i++) {
-        const Str p{kSaasRoutes[i], static_cast<u32>(strlen(kSaasRoutes[i]))};
-        t.insert(p, 0, static_cast<u16>(i));
+    for (u16 i = 0; i < n; i++) {
+        const Str p = kSaasRoutes[i];
+        t.insert(p, 0, i);
     }
     return t;
 }
@@ -211,7 +212,7 @@ struct CanonProbes {
     Str canon[kMaxRoutes];
     void build(u32 n) {
         for (u32 i = 0; i < n; i++) {
-            const Str raw{kSaasRoutes[i], static_cast<u32>(strlen(kSaasRoutes[i]))};
+            const Str raw = kSaasRoutes[i];
             canon[i] = canonicalize_request(raw);
         }
     }
@@ -223,7 +224,7 @@ template <typename Match>
 double run_bench(Match match, u32 nprobes, u32 select_kind, u32 iters) {
     // select_kind: 0=first, 1=middle, 2=last, 3=miss
     volatile u32 sink = 0;
-    auto pick = [&](u32 i) -> u32 {
+    auto pick = [&](u32) -> u32 {
         switch (select_kind) {
             case 0:
                 return 0;
@@ -234,14 +235,13 @@ double run_bench(Match match, u32 nprobes, u32 select_kind, u32 iters) {
             default:
                 return nprobes;  // out-of-range → miss
         }
-        (void)i;
     };
     // Warmup
     for (u32 i = 0; i < 50000; i++) sink ^= match(pick(i));
     auto start = std::chrono::high_resolution_clock::now();
     for (u32 i = 0; i < iters; i++) sink ^= match(pick(i));
     auto end = std::chrono::high_resolution_clock::now();
-    (void)sink;
+    [[maybe_unused]] const auto result = sink;
     return std::chrono::duration<double, std::nano>(end - start).count() / iters;
 }
 
@@ -291,34 +291,31 @@ int main() {
 
         for (u32 sk = 0; sk < 4; sk++) {
             // Linear: feeds raw probe (with leading '/').
-            auto m_lin = [&](u32 i) -> u16 {
+            auto m_lin = [&](u32) -> u16 {
                 const u32 idx = (sk == 3) ? 0 : (sk == 0 ? 0 : (sk == 1 ? n / 2 : n - 1));
-                (void)i;
                 if (sk == 3) {
-                    static const char* miss = "/notregistered";
-                    return lin.match(miss, static_cast<u32>(strlen(miss)));
+                    constexpr Str miss = lit_str("/notregistered");
+                    return lin.match(miss.ptr, miss.len);
                 }
-                const char* p = kSaasRoutes[idx];
-                return lin.match(p, static_cast<u32>(strlen(p)));
+                const Str p = kSaasRoutes[idx];
+                return lin.match(p.ptr, p.len);
             };
             // Scalar ART: feeds raw probe (canonicalized inside).
-            auto m_art = [&](u32 i) -> u16 {
+            auto m_art = [&](u32) -> u16 {
                 const u32 idx = (sk == 3) ? 0 : (sk == 0 ? 0 : (sk == 1 ? n / 2 : n - 1));
-                (void)i;
                 if (sk == 3) {
-                    static const char* miss = "/notregistered";
-                    return art.match(Str{miss, static_cast<u32>(strlen(miss))}, 0);
+                    constexpr Str miss = lit_str("/notregistered");
+                    return art.match(miss, 0);
                 }
-                const char* p = kSaasRoutes[idx];
-                return art.match(Str{p, static_cast<u32>(strlen(p))}, 0);
+                const Str p = kSaasRoutes[idx];
+                return art.match(p, 0);
             };
             // JIT: feeds canonical probe (pre-canonicalized).
-            auto m_jit = [&](u32 i) -> u16 {
+            auto m_jit = [&](u32) -> u16 {
                 const u32 idx = (sk == 3) ? 0 : (sk == 0 ? 0 : (sk == 1 ? n / 2 : n - 1));
-                (void)i;
                 if (sk == 3) {
-                    static const char* miss_canon = "notregistered";
-                    return jit_fn(miss_canon, static_cast<u32>(strlen(miss_canon)), 0);
+                    constexpr Str miss_canon = lit_str("notregistered");
+                    return jit_fn(miss_canon.ptr, miss_canon.len, 0);
                 }
                 const Str& c = cp.canon[idx];
                 return jit_fn(c.ptr, c.len, 0);

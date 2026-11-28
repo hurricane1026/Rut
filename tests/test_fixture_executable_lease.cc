@@ -225,11 +225,11 @@ bool canonical_custody_test() {
                   self_kcmp(lease.observation_fd(), authorities[1]) &&
                   self_kcmp(authorities[0], authorities[1]),
               "canonical private authorities exact OFD") &&
-        check(identity && lease.identity().device == static_cast<std::uint64_t>(status.st_dev) &&
-                  lease.identity().inode == static_cast<std::uint64_t>(status.st_ino) &&
-                  lease.identity().mode == static_cast<std::uint64_t>(status.st_mode) &&
-                  lease.identity().uid == static_cast<std::uint64_t>(status.st_uid) &&
-                  lease.identity().gid == static_cast<std::uint64_t>(status.st_gid),
+        check(identity && lease.identity().device == std::uint64_t{status.st_dev} &&
+                  lease.identity().inode == std::uint64_t{status.st_ino} &&
+                  lease.identity().mode == std::uint64_t{status.st_mode} &&
+                  lease.identity().uid == std::uint64_t{status.st_uid} &&
+                  lease.identity().gid == std::uint64_t{status.st_gid},
               "canonical stored identity") &&
         check(lease.revalidate(diagnostic), "canonical revalidate") &&
         check(lease.close(diagnostic), "canonical close") &&
@@ -326,7 +326,7 @@ bool argument_and_policy_rejection_test() {
                okay;
     }
     std::array<gid_t, 32> groups{};
-    const int group_count = getgroups(static_cast<int>(groups.size()), groups.data());
+    const int group_count = getgroups(int{groups.size()}, groups.data());
     gid_t alternate_group = getegid();
     for (int index = 0; index < group_count; ++index)
         if (groups[static_cast<std::size_t>(index)] != getegid()) {
@@ -341,10 +341,9 @@ bool argument_and_policy_rejection_test() {
         executable::Diagnostic diagnostic;
         const bool accepted = executable::ExecutableLease::create(
             directory.child("alternate-gid"), lease, diagnostic);
-        okay =
-            check(accepted && lease.identity().gid == static_cast<std::uint64_t>(alternate_group),
-                  "supplementary-group executable was incorrectly rejected") &&
-            okay;
+        okay = check(accepted && lease.identity().gid == std::uint64_t{alternate_group},
+                     "supplementary-group executable was incorrectly rejected") &&
+               okay;
         okay =
             check(accepted && lease.close(diagnostic), "supplementary-group executable cleanup") &&
             okay;

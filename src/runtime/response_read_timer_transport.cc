@@ -3,7 +3,7 @@
 namespace rut {
 namespace {
 
-consteval bool timer_result_domain_matches() {
+[[nodiscard]] consteval bool timer_result_domain_matches() {
     // Include the four documented outcomes, foreign errors, and a positive
     // byte count. The selector is the cancel bit, independent of the owner id.
     constexpr i32 results[] = {-ETIME, -ECANCELED, 0, -ENOENT, -EALREADY, -EIO, 1};
@@ -27,7 +27,8 @@ consteval bool timer_result_domain_matches() {
     return true;
 }
 
-consteval bool timer_payload_is_isolated(u32 tagged_generation, i32 completion_result) {
+[[nodiscard]] consteval bool timer_payload_is_isolated(u32 tagged_generation,
+                                                       i32 completion_result) {
     IoEvent event{};
     // Decomposing the production aggregate makes a new payload member a build
     // error until its meaning for a response timer has been considered.

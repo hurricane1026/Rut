@@ -1,10 +1,13 @@
+#include "rut/common/byte_span.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks_impl.h"  // IWYU pragma: keep
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/format_integer.h"
 #ifdef __APPLE__
 #include "rut/runtime/kqueue_event_loop.h"  // IWYU pragma: keep
 #else
@@ -51,7 +54,7 @@ template void expire_connect_attempt<IoUringEventLoop>(IoUringEventLoop*, Connec
 bool h2_apply_forward_request_overrides(Connection& conn, const RouteConfig* config) {
     if (conn.target_transform_recorded &&
         (config == nullptr || !config->target_transform_id_is_valid(conn.target_transform_id) ||
-         config->target_transforms[static_cast<i64>(conn.target_transform_id) - 1].mode ==
+         config->target_transforms[i64{conn.target_transform_id} - 1].mode ==
              ForwardTargetTransformMode::CleanPrefix ||
          !materialize_request_target_transform(conn, *config)))
         return false;
@@ -173,7 +176,7 @@ static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end
                 static_cast<u32>(static_cast<i64>(host_end) - static_cast<i64>(start) - 1);
             char host[128];
             if (host_len >= sizeof(host)) return false;
-            __builtin_memcpy(host, data + static_cast<i64>(start) + 1, host_len);
+            __builtin_memcpy(host, data + i64{start} + 1, host_len);
             host[host_len] = '\0';
             in6_addr address{};
             if (inet_pton(AF_INET6, host, &address) != 1) return false;
@@ -191,8 +194,8 @@ static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end
                                   c == ')' || c == '*' || c == '+' || c == ',' || c == ';' ||
                                   c == '=';
             if (c == '%') {
-                if (static_cast<i64>(i) + 2 >= static_cast<i64>(host_end)) return false;
-                const u8 h = data[static_cast<i64>(i) + 1], l = data[static_cast<i64>(i) + 2];
+                if (i64{i} + 2 >= i64{host_end}) return false;
+                const u8 h = data[i64{i} + 1], l = data[i64{i} + 2];
                 const bool hex_h =
                     (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
                 const bool hex_l =
@@ -322,24 +325,13 @@ void capture_request_metadata(Connection& conn) {
     if (parse_status == ParseStatus::Complete) {
         u32 raw_target_offset = 0;
         u32 raw_target_length = 0;
-        const uintptr_t base_address = reinterpret_cast<uintptr_t>(data);
-        const uintptr_t target_address = reinterpret_cast<uintptr_t>(req.path.ptr);
-        uintptr_t target_end = 0;
-        const bool target_address_range_valid =
-            base_address >= 4096 &&
-            !__builtin_add_overflow(base_address, static_cast<uintptr_t>(kLen), &target_end) &&
-            target_address >= base_address && target_address <= target_end;
-        if (target_address_range_valid) {
-            uintptr_t offset_ptr = 0;
-            if (__builtin_sub_overflow(target_address, base_address, &offset_ptr)) return;
-            const u64 offset = offset_ptr;
-            u64 end = 0;
-            if (__builtin_add_overflow(offset, static_cast<u64>(req.path.len), &end)) return;
-            if (req.path.len != 0 && end > offset && end < parser.header_end && end <= kLen &&
-                data[static_cast<i64>(offset)] == '/' && req.path_canon.ptr != nullptr) {
-                raw_target_offset = static_cast<u32>(offset);
-                raw_target_length = req.path.len;
-            }
+        u32 offset = 0;
+        if (reinterpret_cast<uintptr_t>(data) >= 4096 && req.path.len != 0 &&
+            byte_span_offset_within(data, kLen, req.path.ptr, req.path.len, &offset) &&
+            (range_int(offset) + range_int(req.path.len)).value() < parser.header_end &&
+            data[offset] == '/' && req.path_canon.ptr != nullptr) {
+            raw_target_offset = offset;
+            raw_target_length = req.path.len;
         }
         conn.req_header_end = parser.header_end;
         conn.req_http_version = static_cast<u8>(req.version);
@@ -416,7 +408,7 @@ void capture_request_metadata(Connection& conn) {
                 canon_len =
                     static_cast<u32>(static_cast<i64>(copy_len) - static_cast<i64>(canon_off));
             }
-            conn.req_path_canon = Str{conn.req_path + static_cast<i64>(canon_off), canon_len};
+            conn.req_path_canon = Str{conn.req_path + i64{canon_off}, canon_len};
         } else {
             conn.req_path_canon = {nullptr, 0};
         }
@@ -425,18 +417,20 @@ void capture_request_metadata(Connection& conn) {
             conn.req_body_mode = BodyMode::Chunked;
             conn.req_body_remaining = 0;
             conn.req_chunk_parser.reset();
-            const u32 kBodyInBuf =
-                kLen > parser.header_end
-                    ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
-                    : 0;
+            const u32 kBodyInBuf = kLen > parser.header_end
+                                       ? (range_int(kLen) - range_int(parser.header_end))
+                                             .max(range_int(u32{0}))
+                                             .min(range_int(UINT32_MAX))
+                                             .to<u32>()
+                                       : 0;
             chunk_consumed = kBodyInBuf;
             if (kBodyInBuf > 0) {
-                const u8* body_start = data + static_cast<i64>(parser.header_end);
+                const u8* body_start = data + i64{parser.header_end};
                 u32 pos = 0;
                 while (pos < kBodyInBuf) {
                     u32 consumed = 0, out_start = 0, out_len = 0;
                     const ChunkStatus kChunkStatus = conn.req_chunk_parser.feed(
-                        body_start + static_cast<i64>(pos),
+                        body_start + i64{pos},
                         static_cast<u32>(static_cast<i64>(kBodyInBuf) - static_cast<i64>(pos)),
                         &consumed,
                         &out_start,
@@ -461,23 +455,35 @@ void capture_request_metadata(Connection& conn) {
             conn.req_body_mode = BodyMode::ContentLength;
             conn.req_content_length = req.content_length;
             conn.req_body_remaining = req.content_length;
-            const u32 kBodyInBuf =
-                kLen > parser.header_end
-                    ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
-                    : 0;
-            if (kBodyInBuf >= conn.req_body_remaining)
+            const u32 kBodyInBuf = kLen > parser.header_end
+                                       ? (range_int(kLen) - range_int(parser.header_end))
+                                             .max(range_int(u32{0}))
+                                             .min(range_int(UINT32_MAX))
+                                             .to<u32>()
+                                       : 0;
+            if (i64{kBodyInBuf} >= conn.req_body_remaining)
                 conn.req_body_remaining = 0;
             else
-                conn.req_body_remaining = static_cast<u32>(
-                    static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(kBodyInBuf));
+                conn.req_body_remaining -= i64{kBodyInBuf};
         }
         if (conn.req_body_mode == BodyMode::None) {
             conn.req_initial_send_len = parser.header_end;
         } else if (conn.req_body_mode == BodyMode::ContentLength) {
-            const u32 kBodyInInitial = static_cast<u32>(static_cast<i64>(conn.req_content_length) -
-                                                        static_cast<i64>(conn.req_body_remaining));
-            conn.req_initial_send_len = static_cast<u32>(static_cast<i64>(parser.header_end) +
-                                                         static_cast<i64>(kBodyInInitial));
+            const u32 kBodyInBuf = kLen > parser.header_end
+                                       ? (range_int(kLen) - range_int(parser.header_end))
+                                             .max(range_int(u32{0}))
+                                             .min(range_int(UINT32_MAX))
+                                             .to<u32>()
+                                       : 0;
+            const u32 kBodyInInitial = conn.req_content_length <= i64{kBodyInBuf}
+                                           ? range_int(conn.req_content_length)
+                                                 .max(range_int(u32{0}))
+                                                 .min(range_int(UINT32_MAX))
+                                                 .to<u32>()
+                                           : kBodyInBuf;
+            conn.req_initial_send_len = (range_int(parser.header_end) + range_int(kBodyInInitial))
+                                            .min(range_int(UINT32_MAX))
+                                            .to<u32>();
         }
         if (conn.req_initial_send_len > 0) {
             conn.downstream_req_size = conn.req_initial_send_len;
@@ -501,16 +507,14 @@ void capture_request_metadata(Connection& conn) {
 
     u32 method_len = 0;
     conn.req_method = parse_log_method_fallback(data, kLen, &method_len);
-    if (method_len == 0 || static_cast<i64>(method_len) + 1 >= static_cast<i64>(kLen) ||
-        data[method_len] != ' ')
-        return;
+    if (method_len == 0 || i64{method_len} + 1 >= i64{kLen} || data[method_len] != ' ') return;
 
     const u32 kPathStart = static_cast<u32>(static_cast<i64>(method_len) + 1);
     u32 path_len = 0;
-    while (static_cast<i64>(kPathStart) + static_cast<i64>(path_len) < static_cast<i64>(kLen) &&
-           data[static_cast<i64>(kPathStart) + static_cast<i64>(path_len)] != ' ' &&
-           data[static_cast<i64>(kPathStart) + static_cast<i64>(path_len)] != '\r' &&
-           data[static_cast<i64>(kPathStart) + static_cast<i64>(path_len)] != '\n') {
+    while (i64{kPathStart} + i64{path_len} < i64{kLen} &&
+           data[i64{kPathStart} + i64{path_len}] != ' ' &&
+           data[i64{kPathStart} + i64{path_len}] != '\r' &&
+           data[i64{kPathStart} + i64{path_len}] != '\n') {
         path_len++;
     }
 
@@ -570,7 +574,7 @@ PipelineTransitionResult pipeline_shift(Connection& conn) {
     if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
     const PipelineTransitionResult kTransition = pipeline_advance(conn);
     if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
-    const u8* src = conn.recv_buf.data() + static_cast<i64>(conn.req_initial_send_len);
+    const u8* src = conn.recv_buf.data() + i64{conn.req_initial_send_len};
     conn.reset_request_receive_buffer();
     u8* dst = conn.recv_buf.write_ptr();
     __builtin_memmove(dst, src, kLeftover);
@@ -590,8 +594,8 @@ bool pipeline_stash(Connection& conn) {
         conn.pipeline_stash_len = 0;
         return false;
     }
-    const u8* src = conn.recv_buf.data() + static_cast<i64>(conn.req_initial_send_len);
-    conn.send_buf.write(src, kLeftover);
+    const u8* src = conn.recv_buf.data() + i64{conn.req_initial_send_len};
+    conn.send_buf.append_prefix(src, kLeftover);
     conn.pipeline_stash_len = static_cast<u16>(kLeftover);
     return true;
 }
@@ -604,10 +608,9 @@ PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transitio
         if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
     }
     const u32 kStashOff = conn.retry_req_send_len;
-    const u8* src = conn.send_buf.data() + static_cast<i64>(kStashOff);
+    const u8* src = conn.send_buf.data() + i64{kStashOff};
     const u32 kExisting = conn.recv_buf.len();
-    if (static_cast<i64>(kStashLen) + static_cast<i64>(kExisting) >
-        static_cast<i64>(conn.recv_buf.capacity()))
+    if (i64{kStashLen} + i64{kExisting} > conn.recv_buf.capacity())
         return PipelineTransitionResult::LimitExceeded;
     if (count_transition) {
         const PipelineTransitionResult kTransition = pipeline_advance(conn);
@@ -627,9 +630,9 @@ PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transitio
         // tunnel install while an io_uring multishot recv stayed armed) came
         // AFTER the stash, so they must follow it — not be dropped. Shift them up
         // by kStashLen and prepend the stash. base == recv_buf.data().
-        u8* base = conn.recv_buf.write_ptr() - static_cast<i64>(kExisting);
+        u8* base = conn.recv_buf.write_ptr() - i64{kExisting};
         conn.clear_raw_request_target_witness();
-        __builtin_memmove(base + static_cast<i64>(kStashLen), base, kExisting);
+        __builtin_memmove(base + i64{kStashLen}, base, kExisting);
         __builtin_memmove(base, src, kStashLen);
         conn.recv_buf.set_len(
             static_cast<u32>(static_cast<i64>(kStashLen) + static_cast<i64>(kExisting)));
@@ -884,66 +887,66 @@ static void write_response_headers(Connection& conn,
                                    HttpVersion response_version) {
     conn.send_buf.reset();
     const char* version = response_version == HttpVersion::Http10 ? "HTTP/1.0 " : "HTTP/1.1 ";
-    conn.send_buf.write(reinterpret_cast<const u8*>(version), 9);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(version), 9);
     char code_buf[3];
     code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
     code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
     code_buf[2] = static_cast<char>('0' + code % 10);
-    conn.send_buf.write(reinterpret_cast<const u8*>(code_buf), 3);
-    conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
-    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(code_buf), 3);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(" "), 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(reason), reason_len);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     // Content-Length: decimal digits, always emitted (even for 0).
-    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Content-Length: "), 16);
     if (body_len >= 1000000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 1000000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 100000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 10000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 1000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 100000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 10000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 1000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 100u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 10u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
-    char d = static_cast<char>('0' + static_cast<i64>(body_len % 10));
-    conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    char d = last_decimal_digit(body_len);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     if (content_type_len > 0) {
-        conn.send_buf.write(reinterpret_cast<const u8*>("Content-Type: "), 14);
-        conn.send_buf.write(reinterpret_cast<const u8*>(content_type), content_type_len);
-        conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Content-Type: "), 14);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(content_type), content_type_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     }
     if (keep_alive)
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
     else
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
 }
 
 void format_static_response(
@@ -959,7 +962,7 @@ void format_static_response(
     write_response_headers(
         conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0, response_version);
     if (!kSuppressBody && kBodyLen > 0)
-        conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(reason), kBodyLen);
 }
 
 void format_response_with_body(Connection& conn,
@@ -990,7 +993,7 @@ void format_response_with_body(Connection& conn,
                            sizeof(kDefaultContentType) - 1,
                            response_version);
     if (!headers_only && body_len > 0)
-        conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
 // Case-insensitive compare against a string literal. Templated on the
@@ -1011,43 +1014,43 @@ static bool header_name_eq_literal_ci(const char* data, u32 len, const char (&li
 // body_len values (the common case) don't pay for ten divisions.
 static void write_content_length_digits(Connection& conn, u32 body_len) {
     if (body_len >= 1000000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 1000000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 100000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 10000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 1000000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 100000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 10000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 1000u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 100u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10u) % 10));
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        char d = last_decimal_digit(body_len / 10u);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
-    char d = static_cast<char>('0' + static_cast<i64>(body_len % 10));
-    conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    char d = last_decimal_digit(body_len);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
 }
 
 // Count ASCII digits needed to represent `v` in base 10 (at least 1).
@@ -1112,30 +1115,30 @@ bool format_response_with_body_and_headers(Connection& conn,
         sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1;
     constexpr u32 kConnKeepAliveLine = 24;  // "Connection: keep-alive\r\n"
     constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
-    u64 needed = 0;
-    bool needed_overflow = false;
-    auto add_needed = [&](u64 value) {
-        if (!needed_overflow) needed_overflow = __builtin_add_overflow(needed, value, &needed);
+    u32 remaining = conn.send_buf.capacity_u32();
+    bool fits = true;
+    auto reserve = [&](u32 bytes) {
+        if (fits) fits = (range_int(remaining) - range_int(bytes)).to(&remaining);
     };
-    add_needed(kStatusLineFixed);
-    add_needed(reason_len);
-    add_needed(kContentLengthPrefix);
-    add_needed(decimal_digit_count(body_len_emit));
-    add_needed(2);
-    if (emit_default_content_type) add_needed(kDefaultContentTypeLine);
+    reserve(kStatusLineFixed);
+    reserve(reason_len);
+    reserve(kContentLengthPrefix);
+    reserve(decimal_digit_count(body_len_emit));
+    reserve(2);
+    if (emit_default_content_type) reserve(kDefaultContentTypeLine);
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
         }
-        add_needed(headers[i].key_len);
-        add_needed(2);
-        add_needed(headers[i].value_len);
-        add_needed(2);
+        reserve(headers[i].key_len);
+        reserve(2);
+        reserve(headers[i].value_len);
+        reserve(2);
     }
-    add_needed(keep_alive ? kConnKeepAliveLine : kConnCloseLine);
-    add_needed(2);  // blank line terminator
-    if (!headers_only) add_needed(body_len_emit);
-    if (needed_overflow || needed > conn.send_buf.capacity()) {
+    reserve(keep_alive ? kConnKeepAliveLine : kConnCloseLine);
+    reserve(2);  // blank line terminator
+    if (!headers_only) reserve(body_len_emit);
+    if (!fits) {
         // Fail closed: force connection close and emit a small 500.
         // format_static_response uses the reason-phrase body which is
         // guaranteed to fit. Update conn state too — resp_status and
@@ -1153,48 +1156,49 @@ bool format_response_with_body_and_headers(Connection& conn,
     conn.send_buf.reset();
     // Status line: "HTTP/1.x <3-digit code> <reason>\r\n"
     const char* version = response_version == HttpVersion::Http10 ? "HTTP/1.0 " : "HTTP/1.1 ";
-    conn.send_buf.write(reinterpret_cast<const u8*>(version), 9);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(version), 9);
     char code_buf[3];
     code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
     code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
     code_buf[2] = static_cast<char>('0' + code % 10);
-    conn.send_buf.write(reinterpret_cast<const u8*>(code_buf), 3);
-    conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
-    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(code_buf), 3);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(" "), 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(reason), reason_len);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     // Content-Length (from body_len_emit, not the user's headers).
-    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Content-Length: "), 16);
     write_content_length_digits(conn, body_len_emit);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     // Default Content-Type only if the user didn't supply one AND
     // we're actually going to send a body. No-body responses (1xx /
     // 204 / 304 and redirect-style header-only responses) shouldn't
     // advertise a Content-Type — matches format_static_response.
     if (emit_default_content_type) {
         static const char kDefaultContentType[] = "Content-Type: text/plain; charset=utf-8\r\n";
-        conn.send_buf.write(reinterpret_cast<const u8*>(kDefaultContentType),
-                            sizeof(kDefaultContentType) - 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(kDefaultContentType),
+                                    sizeof(kDefaultContentType) - 1);
     }
     // User-supplied headers, skipping Content-Length.
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
         }
-        conn.send_buf.write(reinterpret_cast<const u8*>(headers[i].key_data), headers[i].key_len);
-        conn.send_buf.write(reinterpret_cast<const u8*>(": "), 2);
-        conn.send_buf.write(reinterpret_cast<const u8*>(headers[i].value_data),
-                            headers[i].value_len);
-        conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(headers[i].key_data),
+                                    headers[i].key_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(": "), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(headers[i].value_data),
+                                    headers[i].value_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     }
     // Connection + blank line.
     if (keep_alive)
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
     else
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
 
     if (!headers_only && body_len_emit > 0) {
-        conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len_emit);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(body_data), body_len_emit);
     }
     return true;
 }
@@ -1230,7 +1234,7 @@ u32 consume_upstream_sent(Connection& conn) {
         return 0;
     }
     const u32 kRemaining = static_cast<u32>(static_cast<i64>(kTotal) - static_cast<i64>(kSent));
-    const u8* src = conn.upstream_recv_buf.data() + static_cast<i64>(kSent);
+    const u8* src = conn.upstream_recv_buf.data() + i64{kSent};
     conn.upstream_recv_buf.reset();
     u8* dst = conn.upstream_recv_buf.write_ptr();
     __builtin_memmove(dst, src, kRemaining);
@@ -1241,7 +1245,7 @@ u32 consume_upstream_sent(Connection& conn) {
 template void on_request_complete<NativeReactorEventLoop>(NativeReactorEventLoop*,
                                                           Connection&,
                                                           u16,
-                                                          u32);
+                                                          i64);
 template void pipeline_dispatch<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void on_header_received<NativeReactorEventLoop>(void*, Connection&, IoEvent);
 template void on_response_sent<NativeReactorEventLoop>(void*, Connection&, IoEvent);
@@ -1330,7 +1334,7 @@ template void h1_tls_detach<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template bool h1_tls_dispatch_owner_event<IoUringEventLoop>(IoUringEventLoop*,
                                                             Connection&,
                                                             IoEvent);
-template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, u32);
+template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, i64);
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void on_header_received<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);

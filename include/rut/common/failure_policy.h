@@ -2,6 +2,7 @@
 
 #include "rut/common/forward_policy_head_mode.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 
@@ -45,15 +46,16 @@ inline u32 bounded_response_release_target(u32 raw_header_bytes,
                                            bool terminal) {
     if (body_received > declared_body) return 0;
     if (terminal) return body_received;
-    if (static_cast<i64>(raw_header_bytes) + static_cast<i64>(body_received) > UINT32_MAX) return 0;
-    const u32 raw_total =
-        static_cast<u32>(static_cast<i64>(raw_header_bytes) + static_cast<i64>(body_received));
-    const u32 released_raw = static_cast<u32>(static_cast<i64>(raw_total) %
-                                              static_cast<i64>(kBoundedResponseBufferBytes));
-    const u32 aligned =
-        static_cast<u32>(static_cast<i64>(raw_total) - static_cast<i64>(released_raw));
-    return aligned > raw_header_bytes
-               ? static_cast<u32>(static_cast<i64>(aligned) - static_cast<i64>(raw_header_bytes))
+    using ResponseLength = range_int<0, i64{UINT32_MAX} + 1>;
+    const auto raw_total = ResponseLength{raw_header_bytes} + ResponseLength{body_received};
+    const i64 released_raw = raw_total.value() % i64{kBoundedResponseBufferBytes};
+    const i64 aligned = raw_total.value() - released_raw;
+    if (aligned <= i64{raw_header_bytes}) return 0;
+    const i64 target = aligned - i64{raw_header_bytes};
+    ResponseLength target_length;
+    u32 result = 0;
+    return ResponseLength::try_from_i64(target, &target_length) && target_length.to(&result)
+               ? result
                : 0;
 }
 

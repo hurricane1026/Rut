@@ -52,13 +52,12 @@ bool resource_identifier_valid(Str resource) {
         u32 close = 9;
         while (close < end && resource.ptr[close] != ']') ++close;
         char address[INET6_ADDRSTRLEN];
-        const i64 address_len = static_cast<i64>(close) - 9;
-        if (close == end || close == 9 || address_len >= static_cast<i64>(sizeof(address)))
-            return false;
+        const i64 address_len = i64{close} - 9;
+        if (close == end || close == 9 || address_len >= i64{sizeof(address)}) return false;
         for (u32 i = 9; i < close; ++i) {
             const char kByte = resource.ptr[i];
             if (!hex_byte(kByte) && kByte != ':' && kByte != '.') return false;
-            address[static_cast<i64>(i) - 9] = kByte;
+            address[i64{i} - 9] = kByte;
         }
         address[address_len] = 0;
         struct in6_addr parsed{};
@@ -68,12 +67,12 @@ bool resource_identifier_valid(Str resource) {
     } else {
         u32 host_end = 8;
         while (host_end < end && resource.ptr[host_end] != ':') ++host_end;
-        if (host_end == 8 || static_cast<i64>(host_end) - 8 > 253) return false;
+        if (host_end == 8 || i64{host_end} - 8 > 253) return false;
         u32 label = 0;
         for (u32 i = 8; i < host_end; ++i) {
             const char kByte = resource.ptr[i];
             if (kByte == '.') {
-                if (!label || resource.ptr[static_cast<i64>(i) - 1] == '-') return false;
+                if (!label || resource.ptr[i64{i} - 1] == '-') return false;
                 label = 0;
             } else {
                 const bool kLetter =
@@ -85,7 +84,7 @@ bool resource_identifier_valid(Str resource) {
                 if (label > 63) return false;
             }
         }
-        if (!label || resource.ptr[static_cast<i64>(host_end) - 1] == '-') return false;
+        if (!label || resource.ptr[i64{host_end} - 1] == '-') return false;
         port = host_end;
     }
     if (port < end) {
@@ -94,7 +93,7 @@ bool resource_identifier_valid(Str resource) {
         for (; port < end; ++port) {
             const char kByte = resource.ptr[port];
             if (kByte < '0' || kByte > '9') return false;
-            const i64 next_number = static_cast<i64>(number) * 10 + static_cast<i64>(kByte - '0');
+            const i64 next_number = i64{number} * 10 + i64{kByte - '0'};
             if (next_number > 65535) return false;
             number = static_cast<u32>(next_number);
         }
@@ -105,9 +104,8 @@ bool resource_identifier_valid(Str resource) {
     for (u32 i = end; i < resource.len; ++i) {
         const char kByte = resource.ptr[i];
         if (kByte == '%') {
-            if (static_cast<i64>(resource.len) - static_cast<i64>(i) < 3 ||
-                !hex_byte(resource.ptr[static_cast<i64>(i) + 1]) ||
-                !hex_byte(resource.ptr[static_cast<i64>(i) + 2]))
+            if (i64{resource.len} - i64{i} < 3 || !hex_byte(resource.ptr[i64{i} + 1]) ||
+                !hex_byte(resource.ptr[i64{i} + 2]))
                 return false;
             i = static_cast<u32>(static_cast<i64>(i) + 2);
         } else {
@@ -197,8 +195,7 @@ bool oauth_client_basic_authorization(Str client_id, Str client_secret, json::Wr
                                      sizeof(scratch.encoded),
                                      &encoded_length) ||
         !output.ok || output.len > output.cap ||
-        static_cast<i64>(encoded_length) + 6 >
-            static_cast<i64>(output.cap) - static_cast<i64>(output.len))
+        i64{encoded_length} + 6 > i64{output.cap} - i64{output.len})
         return false;
     output.text(lit_str("Basic "));
     output.text({reinterpret_cast<const char*>(scratch.encoded), encoded_length});

@@ -1,6 +1,7 @@
 #include "rut/runtime/password_gateway.h"
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/connection_base.h"
@@ -108,7 +109,7 @@ u32 PasswordGateway::active_requests() const {
         if (entry.active) ++count;
     return count;
 }
-PasswordGatewayReply PasswordGateway::verify(
+[[nodiscard]] PasswordGatewayReply PasswordGateway::verify(
     u32 connection, u64 generation, Str password, Str record, u64 now_ms, u32 timeout_ms) {
     if (generation == 0) return {};
     if (worker.completion_fd() >= 0 && !worker.drain_completions()) {
@@ -140,7 +141,7 @@ PasswordGatewayReply PasswordGateway::verify(
     const auto kStatus = found->request.poll(now_ms);
     if (kStatus == PasswordRequestStatus::Pending) {
         u64 kRemaining = 0;
-        if (__builtin_sub_overflow(found->request.deadline_ms(), now_ms, &kRemaining)) return {};
+        if (sub_overflow(found->request.deadline_ms(), now_ms, &kRemaining)) return {};
         return {kStatus, static_cast<u32>(kRemaining < 10 ? kRemaining : 10)};
     }
     const auto kResult = found->request.take();

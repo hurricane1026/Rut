@@ -1,5 +1,7 @@
 #include "rut/runtime/route_trie.h"
 
+#include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/runtime/route_params.h"
 
@@ -14,19 +16,11 @@ namespace rut {
 //        once the trailing empty run is skipped
 //   P3a: case-sensitive — bytes are preserved verbatim, no tolower
 //
-// Returns the segment count, or kMaxPathSegments + 1 as a sentinel when the
-// path would produce more segments than `out` can hold. The two callers
-// treat the sentinel differently:
-//   - insert() rejects sentinel results at build time (registering a
-//     truncated path would land the route at the wrong depth relative
-//     to what the user wrote).
-//   - match() ignores the sentinel and routes using whatever segment
-//     prefix `out` does hold, so a request that exceeds the cap still
-//     hits the deepest applicable terminal — preserving catchall and
-//     longest-prefix semantics rather than failing-closed on input
-//     length alone (Codex P1 caught the earlier fail-closed match()).
-
-u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out) {
+// Return the number of retained segments. Registration uses a sentinel
+// when storage fills so a truncated path cannot create a route.
+[[nodiscard]] u32 RouteTrie::tokenize_segments(Str path,
+                                               FixedVec<Str, kMaxPathSegments>& out,
+                                               SegmentLimit limit) {
     // Pure segment split — query/fragment stripping is the caller's
     // job. Routes arrive here via RouteConfig::add_* which already
     // rejected inputs containing '?' / '#', so insert() sees a clean
@@ -34,16 +28,22 @@ u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out)
     // Str above any '?' / '#' before calling tokenize. Keeping
     // tokenize pure means the insert-vs-match round-trip always
     // agrees on what a segment is: bytes between slashes.
+    constexpr auto kSegmentLimitExceeded =
+        range_int<i64{kMaxPathSegments} + 1, i64{kMaxPathSegments} + 2>{}.to<u32>();
     u32 start = 0;
-    for (u32 i = 0; i <= path.len; i++) {
-        const bool at_sep = (i == path.len) || (path.ptr[i] == '/');
-        if (!at_sep) continue;
-        if (i > start) {
-            if (!out.push(Str{path.ptr + static_cast<i64>(start),
-                              static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(start))}))
-                return static_cast<u32>(static_cast<i64>(kMaxPathSegments) + 1);
+    u32 end = 0;
+    for (;;) {
+        if (end == path.len || path.ptr[range_int{end}.index()] == '/') {
+            if (end > start) {
+                if (!out.push(path.slice(start, end)))
+                    return limit == SegmentLimit::KeepPrefix ? out.len : kSegmentLimitExceeded;
+            }
+            if (end == path.len) break;
+            // A separator before the end leaves room to advance.
+            start = end;
+            ++start;
         }
-        start = static_cast<u32>(static_cast<i64>(i) + 1);
+        ++end;
     }
     return out.len;
 }
@@ -88,10 +88,12 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     // silently broaden a route's method filter; fail fast instead so
     // callers notice (Codex P2 on #41).
     const u32 slot = method_slot(method_char);
-    if (slot == kMethodSlotInvalid) return false;
+    static_assert(kMethodSlots <= 16);
+    u16 method_bit;
+    if (slot >= kMethodSlots || !range_int{1u << slot}.to(&method_bit)) return false;
 
     FixedVec<Str, kMaxPathSegments> segs{};
-    const u32 n = tokenize_segments(path, segs);
+    const u32 n = tokenize_segments(path, segs, SegmentLimit::Reject);
     // Sentinel: a path with more segments than we can hold is rejected
     // at insert time. Silently truncating would create a route
     // registered at the wrong depth relative to what the user wrote.
@@ -112,14 +114,14 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     FixedVec<u16, kMaxPathSegments> pushed_parents{};
 
     auto rollback = [&]() {
-        for (u32 r = pushed_parents.len; r > 0; r--) {
-            nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len = static_cast<u32>(
-                static_cast<i64>(nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len) - 1);
+        for (u32 r = pushed_parents.len; r > 0;) {
+            --r;
+            --nodes[pushed_parents[range_int{r}.index()]].children.len;
         }
         nodes.len = saved_nodes_len;
     };
 
-    FixedVec<u16, static_cast<size_t>(static_cast<i64>(kMaxPathSegments) + 1)> visited;
+    FixedVec<u16, i64{kMaxPathSegments} + 1> visited;
     [[maybe_unused]] const bool kRootRecorded = visited.push(0);
     u16 cur = 0;  // root
     for (u32 i = 0; i < n; i++) {
@@ -139,7 +141,11 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 rollback();
                 return false;
             }
-            child = static_cast<u16>(static_cast<i64>(nodes.len) - 1);
+            constexpr auto kOne = range_int<1, 2>{};
+            if (!(range_int{nodes.len} - kOne).to(&child)) {
+                rollback();
+                return false;
+            }
             if (!nodes[cur].children.push(child)) {
                 // Pre-flight above rules this out, but if a future
                 // FixedVec invariant change makes it reachable, fall
@@ -168,18 +174,26 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     // a simple pop and cannot corrupt an existing parameter prefix.
     for (u32 i = 0; i < pushed_parents.len; ++i) {
         auto& parent = nodes[pushed_parents[i]];
-        const u32 kLast = static_cast<u32>(static_cast<i64>(parent.children.len) - 1);
+        // This parent recorded a successful append before publication.
+        range_int<1, 256> child_count;
+        if (!decltype(child_count)::try_from_u64(parent.children.len, &child_count))
+            RUT_TRAP("RouteTrie recorded an empty child list after append");
+        const u32 kLast = (child_count - range_int<1, 2>{}).to<u32>();
         const u16 kChild = parent.children[kLast];
         if (is_param_segment(nodes[kChild].segment)) {
-            for (u32 j = kLast; j > parent.children.param_count; --j)
-                parent.children[j] = parent.children[static_cast<i64>(j) - 1];
+            u32 destination = kLast;
+            while (destination > parent.children.param_count) {
+                u32 source = destination;
+                --source;
+                parent.children[destination] = parent.children[source];
+                destination = source;
+            }
             parent.children[parent.children.param_count++] = kChild;
         }
         needs_backtracking_ |= parent.children.param_count != 0 && parent.children.len > 1;
     }
-    const u16 kMethodBit = static_cast<u16>(1u << slot);
-    for (u32 i = 0; i < visited.len; ++i) nodes[visited[i]].children.method_mask |= kMethodBit;
-    method_mask_ |= kMethodBit;
+    for (u32 i = 0; i < visited.len; ++i) nodes[visited[i]].children.method_mask |= method_bit;
+    method_mask_ |= method_bit;
     return true;
 }
 
@@ -187,7 +201,9 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
     // Unsupported method bytes can't match anything — bail before
     // touching the trie. Consistent with the insert-time rejection.
     const u32 want_slot = method_slot(method_char);
-    return match_key(path, static_cast<u8>(want_slot));
+    range_int<0, kMethodSlots> slot;
+    if (!decltype(slot)::try_from_i64(want_slot, &slot)) return TrieNode::kInvalidRoute;
+    return match_key(path, slot.to<u8>());
 }
 
 u16 RouteTrie::match_key(Str path, u8 method_key) const {
@@ -202,7 +218,7 @@ u16 RouteTrie::match_key(Str path,
     if (out_param_count) *out_param_count = 0;
     const u32 want_slot = method_key_slot(method_key);
     if (want_slot == kMethodSlotInvalid) return TrieNode::kInvalidRoute;
-    const u16 kEligibleMethods = static_cast<u16>(1u | (1u << want_slot));
+    const u32 kEligibleMethods = 1u | (1u << want_slot);
     if ((method_mask_ & kEligibleMethods) == 0) return TrieNode::kInvalidRoute;
 
     // Caller passes canonical input (PR #50 round 6 — RouteConfig::
@@ -248,20 +264,16 @@ u16 RouteTrie::match_key(Str path,
             if (position == path.len) break;
             const u32 kStart = position;
             while (position < path.len && path.ptr[position] != '/') ++position;
-            const Str kValue{
-                path.ptr + static_cast<i64>(kStart),
-                static_cast<u32>(static_cast<i64>(position) - static_cast<i64>(kStart))};
+            // The scan starts at kStart and only advances toward path.len.
+            const Str kValue = path.slice(kStart, position);
             const u16 kChild =
                 node.children.len == 1 ? node.children[0] : find_child(current, kValue);
             if (kChild == TrieNode::kInvalidNodeIdx) break;
             const Str kName = nodes[kChild].segment;
             if (is_param_segment(kName)) {
                 if (captured < kCap) {
-                    out_params[captured++] =
-                        RouteParam{kName.ptr + 1,
-                                   static_cast<u32>(static_cast<i64>(kName.len) - 1),
-                                   kValue.ptr,
-                                   kValue.len};
+                    const Str name = kName.slice(1, kName.len);
+                    out_params[captured++] = RouteParam{name.ptr, name.len, kValue.ptr, kValue.len};
                 }
             } else if (!kName.eq(kValue)) {
                 break;
@@ -275,13 +287,9 @@ u16 RouteTrie::match_key(Str path,
     }
 
     FixedVec<Str, kMaxPathSegments> segs;
-    // Ignore tokenize's return value on overflow: `segs` still holds
-    // the first kMaxPathSegments, and we want to walk the trie as deep
-    // as we have data for. Bailing out on overflow would let a request
-    // that's deeper than cap bypass a '/' catchall or a matching
-    // prefix route — insert() already rejects too-deep route configs,
-    // so the trie never contains a terminal we'd miss.
-    (void)tokenize_segments(path, segs);
+    // On overflow the retained prefix still participates in catchall and
+    // longest-prefix matching. Insert rejects routes beyond this depth.
+    const u32 segment_count = tokenize_segments(path, segs, SegmentLimit::KeepPrefix);
     // Keep only the active DFS path, not a node-pool-sized collection of
     // copied capture arrays. Each pushed frame is initialized before reading.
     struct Frame {
@@ -291,7 +299,7 @@ u16 RouteTrie::match_key(Str path,
         u32 static_segments;
         u64 static_mask;
     };
-    FixedVec<Frame, static_cast<size_t>(static_cast<i64>(kMaxPathSegments) + 1)> stack;
+    FixedVec<Frame, i64{kMaxPathSegments} + 1> stack;
     [[maybe_unused]] const bool kPushed = stack.push(Frame{});
 
     struct Candidate {
@@ -321,14 +329,14 @@ u16 RouteTrie::match_key(Str path,
             // Record only node IDs for the winning path. Capture views are
             // materialized once, after the search, and only when requested.
             if (out_params && out_param_count && out_param_cap != 0 && depth != static_segments) {
-                for (u32 i = 1; i < stack.len; ++i)
-                    best_path[static_cast<i64>(i) - 1] = stack[i].node;
+                u32 destination = 0;
+                for (u32 i = 1; i < stack.len; ++i) best_path[destination++] = stack[i].node;
             }
         }
     };
 
     while (stack.len > 0) {
-        Frame& frame = stack[static_cast<i64>(stack.len) - 1];
+        Frame& frame = *(stack.data + range_int{stack.len}.index() - 1);
         const auto& node = nodes[frame.node];
         if (frame.next_child == 0) {
             consider(pick_terminal(node, want_slot),
@@ -337,11 +345,11 @@ u16 RouteTrie::match_key(Str path,
                      frame.static_mask);
             // A complete all-literal match has maximal depth and specificity.
             // No parameter sibling can improve it; captures are necessarily empty.
-            if (best.route_idx != TrieNode::kInvalidRoute && best.depth == segs.len &&
+            if (best.route_idx != TrieNode::kInvalidRoute && best.depth == segment_count &&
                 best.static_segments == best.depth)
                 return best.route_idx;
-            if (frame.depth >= segs.len) {
-                stack.len = static_cast<u32>(static_cast<i64>(stack.len) - 1);
+            if (frame.depth >= segment_count) {
+                --stack.len;
                 continue;
             }
             // Visit the literal first, then parameter children in insertion
@@ -350,32 +358,31 @@ u16 RouteTrie::match_key(Str path,
             const u16 kLiteral =
                 find_child(frame.node, segs[frame.depth], node.children.param_count);
             if (kLiteral != TrieNode::kInvalidNodeIdx) {
-                const u32 kDepth = static_cast<u32>(static_cast<i64>(frame.depth) + 1);
-                const u64 kMask =
-                    frame.static_mask | (kDepth < 64 ? 1ull << (63 - static_cast<i64>(kDepth)) : 0);
+                u32 depth;
+                u32 static_segments;
+                if (!(range_int{frame.depth} + range_int<1, 2>{}).to(&depth) ||
+                    !(range_int{frame.static_segments} + range_int<1, 2>{}).to(&static_segments))
+                    return TrieNode::kInvalidRoute;
+                const u64 kMask = frame.static_mask |
+                                  (depth < 64 ? 1ull << (63 - range_int{depth}.to<i64>()) : 0);
                 [[maybe_unused]] const bool kOk =
-                    stack.push(Frame{kLiteral,
-                                     kDepth,
-                                     0,
-                                     static_cast<u32>(static_cast<i64>(frame.static_segments) + 1),
-                                     kMask});
+                    stack.push(Frame{kLiteral, depth, 0, static_segments, kMask});
                 continue;
             }
         }
         bool descended = false;
         while (frame.next_child <= node.children.param_count) {
-            const u16 kChild = node.children[static_cast<i64>(frame.next_child++) - 1];
+            const u16 kChild = node.children[range_int{frame.next_child++}.to<i64>() - 1];
             if ((nodes[kChild].children.method_mask & kEligibleMethods) == 0) continue;
+            u32 depth;
+            if (!(range_int{frame.depth} + range_int<1, 2>{}).to(&depth))
+                return TrieNode::kInvalidRoute;
             [[maybe_unused]] const bool kOk =
-                stack.push(Frame{kChild,
-                                 static_cast<u32>(static_cast<i64>(frame.depth) + 1),
-                                 0,
-                                 frame.static_segments,
-                                 frame.static_mask});
+                stack.push(Frame{kChild, depth, 0, frame.static_segments, frame.static_mask});
             descended = true;
             break;
         }
-        if (!descended) stack.len = static_cast<u32>(static_cast<i64>(stack.len) - 1);
+        if (!descended) --stack.len;
     }
     if (out_params && out_param_count && best.route_idx != TrieNode::kInvalidRoute &&
         best.static_segments != best.depth) {
@@ -384,11 +391,9 @@ u16 RouteTrie::match_key(Str path,
             const Str kName = nodes[best_path[i]].segment;
             if (!is_param_segment(kName)) continue;
             const Str kValue = segs[i];
+            const Str name = kName.slice(1, kName.len);
             out_params[(*out_param_count)++] =
-                RouteParam{kName.ptr + 1,
-                           static_cast<u32>(static_cast<i64>(kName.len) - 1),
-                           kValue.ptr,
-                           kValue.len};
+                RouteParam{name.ptr, name.len, kValue.ptr, kValue.len};
         }
     }
     return best.route_idx;

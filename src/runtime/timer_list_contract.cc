@@ -1,3 +1,4 @@
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -7,11 +8,13 @@ enum class Action : u8 { ArmFirst, ArmSecond, Detach, Rotate };
 
 // A slot with three nodes can lose its first, middle, last or only member.
 // Node labels are interchangeable, so contiguous ranges represent all orders.
-consteval bool timer_list_transition(u32 first_size, u32 second_size, u32 selected, Action action) {
+[[nodiscard]] consteval bool timer_list_transition(u16 first_size,
+                                                   u16 second_size,
+                                                   u32 selected,
+                                                   Action action) {
     ListNode slots[2]{};
     ListNode nodes[3]{};
-    const u32 kLinked =
-        static_cast<u32>(static_cast<i64>(first_size) + static_cast<i64>(second_size));
+    const u32 kLinked = (range_int(first_size) + range_int(second_size)).to<u32>();
     for (auto& head : slots) head.init();
     for (u32 i = 0; i < 3; ++i) {
         nodes[i].init();
@@ -56,11 +59,11 @@ consteval bool timer_list_transition(u32 first_size, u32 second_size, u32 select
     return true;
 }
 
-consteval bool timer_list_contract() {
+[[nodiscard]] consteval bool timer_list_contract() {
     constexpr Action kActions[] = {
         Action::ArmFirst, Action::ArmSecond, Action::Detach, Action::Rotate};
-    for (u32 first = 0; first <= 3; ++first)
-        for (u32 second = 0; static_cast<i64>(first) + static_cast<i64>(second) <= 3; ++second)
+    for (u16 first = 0; first <= 3; ++first)
+        for (u16 second = 0; (range_int(first) + range_int(second)).value() <= 3; ++second)
             for (u32 selected = 0; selected < 3; ++selected)
                 for (const Action kAction : kActions)
                     if (!timer_list_transition(first, second, selected, kAction)) return false;

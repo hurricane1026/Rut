@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_parser.h"
 
 namespace rut {
@@ -10,7 +11,7 @@ inline constexpr u32 kMaxForwardBodyOverride = 65536;
 
 namespace request_body_override_detail {
 inline bool content_length_line(const u8* data, u32 header_end, u32* line_start, u32* line_end) {
-    const i64 kHeaderEnd = static_cast<i64>(header_end);
+    const i64 kHeaderEnd = i64{header_end};
     i64 position = 0;
     while (position + 1 < kHeaderEnd && !(data[position] == '\r' && data[position + 1] == '\n'))
         ++position;
@@ -62,11 +63,13 @@ inline bool replace_h1_body_in_place(
         request.transfer_encoding != RequestTransferEncoding::None || !request.has_content_length ||
         request.content_length_count != 1)
         return false;
-    const u32 old_body_len = request.content_length;
-    if ((expected_body_len != 0xffffffffu && expected_body_len != old_body_len) ||
-        static_cast<i64>(old_body_len) >
-            static_cast<i64>(old_total) - static_cast<i64>(old_header_end))
-        return false;
+    const i64 available_body = i64{old_total} - i64{old_header_end};
+    if (request.content_length < 0 || request.content_length > available_body) return false;
+    const u32 old_body_len = range_int(request.content_length)
+                                 .max(range_int(u32{0}))
+                                 .min(range_int(UINT32_MAX))
+                                 .to<u32>();
+    if (expected_body_len != 0xffffffffu && expected_body_len != old_body_len) return false;
     u32 line_start = 0;
     u32 line_end = 0;
     if (!request_body_override_detail::content_length_line(
@@ -77,49 +80,42 @@ inline bool replace_h1_body_in_place(
     u32 digit_count = 0;
     u32 value = body.len;
     do {
-        digits[digit_count++] =
-            static_cast<char>(static_cast<i64>('0') + static_cast<i64>(value % 10));
+        digits[digit_count++] = last_decimal_digit(value);
         value /= 10;
     } while (value);
     const u32 new_line_len = static_cast<u32>(16 + static_cast<i64>(digit_count) + 2);
-    const i64 header_delta =
-        static_cast<i64>(new_line_len) -
-        static_cast<i64>(static_cast<i64>(line_end) + 2 - static_cast<i64>(line_start));
-    const i64 tail_len = static_cast<i64>(old_total) - static_cast<i64>(old_header_end) -
-                         static_cast<i64>(old_body_len);
-    const i64 new_total =
-        static_cast<i64>(old_header_end) + header_delta + static_cast<i64>(body.len) + tail_len;
+    const i64 header_delta = i64{new_line_len} - i64{i64{line_end} + 2 - i64{line_start}};
+    const i64 tail_len = i64{old_total} - i64{old_header_end} - i64{old_body_len};
+    const i64 new_total = i64{old_header_end} + header_delta + i64{body.len} + tail_len;
     // Growing the Content-Length line shifts the body and tail up by header_delta
     // before the body is shortened. That intermediate extent can therefore exceed
     // the final total, so bound the larger of the two writes.
-    const i64 intermediate_total =
-        static_cast<i64>(old_total) + (header_delta > 0 ? header_delta : 0);
-    if (tail_len < 0 || new_total < 0 || new_total > static_cast<i64>(capacity) ||
-        intermediate_total > static_cast<i64>(capacity))
+    const i64 intermediate_total = i64{old_total} + (header_delta > 0 ? header_delta : 0);
+    if (tail_len < 0 || new_total < 0 || new_total > i64{capacity} ||
+        intermediate_total > i64{capacity})
         return false;
 
     const u32 after_line = static_cast<u32>(static_cast<i64>(line_end) + 2);
     if (header_delta != 0) {
         __builtin_memmove(
-            data + static_cast<i64>(line_start) + static_cast<i64>(new_line_len),
-            data + static_cast<i64>(after_line),
+            data + i64{line_start} + i64{new_line_len},
+            data + i64{after_line},
             static_cast<u32>(static_cast<i64>(old_total) - static_cast<i64>(after_line)));
     }
-    __builtin_memcpy(data + static_cast<i64>(line_start), "Content-Length: ", 16);
+    __builtin_memcpy(data + i64{line_start}, "Content-Length: ", 16);
     for (u32 i = 0; i < digit_count; ++i)
-        data[static_cast<i64>(line_start) + 16 + static_cast<i64>(i)] =
+        data[i64{line_start} + 16 + i64{i}] =
             static_cast<u8>(digits[static_cast<i64>(digit_count) - 1 - static_cast<i64>(i)]);
-    data[static_cast<i64>(line_start) + 16 + static_cast<i64>(digit_count)] = '\r';
-    data[static_cast<i64>(line_start) + 17 + static_cast<i64>(digit_count)] = '\n';
+    data[i64{line_start} + 16 + i64{digit_count}] = '\r';
+    data[i64{line_start} + 17 + i64{digit_count}] = '\n';
     const u32 new_header_end = static_cast<u32>(static_cast<i64>(old_header_end) + header_delta);
     const u32 tail_destination =
         static_cast<u32>(static_cast<i64>(new_header_end) + static_cast<i64>(body.len));
     if (tail_len != 0)
-        __builtin_memmove(data + static_cast<i64>(tail_destination),
-                          data + static_cast<i64>(new_header_end) + static_cast<i64>(old_body_len),
+        __builtin_memmove(data + i64{tail_destination},
+                          data + i64{new_header_end} + i64{old_body_len},
                           static_cast<u32>(tail_len));
-    if (body.len != 0)
-        __builtin_memcpy(data + static_cast<i64>(new_header_end), body.ptr, body.len);
+    if (body.len != 0) __builtin_memcpy(data + i64{new_header_end}, body.ptr, body.len);
     *total = static_cast<u32>(new_total);
     *header_end = new_header_end;
     return true;

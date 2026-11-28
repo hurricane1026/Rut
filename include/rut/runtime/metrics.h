@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/rate_limit.h"
 
@@ -33,7 +34,7 @@ struct LatencyHistogram {
     void record(u64 duration_us) {
         u32 bucket = find_bucket(duration_us);
         buckets[bucket]++;
-        (void)__builtin_add_overflow(sum_us, duration_us, &sum_us);
+        sum_us = wrapping_add(sum_us, duration_us);
         count++;
     }
 
@@ -149,13 +150,13 @@ struct ShardMetrics {
     void on_rate_limit(const RateLimitDecision& decision) {
         rate_limit_attempts_total++;
         for (u32 scope = 0; scope < kRateLimitScopeCount; scope++) {
-            (void)__builtin_add_overflow(rate_limit_rules_evaluated_by_scope[scope],
-                                         decision.rules_evaluated_by_scope[scope],
-                                         &rate_limit_rules_evaluated_by_scope[scope]);
+            rate_limit_rules_evaluated_by_scope[scope] =
+                wrapping_add(rate_limit_rules_evaluated_by_scope[scope],
+                             u64{decision.rules_evaluated_by_scope[scope]});
             for (u32 i = 0; i < kRateLimitRuleReasonCount; i++)
-                (void)__builtin_add_overflow(rate_limit_rules_rejected_by_scope_reason[scope][i],
-                                             decision.rules_rejected_by_scope_reason[scope][i],
-                                             &rate_limit_rules_rejected_by_scope_reason[scope][i]);
+                rate_limit_rules_rejected_by_scope_reason[scope][i] =
+                    wrapping_add(rate_limit_rules_rejected_by_scope_reason[scope][i],
+                                 u64{decision.rules_rejected_by_scope_reason[scope][i]});
         }
         if (decision.allowed) return;
         rate_limit_rejected_total++;
@@ -199,65 +200,51 @@ inline ShardMetrics aggregate_metrics(ShardMetrics* const* shards, u32 count) {
 
     for (u32 i = 0; i < count; i++) {
         const auto& s = *shards[i];
-        (void)__builtin_add_overflow(agg.requests_total, s.requests_total, &agg.requests_total);
-        (void)__builtin_add_overflow(agg.requests_active, s.requests_active, &agg.requests_active);
-        (void)__builtin_add_overflow(agg.rate_limit_attempts_total,
-                                     s.rate_limit_attempts_total,
-                                     &agg.rate_limit_attempts_total);
-        (void)__builtin_add_overflow(agg.rate_limit_rejected_total,
-                                     s.rate_limit_rejected_total,
-                                     &agg.rate_limit_rejected_total);
+        agg.requests_total = wrapping_add(agg.requests_total, s.requests_total);
+        agg.requests_active = wrapping_add(agg.requests_active, s.requests_active);
+        agg.rate_limit_attempts_total =
+            wrapping_add(agg.rate_limit_attempts_total, s.rate_limit_attempts_total);
+        agg.rate_limit_rejected_total =
+            wrapping_add(agg.rate_limit_rejected_total, s.rate_limit_rejected_total);
         for (u32 reason = 0; reason < ShardMetrics::kRateLimitReasonCount; reason++)
-            (void)__builtin_add_overflow(agg.rate_limit_rejected_by_reason[reason],
-                                         s.rate_limit_rejected_by_reason[reason],
-                                         &agg.rate_limit_rejected_by_reason[reason]);
+            agg.rate_limit_rejected_by_reason[reason] = wrapping_add(
+                agg.rate_limit_rejected_by_reason[reason], s.rate_limit_rejected_by_reason[reason]);
         for (u32 scope = 0; scope < ShardMetrics::kRateLimitScopeCount; scope++) {
-            (void)__builtin_add_overflow(agg.rate_limit_rules_evaluated_by_scope[scope],
-                                         s.rate_limit_rules_evaluated_by_scope[scope],
-                                         &agg.rate_limit_rules_evaluated_by_scope[scope]);
+            agg.rate_limit_rules_evaluated_by_scope[scope] =
+                wrapping_add(agg.rate_limit_rules_evaluated_by_scope[scope],
+                             s.rate_limit_rules_evaluated_by_scope[scope]);
             for (u32 reason = 0; reason < ShardMetrics::kRateLimitRuleReasonCount; reason++)
-                (void)__builtin_add_overflow(
-                    agg.rate_limit_rules_rejected_by_scope_reason[scope][reason],
-                    s.rate_limit_rules_rejected_by_scope_reason[scope][reason],
-                    &agg.rate_limit_rules_rejected_by_scope_reason[scope][reason]);
+                agg.rate_limit_rules_rejected_by_scope_reason[scope][reason] =
+                    wrapping_add(agg.rate_limit_rules_rejected_by_scope_reason[scope][reason],
+                                 s.rate_limit_rules_rejected_by_scope_reason[scope][reason]);
         }
-        (void)__builtin_add_overflow(agg.grpc_started, s.grpc_started, &agg.grpc_started);
-        (void)__builtin_add_overflow(agg.grpc_active, s.grpc_active, &agg.grpc_active);
+        agg.grpc_started = wrapping_add(agg.grpc_started, s.grpc_started);
+        agg.grpc_active = wrapping_add(agg.grpc_active, s.grpc_active);
         for (u32 code = 0; code < 17; code++)
-            (void)__builtin_add_overflow(
-                agg.grpc_completed[code], s.grpc_completed[code], &agg.grpc_completed[code]);
+            agg.grpc_completed[code] =
+                wrapping_add(agg.grpc_completed[code], s.grpc_completed[code]);
         for (u32 b = 0; b < LatencyHistogram::kBucketCount; b++)
-            (void)__builtin_add_overflow(agg.grpc_latency.buckets[b],
-                                         s.grpc_latency.buckets[b],
-                                         &agg.grpc_latency.buckets[b]);
-        (void)__builtin_add_overflow(
-            agg.grpc_latency.sum_us, s.grpc_latency.sum_us, &agg.grpc_latency.sum_us);
-        (void)__builtin_add_overflow(
-            agg.grpc_latency.count, s.grpc_latency.count, &agg.grpc_latency.count);
-        (void)__builtin_add_overflow(
-            agg.connections_total, s.connections_total, &agg.connections_total);
-        (void)__builtin_add_overflow(
-            agg.connections_active, s.connections_active, &agg.connections_active);
-        (void)__builtin_add_overflow(
-            agg.connections_closed, s.connections_closed, &agg.connections_closed);
-        (void)__builtin_add_overflow(
-            agg.memory_arena_used, s.memory_arena_used, &agg.memory_arena_used);
-        (void)__builtin_add_overflow(
-            agg.memory_slices_used, s.memory_slices_used, &agg.memory_slices_used);
-        (void)__builtin_add_overflow(
-            agg.memory_slices_free, s.memory_slices_free, &agg.memory_slices_free);
-        (void)__builtin_add_overflow(
-            agg.memory_connections_used, s.memory_connections_used, &agg.memory_connections_used);
+            agg.grpc_latency.buckets[b] =
+                wrapping_add(agg.grpc_latency.buckets[b], s.grpc_latency.buckets[b]);
+        agg.grpc_latency.sum_us = wrapping_add(agg.grpc_latency.sum_us, s.grpc_latency.sum_us);
+        agg.grpc_latency.count = wrapping_add(agg.grpc_latency.count, s.grpc_latency.count);
+        agg.connections_total = wrapping_add(agg.connections_total, s.connections_total);
+        agg.connections_active = wrapping_add(agg.connections_active, s.connections_active);
+        agg.connections_closed = wrapping_add(agg.connections_closed, s.connections_closed);
+        agg.memory_arena_used = wrapping_add(agg.memory_arena_used, s.memory_arena_used);
+        agg.memory_slices_used = wrapping_add(agg.memory_slices_used, s.memory_slices_used);
+        agg.memory_slices_free = wrapping_add(agg.memory_slices_free, s.memory_slices_free);
+        agg.memory_connections_used =
+            wrapping_add(agg.memory_connections_used, s.memory_connections_used);
 
         for (u32 b = 0; b < LatencyHistogram::kBucketCount; b++) {
-            (void)__builtin_add_overflow(agg.request_latency.buckets[b],
-                                         s.request_latency.buckets[b],
-                                         &agg.request_latency.buckets[b]);
+            agg.request_latency.buckets[b] =
+                wrapping_add(agg.request_latency.buckets[b], s.request_latency.buckets[b]);
         }
-        (void)__builtin_add_overflow(
-            agg.request_latency.sum_us, s.request_latency.sum_us, &agg.request_latency.sum_us);
-        (void)__builtin_add_overflow(
-            agg.request_latency.count, s.request_latency.count, &agg.request_latency.count);
+        agg.request_latency.sum_us =
+            wrapping_add(agg.request_latency.sum_us, s.request_latency.sum_us);
+        agg.request_latency.count =
+            wrapping_add(agg.request_latency.count, s.request_latency.count);
     }
     return agg;
 }

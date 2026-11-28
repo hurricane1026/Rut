@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/http_query.h"
+#include "rut/common/range_int.h"
 #include "rut/common/ws_message.h"
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
@@ -1633,9 +1634,14 @@ struct Builder {
                                u16 body_idx = 0,
                                u16 headers_idx = 0) {
         auto r = TRY(emit(Opcode::RetStatus, nullptr, loc));
-        const u64 packed = (static_cast<u64>(code) & 0xffffu) | (static_cast<u64>(body_idx) << 16) |
-                           (static_cast<u64>(headers_idx) << 32);
-        r.inst->imm.i64_val = static_cast<i64>(packed);
+        using StatusImmediate = range_int<0, u64{1} << 48>;
+        constexpr i64 kBodyIndexScale = u64{1} << 16;
+        constexpr i64 kHeaderIndexScale = u64{1} << 32;
+        const auto status = range_int(static_cast<u16>(code));
+        const auto body = range_int(body_idx).scaled_by<kBodyIndexScale>();
+        const auto headers = range_int(headers_idx).scaled_by<kHeaderIndexScale>();
+        const StatusImmediate packed = status + body + headers;
+        r.inst->imm.i64_val = packed.value();
         return {};
     }
 
@@ -1803,7 +1809,7 @@ struct Builder {
         if (policy_id == 0) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetRedirect, nullptr, loc));
         r.inst->operand_count = 0;
-        r.inst->imm.i32_val = static_cast<i32>(policy_id);
+        r.inst->imm.i32_val = i32{policy_id};
         return {};
     }
 

@@ -1,6 +1,9 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
+#include "rut/runtime/format_integer.h"
+#include "rut/runtime/parse_integer.h"
 
 namespace rut::json {
 
@@ -151,7 +154,7 @@ struct Writer {
         data[len++] = c;
     }
     void text(Str s) {
-        if (static_cast<i64>(s.len) > static_cast<i64>(cap) - static_cast<i64>(len)) {
+        if (i64{s.len} > i64{cap} - i64{len}) {
             ok = false;
             return;
         }
@@ -270,8 +273,7 @@ inline bool decode(Str s, u32& p, Writer& out) {
                 case 'u': {
                     if (!hex4(s, p, cp)) return false;
                     if (cp >= 0xd800 && cp <= 0xdbff) {
-                        if (static_cast<i64>(s.len) - static_cast<i64>(p) < 2 || s.ptr[p] != '\\' ||
-                            s.ptr[static_cast<i64>(p) + 1] != 'u')
+                        if (i64{s.len} - i64{p} < 2 || s.ptr[p] != '\\' || s.ptr[i64{p} + 1] != 'u')
                             return false;
                         p = static_cast<u32>(static_cast<i64>(p) + 2);
                         u32 lo;
@@ -419,7 +421,7 @@ struct Document {
             const Str token = c == 'n'   ? lit_str("null")
                               : c == 't' ? lit_str("true")
                                          : lit_str("false");
-            if (static_cast<i64>(source.len) - static_cast<i64>(p) < token.len ||
+            if (i64{source.len} - i64{p} < token.len ||
                 !source
                      .slice(p, static_cast<u32>(static_cast<i64>(p) + static_cast<i64>(token.len)))
                      .eq(token))
@@ -473,19 +475,17 @@ struct Document {
         }
         return n;
     }
-    static bool index(Str s, u32& n) {
+    [[nodiscard]] static bool index(Str s, u32* out) {
         if (s.len == 0 || (s.len > 1 && s.ptr[0] == '0')) return false;
-        n = 0;
+        u32 result = 0;
         for (u32 i = 0; i < s.len; ++i) {
-            if (s.ptr[i] < '0' || s.ptr[i] > '9' || n > 429496729u) return false;
-            const u32 digit = static_cast<u32>(s.ptr[i] - '0');
-            if (n == 429496729u && digit > 5) return false;
-            u64 next = 0;
-            if (__builtin_mul_overflow(n, u64{10}, &next) ||
-                __builtin_add_overflow(next, static_cast<u64>(digit), &next))
-                return false;
-            n = next;
+            const u8 byte = byte_value(s.ptr[i]);
+            if (byte < '0' || byte > '9') return false;
+            static_assert('0' == 0x30 && '9' == 0x39);
+            const auto digit = bounded_remainder<16>(byte);
+            if (!(range_int(result).scaled_by<10>() + digit).to(&result)) return false;
         }
+        *out = result;
         return true;
     }
     // RFC 6901 string form, not URI-fragment form. Empty pointer selects root.
@@ -513,7 +513,7 @@ struct Document {
             const Str key{other, token.len};
             if (nodes[id].kind == Kind::Array) {
                 u32 n;
-                if (!index(key, n)) return kNone;
+                if (!index(key, &n)) return kNone;
                 id = at(id, n);
             } else if (nodes[id].kind == Kind::Object) {
                 u32 found = kNone;
@@ -576,49 +576,7 @@ struct Document {
 };
 
 inline bool integer(Str s, i64& out) {
-    u32 p = 0;
-    const bool negative = s.len && s.ptr[0] == '-';
-    if (negative) ++p;
-    if (p == s.len) return false;
-    u64 n = 0;
-    const u64 limit = negative ? (u64(1) << 63) : ((u64(1) << 63) - 1);
-    for (; p < s.len; ++p) {
-        if (s.ptr[p] < '0' || s.ptr[p] > '9') return false;
-        const u32 d = static_cast<u32>(s.ptr[p] - '0');
-        if (n > limit / 10 || (n == limit / 10 && static_cast<u64>(d) > limit % 10)) return false;
-        // The range check above makes the ordinary path fit in i64. Handle
-        // exactly INT64_MIN's magnitude separately, since it has no positive
-        // signed counterpart for the widened multiplication.
-        if (negative && n == limit / 10 && static_cast<u64>(d) == limit % 10)
-            n = limit;
-        else
-            n = static_cast<u64>(static_cast<i64>(n) * 10 + static_cast<i64>(d));
-    }
-    if (!negative) {
-        out = static_cast<i64>(n);
-    } else if (n == (u64{1} << 63)) {
-        out = -9223372036854775807LL - 1;
-    } else {
-        out = -static_cast<i64>(n);
-    }
-    return true;
-}
-inline void write_integer(i64 value, Writer& w) {
-    u64 n = 0;
-    if (value == (-9223372036854775807LL - 1))
-        n = u64{1} << 63;
-    else if (value < 0)
-        n = static_cast<u64>(-value);
-    else
-        n = static_cast<u64>(value);
-    char digits[20];
-    u32 count = 0;
-    do {
-        digits[count++] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(n % 10));
-        n /= 10;
-    } while (n);
-    if (value < 0) w.put('-');
-    while (count) w.put(digits[--count]);
+    return s.ptr && s.len && s.ptr[0] != '+' && parse_integer<true>(s, &out);
 }
 
 // All updates are immutable. Set/remove require an existing RFC 6901 target;
@@ -628,7 +586,8 @@ inline bool apply(
     view = {};
     if (op == Op::Quote) return quote(a, w);
     if (op == Op::Integer) {
-        write_integer(number, w);
+        char buffer[kFormatIntegerBufferSize];
+        w.text(format_integer(number, buffer));
         return w.ok;
     }
     if (op == Op::Boolean) {

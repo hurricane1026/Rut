@@ -117,8 +117,7 @@ struct ProbeRig {
 
     bool respond(Socket& peer, const char* response) {
         const u32 kLength = static_cast<u32>(strlen(response));
-        if (send(peer.fd, response, kLength, MSG_NOSIGNAL) != static_cast<ssize_t>(kLength))
-            return false;
+        if (send(peer.fd, response, kLength, MSG_NOSIGNAL) != ssize_t{kLength}) return false;
         return until([&] { return !probe_in_flight(0, 0); });
     }
 
@@ -277,9 +276,9 @@ void connect_timeout_wheel_ownership(rut::test::TestCase* _tc) {
     arm_connect_timeout(rig.loop, *c, target);
     CHECK_EQ(c->connect_timeout_episode, episode);
     u32 expired = 0;
-    for (u32 i = 0; i < 2; ++i) rig.loop->timer.tick([&](Connection*) { ++expired; });
+    for (u32 i = 0; i < 2; ++i) rig.loop->timer.advance([&](Connection*) { ++expired; });
     CHECK_EQ(expired, 0u);
-    rig.loop->timer.tick([&](Connection* value) {
+    rig.loop->timer.advance([&](Connection* value) {
         CHECK(value == c);
         ++expired;
     });

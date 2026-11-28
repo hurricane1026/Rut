@@ -1,6 +1,7 @@
 #include "rut/runtime/password_worker.h"
 
 #include "core/expected.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/password.h"
@@ -58,12 +59,13 @@ void PasswordWorker::stop() {
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
     // A join failure violates exclusive lifecycle ownership. Never release
     // storage while a worker might still be using it.
-    if (pthread_join(worker_thread, nullptr) != 0) __builtin_trap();
+    if (const int error = pthread_join(worker_thread, nullptr); error != 0)
+        RUT_TRAP("PasswordWorker::stop: pthread_join failed (error=%d)", error);
     started = false;
     close_notifications();
     for (auto& slot : slots) {
         wipe(slot);
-        __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+        __atomic_store_n(&slot.state, u32{Empty}, __ATOMIC_RELEASE);
     }
 }
 
@@ -83,7 +85,10 @@ void PasswordWorker::notify_completion() {
         // A full pipe already carries a readable wakeup. Other errors violate
         // ownership: the producer must never close/change this borrowed fd.
         if (kWritten < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-        __builtin_trap();
+        RUT_TRAP("PasswordWorker notification write failed (fd=%d, result=%zd, errno=%d)",
+                 notification_write,
+                 kWritten,
+                 kWritten < 0 ? errno : 0);
     }
 }
 
@@ -110,7 +115,7 @@ PasswordTask PasswordWorker::submit(Str password, Str record) {
         for (u32 j = 0; j < record.len; ++j) slot.record[j] = record.ptr[j];
         slot.password_len = password.len;
         slot.generation = next_generation++;
-        __atomic_store_n(&slot.state, static_cast<u32>(Queued), __ATOMIC_RELEASE);
+        __atomic_store_n(&slot.state, u32{Queued}, __ATOMIC_RELEASE);
         return {this, slot.generation, i};
     }
     return {};
@@ -135,7 +140,7 @@ PasswordTaskStatus PasswordWorker::poll(PasswordTask task) {
             const auto kStatus =
                 slot->matched ? PasswordTaskStatus::Matched : PasswordTaskStatus::Rejected;
             slot->matched = false;
-            __atomic_store_n(&slot->state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+            __atomic_store_n(&slot->state, u32{Empty}, __ATOMIC_RELEASE);
             return kStatus;
         }
         default:
@@ -156,7 +161,7 @@ bool PasswordWorker::cancel(PasswordTask task) {
         else if (state == Done) {
             // Done is stable until the single producer consumes it.
             slot->matched = false;
-            __atomic_store_n(&slot->state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+            __atomic_store_n(&slot->state, u32{Empty}, __ATOMIC_RELEASE);
             return true;
         } else
             return false;
@@ -180,32 +185,24 @@ void PasswordWorker::run() {
             u32 state = __atomic_load_n(&slot.state, __ATOMIC_ACQUIRE);
             if (state == CancelQueued) {
                 wipe(slot);
-                __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+                __atomic_store_n(&slot.state, u32{Empty}, __ATOMIC_RELEASE);
                 notify_completion();
                 worked = true;
                 continue;
             }
             state = Queued;
-            if (!__atomic_compare_exchange_n(&slot.state,
-                                             &state,
-                                             static_cast<u32>(Running),
-                                             false,
-                                             __ATOMIC_ACQ_REL,
-                                             __ATOMIC_ACQUIRE))
+            if (!__atomic_compare_exchange_n(
+                    &slot.state, &state, u32{Running}, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
                 continue;
             const bool kMatched = password_verify({slot.password, slot.password_len},
                                                   {slot.record, kPasswordRecordBytes});
             wipe(slot);
             slot.matched = kMatched;
             state = Running;
-            if (!__atomic_compare_exchange_n(&slot.state,
-                                             &state,
-                                             static_cast<u32>(Done),
-                                             false,
-                                             __ATOMIC_RELEASE,
-                                             __ATOMIC_RELAXED)) {
+            if (!__atomic_compare_exchange_n(
+                    &slot.state, &state, u32{Done}, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
                 slot.matched = false;
-                __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+                __atomic_store_n(&slot.state, u32{Empty}, __ATOMIC_RELEASE);
             }
             notify_completion();
             worked = true;

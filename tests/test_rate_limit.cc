@@ -260,6 +260,9 @@ TEST(rate_limit_arithmetic, rejects_unrepresentable_tau_atomically) {
 }
 
 TEST(rate_limit_arithmetic, disabled_interval_is_safe) {
+    static_assert(rate_limit_emit_interval_us(1, UINT32_MAX) == 4294967295000000ull);
+    static_assert(rate_limit_emit_interval_us(UINT32_MAX, UINT32_MAX) == 1000000ull);
+    static_assert(rate_limit_emit_interval_us(UINT32_MAX, 1) == 1);
     CHECK_EQ(rate_limit_emit_interval_us(0, 60), 0ull);
     CHECK_EQ(rate_limit_emit_interval_us(10, 0), 0ull);
     RateLimitRuleSet disabled{};
@@ -350,6 +353,30 @@ TEST(rate_limit_decision, finite_collision_wait_and_overflow_unknown) {
     CHECK(!result.allowed);
     CHECK(!result.retry_known);
     CHECK_EQ(result.reject_reason, RateLimitRejectReason::StateOverflow);
+}
+
+TEST(rate_limit_decision, overflow_does_not_publish_a_new_arrival_time) {
+    RateLimiter shard{};
+    GlobalRateLimiter global{};
+    global.reset();
+    auto check = [&](auto& limiter) {
+        constexpr u64 kNow = UINT64_MAX - 6;
+        REQUIRE(limiter.allow_key(1, 1, 0, kNow - 1));
+        const auto rejected = limiter.allow_key_detailed(1, 7, 0, kNow);
+        CHECK(!rejected.allowed);
+        CHECK(!rejected.retry_known);
+        CHECK_EQ(rejected.reject_reason, RateLimitRejectReason::StateOverflow);
+        CHECK_EQ(rejected.next_wait_us, 0u);
+        const auto before_arrival = limiter.allow_key_detailed(1, 1, 0, kNow - 1);
+        CHECK(!before_arrival.allowed);
+        CHECK_EQ(before_arrival.reject_reason, RateLimitRejectReason::Budget);
+        CHECK_EQ(before_arrival.next_wait_us, 1u);
+        const auto accepted = limiter.allow_key_detailed(1, 6, 0, kNow);
+        CHECK(accepted.allowed);
+        CHECK_EQ(accepted.next_wait_us, 6u);
+    };
+    check(shard);
+    check(global);
 }
 
 TEST(rate_limit_decision, stacked_post_charge_wait_dominates_global_rejection) {

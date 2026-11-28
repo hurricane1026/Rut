@@ -848,7 +848,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::CtxLoadSlotI32:
             buf.put(' ');
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             break;
         case Opcode::ReqRemoteAddr:
         case Opcode::ReqContentLength:
@@ -887,11 +887,11 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqSetTargetTransform:
             buf.put(' ');
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             break;
         case Opcode::CtxStoreSlotI32:
             buf.put(' ');
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
             break;
@@ -1062,7 +1062,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
                 print_value_ref(buf, inst.operands[1]);
             }
             buf.put_cstr(", inst=");
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             break;
         case Opcode::HashHmacSha256:
             buf.put(' ');
@@ -1092,7 +1092,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
                 // Literal form packs (status | body_idx<<16 |
                 // headers_idx<<32) into i64_val; decode all three so
                 // human-facing output stays truthful.
-                u64 packed = static_cast<u64>(inst.imm.i64_val);
+                i64 packed = inst.imm.i64_val;
                 buf.put_i32(static_cast<i32>(packed & 0xffffu));
                 u32 body_idx = static_cast<u32>((packed >> 16) & 0xffffu);
                 if (body_idx != 0) {
@@ -1144,7 +1144,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             if (inst.operand_count > 0) print_value_ref(buf, inst.operands[0]);
             break;
         case Opcode::YieldTimer: {
-            const u64 packed = static_cast<u64>(inst.imm.i64_val);
+            const i64 packed = inst.imm.i64_val;
             buf.put(' ');
             buf.put_u32(static_cast<u32>(packed & 0xffffffffu));
             buf.put_cstr(", state ");

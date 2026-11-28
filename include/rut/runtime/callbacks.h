@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/io_event.h"
@@ -76,7 +77,7 @@ template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
-void on_request_complete(Loop* lp, Connection& conn, u16 status, u32 resp_size);
+void on_request_complete(Loop* lp, Connection& conn, u16 status, i64 resp_size);
 template <typename Loop>
 bool client_send(Loop*, Connection&, const u8*, u32);
 
@@ -217,14 +218,15 @@ inline bool tls_partial_initial_connect_request_owner(const Connection& conn) {
         return false;
     if (conn.req_body_mode == BodyMode::ContentLength) {
         if (!conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
-            conn.req_content_length == 0 || conn.req_body_remaining == 0 ||
+            conn.req_content_length <= 0 || conn.req_body_remaining <= 0 ||
             conn.req_body_remaining > conn.req_content_length)
             return false;
-        const u64 body_received = static_cast<u64>(static_cast<i64>(conn.req_content_length) -
-                                                   static_cast<i64>(conn.req_body_remaining));
-        return static_cast<u64>(conn.req_initial_send_len) ==
-               static_cast<u64>(static_cast<i64>(conn.req_header_end) +
-                                static_cast<i64>(body_received));
+        // The preceding guards prove 0 < remaining <= content_length, so this
+        // signed subtraction is nonnegative and cannot overflow.
+        const i64 body_received = conn.req_content_length - conn.req_body_remaining;
+        // The sum of the header and body can exceed u32. Compare the full i64 result.
+        if (body_received > INT64_MAX - i64{conn.req_header_end}) return false;
+        return i64{conn.req_initial_send_len} == i64{conn.req_header_end} + body_received;
     }
     // Chunked partial-send ownership needs a fresh parse of the exact captured
     // body prefix. Until that proof is available, leave it on the conservative 413 path.

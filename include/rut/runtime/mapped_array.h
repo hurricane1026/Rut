@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
@@ -33,15 +34,16 @@ public:
     // non-resident. The caller owns an initialised-prefix watermark and calls
     // construct_to(n) before first use of element n-1; destroy() runs
     // destructors only for the constructed prefix.
-    core::Expected<void, Error> init_lazy(u32 count) {
-        if (count == 0 || static_cast<u64>(count) > static_cast<u64>(SIZE_MAX) / sizeof(T))
+    [[nodiscard]] core::Expected<void, Error> init_lazy(u32 count) {
+        const auto elements = range_int{count};
+        if (elements.value() == 0 || elements.to_u64() > SIZE_MAX / sizeof(T))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         if (ptr_) {
             if (count == count_) return {};
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         }
 
-        const size_t bytes = static_cast<size_t>(count) * sizeof(T);
+        const size_t bytes = elements.to_u64() * sizeof(T);
         void* region =
             mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (region == MAP_FAILED)
@@ -64,7 +66,9 @@ public:
     void destroy() {
         if (!ptr_) return;
         while (constructed_ != 0) ptr_[--constructed_].~T();
-        munmap(ptr_, static_cast<size_t>(count_) * sizeof(T));
+        // init_lazy checked the byte count before creating this mapping.
+        const size_t count = range_int{count_}.to<u32>();
+        munmap(ptr_, count * sizeof(T));
         ptr_ = nullptr;
         count_ = 0;
     }
@@ -78,9 +82,9 @@ public:
     operator T*() { return ptr_; }
     operator const T*() const { return ptr_; }
     T* begin() { return ptr_; }
-    T* end() { return ptr_ ? ptr_ + static_cast<i64>(count_) : nullptr; }
+    [[nodiscard]] T* end() { return ptr_ ? ptr_ + range_int{count_}.index() : nullptr; }
     const T* begin() const { return ptr_; }
-    const T* end() const { return ptr_ ? ptr_ + static_cast<i64>(count_) : nullptr; }
+    [[nodiscard]] const T* end() const { return ptr_ ? ptr_ + range_int{count_}.index() : nullptr; }
 
 private:
     T* ptr_ = nullptr;

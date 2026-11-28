@@ -230,8 +230,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
     LLVMSetInitializer(size_global, LLVMConstInt(LLVMInt64TypeInContext(ctx), size, 0));
     LLVMSetGlobalConstant(size_global, 1);
     char object[4096];
-    if (snprintf(object, sizeof(object), "%s.o", output) >= static_cast<int>(sizeof(object)))
-        return false;
+    if (snprintf(object, sizeof(object), "%s.o", output) >= int{sizeof(object)}) return false;
     struct ObjectCleanup {
         const char* path;
         ~ObjectCleanup() { unlink(path); }

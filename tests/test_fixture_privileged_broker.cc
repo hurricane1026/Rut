@@ -462,10 +462,9 @@ static bool install_launcher_bundle_handoff(const identity_bundle::RoleBundle& l
     std::array<int, identity_bundle::kFdsPerRole> temporary{};
     temporary.fill(-1);
     for (size_t i = 0; i != temporary.size(); ++i) {
-        temporary[i] =
-            fcntl(launcher_role.fds[i],
-                  F_DUPFD_CLOEXEC,
-                  kLauncherBundleFdBase + static_cast<int>(identity_bundle::kFdsPerRole));
+        temporary[i] = fcntl(launcher_role.fds[i],
+                             F_DUPFD_CLOEXEC,
+                             kLauncherBundleFdBase + int{identity_bundle::kFdsPerRole});
         if (temporary[i] < 0) {
             for (int fd : temporary)
                 if (fd >= 0) close(fd);
@@ -570,7 +569,7 @@ static bool parse_exact_proc_stat(const std::string& text, ExactProcStat& result
     if (!(fields >> start) || start == 0) return false;
     result.pid = static_cast<pid_t>(pid_value);
     result.state = state;
-    result.start = static_cast<std::uint64_t>(start);
+    result.start = std::uint64_t{start};
     return true;
 }
 
@@ -813,7 +812,7 @@ static bool parse_probe_stat(const std::string& text, pid_t& sid, std::uint64_t&
         if (field == 22) {
             unsigned long long value = 0;
             if (!(fields >> value)) return false;
-            start = static_cast<std::uint64_t>(value);
+            start = std::uint64_t{value};
         } else {
             long long value = 0;
             if (!(fields >> value)) return false;
@@ -1069,7 +1068,7 @@ static bool parse_u64(const char* text, u64& value) {
     errno = 0;
     const unsigned long long parsed = strtoull(text, &end, 10);
     if (errno != 0 || end == text || *end != '\0') return false;
-    value = static_cast<u64>(parsed);
+    value = u64{parsed};
     return true;
 }
 
@@ -1199,7 +1198,7 @@ static bool fill_report(const char* mode, u64 wrapper_pid, Report& report, bool 
 
 static std::vector<unsigned char> credentials_payload(uid_t uid, gid_t gid) {
     std::vector<unsigned char> result(16, 0);
-    const u64 values[] = {static_cast<u64>(uid), static_cast<u64>(gid)};
+    const u64 values[] = {u64{uid}, u64{gid}};
     for (size_t field = 0; field != 2; ++field)
         for (unsigned shift = 0; shift != 64; shift += 8)
             result[field * 8 + shift / 8] = static_cast<unsigned char>(values[field] >> shift);
@@ -2088,11 +2087,11 @@ static std::vector<unsigned char> executable_lease_payload(const ExecutableLease
     std::vector<unsigned char> payload;
     payload.reserve(7u * sizeof(u64) + lease.path.size());
     append_u64(payload, 1u);
-    append_u64(payload, static_cast<u64>(lease.status.st_dev));
-    append_u64(payload, static_cast<u64>(lease.status.st_ino));
-    append_u64(payload, static_cast<u64>(lease.status.st_mode));
-    append_u64(payload, static_cast<u64>(lease.status.st_uid));
-    append_u64(payload, static_cast<u64>(lease.status.st_gid));
+    append_u64(payload, u64{lease.status.st_dev});
+    append_u64(payload, u64{lease.status.st_ino});
+    append_u64(payload, u64{lease.status.st_mode});
+    append_u64(payload, u64{lease.status.st_uid});
+    append_u64(payload, u64{lease.status.st_gid});
     append_u64(payload, lease.path.size());
     payload.insert(payload.end(), lease.path.begin(), lease.path.end());
     return payload;
@@ -2117,10 +2116,10 @@ static bool parse_executable_lease(const std::vector<unsigned char>& payload,
         uid > std::numeric_limits<uid_t>::max() || gid > std::numeric_limits<gid_t>::max())
         return false;
     path.assign(reinterpret_cast<const char*>(payload.data() + 7u * sizeof(u64)),
-                static_cast<std::size_t>(length));
+                std::size_t{length});
     if (path.front() != '/' || path.find('\0') != std::string::npos) return false;
-    expected.st_dev = static_cast<dev_t>(dev);
-    expected.st_ino = static_cast<ino_t>(ino);
+    expected.st_dev = dev_t{dev};
+    expected.st_ino = ino_t{ino};
     expected.st_mode = static_cast<mode_t>(mode);
     expected.st_uid = static_cast<uid_t>(uid);
     expected.st_gid = static_cast<gid_t>(gid);
@@ -2421,7 +2420,7 @@ static bool decode_exact_failure(const std::vector<unsigned char>& payload,
     const u64 child_pid = read_u64(payload.data() + 5u * sizeof(u64));
     const u64 child_start = read_u64(payload.data() + 6u * sizeof(u64));
     if (version != 2u || !valid_exact_failure_phase(phase) ||
-        error_number > static_cast<u64>(std::numeric_limits<int>::max()) || count > 1024u ||
+        error_number > u64{std::numeric_limits<int>::max()} || count > 1024u ||
         escrow_required > 1u || (escrow_required != 0u && (child_pid <= 1u || child_start == 0u)) ||
         (escrow_required == 0u && (child_pid != 0u || child_start != 0u)))
         return false;
@@ -2496,8 +2495,7 @@ static bool decode_exact_settled(const std::vector<unsigned char>& payload,
         fields[i] = read_u64(payload.data() + i * sizeof(u64));
     if (fields[0] != kExactSettledVersion || fields[1] <= 1u || fields[2] <= 1u ||
         fields[3] == 0u || fields[4] == 0u || fields[5] > 1u || fields[6] > 1u || fields[7] > 1u ||
-        fields[8] > 1u || fields[9] > static_cast<u64>(std::numeric_limits<int>::max()) ||
-        fields[10] > 1u)
+        fields[8] > 1u || fields[9] > u64{std::numeric_limits<int>::max()} || fields[10] > 1u)
         return false;
     settled = {fields[0],
                fields[1],
@@ -2854,7 +2852,7 @@ static bool parse_canonical_request(const std::vector<unsigned char>& payload,
         length > collision_evidence::kMaxSourcePath)
         return false;
     executable.assign(reinterpret_cast<const char*>(payload.data() + 3u * sizeof(u64)),
-                      static_cast<std::size_t>(length));
+                      std::size_t{length});
     return executable.front() == '/' && executable.find('\0') == std::string::npos;
 }
 
@@ -2868,14 +2866,14 @@ static collision_evidence::Proc13 canonical_proc13(const ProcIdentity& value) {
             static_cast<u64>(value.sid),
             value.start,
             static_cast<u64>(value.pgid),
-            static_cast<u64>(value.uid),
-            static_cast<u64>(value.gid),
-            static_cast<u64>(value.netns),
-            static_cast<u64>(value.exe_dev),
-            static_cast<u64>(value.exe_ino),
+            u64{value.uid},
+            u64{value.gid},
+            u64{value.netns},
+            u64{value.exe_dev},
+            u64{value.exe_ino},
             value.no_new_privs ? 1u : 0u,
             value.capabilities_clear ? 1u : 0u,
-            static_cast<u64>(value.supplementary_groups)};
+            u64{value.supplementary_groups}};
 }
 
 static collision_evidence::ProcPair canonical_proc_pair(
@@ -2896,7 +2894,7 @@ static collision_evidence::Settlement9 canonical_settlement(
             static_cast<u64>(receipt->identity.pid),
             static_cast<u64>(receipt->identity.ppid),
             receipt->identity.start,
-            static_cast<u64>(receipt->identity.netns),
+            u64{receipt->identity.netns},
             receipt->terminal ? 1u : 0u,
             receipt->reaped ? 1u : 0u,
             static_cast<u64>(receipt->wait_status),
@@ -2970,16 +2968,16 @@ static bool canonical_socket_fields(int fd,
     if (!canonical_proc_link(fd, proc_link)) return false;
     g_fgetfd = static_cast<u64>(fgetfd);
     g_fgetfl = static_cast<u64>(fgetfl);
-    mode = static_cast<u64>(status.st_mode);
-    device = static_cast<u64>(status.st_dev);
-    rdevice = static_cast<u64>(status.st_rdev);
+    mode = u64{status.st_mode};
+    device = u64{status.st_dev};
+    rdevice = u64{status.st_rdev};
     domain = static_cast<u64>(socket_domain);
     type = static_cast<u64>(socket_type);
     protocol = static_cast<u64>(socket_protocol);
     reuseaddr = static_cast<u64>(socket_reuseaddr);
     reuseport = static_cast<u64>(socket_reuseport);
     acceptconn = static_cast<u64>(socket_acceptconn);
-    inode = static_cast<u64>(status.st_ino);
+    inode = u64{status.st_ino};
     return S_ISSOCK(status.st_mode) && inode != 0u &&
            proc_link == "socket:[" + std::to_string(inode) + "]";
 }
@@ -3045,13 +3043,13 @@ static bool canonical_reservation_source(
     report.directory_uid = directory.identity().uid;
     report.directory_gid = directory.identity().gid;
     report.source_state = static_cast<u64>(collision_evidence::SourceState::Active);
-    report.source_dev = static_cast<u64>(source_status.st_dev);
-    report.source_ino = static_cast<u64>(source_status.st_ino);
-    report.source_mode = static_cast<u64>(source_status.st_mode);
-    report.source_uid = static_cast<u64>(source_status.st_uid);
-    report.source_gid = static_cast<u64>(source_status.st_gid);
+    report.source_dev = u64{source_status.st_dev};
+    report.source_ino = u64{source_status.st_ino};
+    report.source_mode = u64{source_status.st_mode};
+    report.source_uid = u64{source_status.st_uid};
+    report.source_gid = u64{source_status.st_gid};
     report.source_size = static_cast<u64>(source_status.st_size);
-    report.source_nlink = static_cast<u64>(source_status.st_nlink);
+    report.source_nlink = u64{source_status.st_nlink};
     report.path_len = source.path().size();
     report.bytes_len = source_bytes.size();
     report.source_path = source.path();
@@ -3124,7 +3122,7 @@ static bool canonical_random_transaction(u64& transaction) {
     transaction = 0u;
     for (;;) {
         const ssize_t count = getrandom(&transaction, sizeof(transaction), GRND_NONBLOCK);
-        if (count == static_cast<ssize_t>(sizeof(transaction))) return transaction != 0u;
+        if (count == ssize_t{sizeof(transaction)}) return transaction != 0u;
         if (count < 0 && errno == EINTR) continue;
         return false;
     }
@@ -3821,8 +3819,8 @@ static int canonical_target_flow(int control,
         3u);
     const Frame collision_frame =
         collision_evidence::encode_collision_attempt(token, collision_envelope, collision_report);
-    const collision_evidence::CollisionCapture capture_report{
-        static_cast<u64>(collision_capture.size()), collision_capture};
+    const collision_evidence::CollisionCapture capture_report{u64{collision_capture.size()},
+                                                              collision_capture};
     const collision_evidence::Envelope collision_capture_envelope = canonical_expected_envelope(
         transaction,
         evidence_target,
@@ -3986,8 +3984,8 @@ static int canonical_target_flow(int control,
                                     collision_evidence::Binding::Phase,
                                     collision_evidence::Phase::RetryLive,
                                     9u);
-    const collision_evidence::RetryLiveCapture retry_capture_report{
-        static_cast<u64>(startup_capture.size()), startup_capture};
+    const collision_evidence::RetryLiveCapture retry_capture_report{u64{startup_capture.size()},
+                                                                    startup_capture};
     const collision_evidence::Envelope retry_capture_envelope =
         canonical_expected_envelope(transaction,
                                     evidence_target,
@@ -4064,7 +4062,7 @@ static int canonical_target_flow(int control,
     if (!canonical_success_owners_settled(
             retry_attempt, collision_attempt, reservation, source, directory, executable))
         return 83;
-    const collision_evidence::RetryFinalCapture final_report{static_cast<u64>(final_capture.size()),
+    const collision_evidence::RetryFinalCapture final_report{u64{final_capture.size()},
                                                              final_capture};
     const collision_evidence::Envelope final_envelope =
         canonical_expected_envelope(transaction,
@@ -4396,8 +4394,7 @@ static bool canonical_parent_g_evidence(const collision_evidence::ReservationSou
                                         const ProcIdentity& target,
                                         u32 positive_ipv4,
                                         u32 guard_ipv4) {
-    if (target.pid <= 1 || source.g_fd > static_cast<u64>(std::numeric_limits<int>::max()))
-        return false;
+    if (target.pid <= 1 || source.g_fd > u64{std::numeric_limits<int>::max()}) return false;
     const int descriptor = static_cast<int>(source.g_fd);
     std::array<char, collision_evidence::kMaxProcLink + 1u> link_buffer{};
     const std::string link_path =
@@ -4507,9 +4504,8 @@ static bool canonical_parent_validate_source(const collision_evidence::Envelope&
         envelope.binding != collision_evidence::Binding::Phase ||
         envelope.phase != collision_evidence::Phase::ReservationHeld || envelope.sequence != 1u ||
         envelope.target.pid != static_cast<u64>(target.pid) ||
-        envelope.target.start != target.start ||
-        envelope.target.netns != static_cast<u64>(target.netns) || positive_ipv4 == 0u ||
-        positive_ipv4 == guard_ipv4 ||
+        envelope.target.start != target.start || envelope.target.netns != u64{target.netns} ||
+        positive_ipv4 == 0u || positive_ipv4 == guard_ipv4 ||
         source.reservation_state != static_cast<u64>(collision_evidence::ReservationState::Held) ||
         source.ipv4 != guard_ipv4 || source.port == 0u || source.port > 65535u ||
         source.g_fd <= 2u || source.g_f_getfd != static_cast<u64>(FD_CLOEXEC) ||
@@ -4557,16 +4553,15 @@ static bool canonical_parent_validate_source(const collision_evidence::Envelope&
     struct stat directory_status{}, source_status{};
     if (lstat(directory_path.c_str(), &directory_status) != 0 ||
         !S_ISDIR(directory_status.st_mode) ||
-        static_cast<u64>(directory_status.st_dev) != source.directory_dev ||
-        static_cast<u64>(directory_status.st_ino) != source.directory_ino ||
+        u64{directory_status.st_dev} != source.directory_dev ||
+        u64{directory_status.st_ino} != source.directory_ino ||
         lstat(source.source_path.c_str(), &source_status) != 0 ||
-        static_cast<u64>(source_status.st_dev) != source.source_dev ||
-        static_cast<u64>(source_status.st_ino) != source.source_ino ||
+        u64{source_status.st_dev} != source.source_dev ||
+        u64{source_status.st_ino} != source.source_ino ||
         static_cast<u64>(source_status.st_size) != source.source_size ||
-        static_cast<u64>(source_status.st_mode) != source.source_mode ||
-        source_status.st_nlink != 1u || source_status.st_uid != getuid() ||
-        source_status.st_gid != getgid() ||
-        static_cast<u64>(directory_status.st_mode) != source.directory_mode ||
+        u64{source_status.st_mode} != source.source_mode || source_status.st_nlink != 1u ||
+        source_status.st_uid != getuid() || source_status.st_gid != getgid() ||
+        u64{directory_status.st_mode} != source.directory_mode ||
         directory_status.st_uid != getuid() || directory_status.st_gid != getgid()) {
         error = "random source path/stat identity was not independently observed";
         return false;
@@ -4611,9 +4606,9 @@ static bool canonical_parent_retry_identity(const collision_evidence::RetryLive&
                                             u16 expected_port,
                                             std::string& error) {
     if (report.header.child_pid <= 1u ||
-        report.header.child_pid > static_cast<u64>(std::numeric_limits<pid_t>::max()) ||
+        report.header.child_pid > u64{std::numeric_limits<pid_t>::max()} ||
         report.header.child_pid == 0u || report.header.child_start == 0u ||
-        report.pidfd.pidfd_fd > static_cast<u64>(std::numeric_limits<int>::max()) ||
+        report.pidfd.pidfd_fd > u64{std::numeric_limits<int>::max()} ||
         report.port != expected_port || report.startup.port != expected_port ||
         report.procs.first_tag != 1u || report.procs.second_tag != 1u ||
         report.procs.first != report.procs.second ||
@@ -7931,9 +7926,9 @@ static bool validate_escrow_temp(int directory,
     errno = 0;
     if (fstatat(directory, name, &status, AT_SYMLINK_NOFOLLOW) < 0)
         return allow_absent && errno == ENOENT;
-    return S_ISREG(status.st_mode) && status.st_dev == static_cast<dev_t>(device) &&
-           status.st_ino == static_cast<ino_t>(inode) && status.st_uid == uid &&
-           status.st_gid == gid && (status.st_mode & 0777) == 0600;
+    return S_ISREG(status.st_mode) && status.st_dev == dev_t{device} &&
+           status.st_ino == ino_t{inode} && status.st_uid == uid && status.st_gid == gid &&
+           (status.st_mode & 0777) == 0600;
 }
 
 static bool exact_custody_child_identity_matches(const ProcIdentity& child,
@@ -7989,9 +7984,8 @@ static ExactEscrowValidation validate_exact_escrow(const ExactCustodyRecord& rec
                                                    uid_t expected_uid,
                                                    gid_t expected_gid) {
     if (record.target_pid != static_cast<u64>(expected_target) ||
-        record.target_start != expected_target_start ||
-        record.netns != static_cast<u64>(expected_netns) || rights.guard < 0 ||
-        rights.directory < 0)
+        record.target_start != expected_target_start || record.netns != u64{expected_netns} ||
+        rights.guard < 0 || rights.directory < 0)
         return ExactEscrowValidation::Invalid;
     struct stat guard_status{}, directory_status{};
     sockaddr_in endpoint{};
@@ -8228,7 +8222,7 @@ static int exact_competing_guard_bind_error(const ExactCustodyRecord& record,
     if (rights.guard < 0 || fstat(rights.guard, &guard_status) != 0 ||
         !S_ISSOCK(guard_status.st_mode))
         return 0;
-    observed_guard_inode = static_cast<u64>(guard_status.st_ino);
+    observed_guard_inode = u64{guard_status.st_ino};
     if (observed_guard_inode != record.guard_inode) return 0;
     const int competing = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (competing < 0) return errno;
@@ -8795,7 +8789,7 @@ static int dropped_broker_main(const char* executable,
         credentials.type != kCallerCredentials || !token_equal(credentials.token, token) ||
         !parse_credentials(credentials.payload, caller_uid, caller_gid) || caller_uid == 0)
         return 25;
-    const gid_t sentinel = caller_gid == static_cast<gid_t>(65534) ? 65533 : 65534;
+    const gid_t sentinel = caller_gid == gid_t{65534} ? 65533 : 65534;
     if (setgroups(1, &sentinel) != 0) return 26;
     int launch_pipe[2] = {-1, -1};
     int trace_pipe[2] = {-1, -1};
@@ -8962,7 +8956,7 @@ static int dropped_broker_main(const char* executable,
                 listener_failure_integration(scenario),
                 control,
                 token,
-                static_cast<ino_t>(expected_netns),
+                ino_t{expected_netns},
                 caller_uid,
                 caller_gid,
                 listener_wildcard_handoff(scenario) ? kCanonicalDroppedTargetWaitMs
@@ -8976,7 +8970,7 @@ static int dropped_broker_main(const char* executable,
                 target_argv,
                 caller_uid,
                 caller_gid,
-                static_cast<ino_t>(expected_netns),
+                ino_t{expected_netns},
                 target,
                 true,
                 (canonical_collision_scenario(scenario) || listener_wildcard_handoff(scenario))
@@ -9216,18 +9210,17 @@ static int root_broker_main(const char* executable,
         close(credential_pair[0]);
         credential_pair[0] = -1;
         int abandoned_status = 0;
-        const OwnedWaitResult abandoned =
-            wait_owned_child_bounded(dropped,
-                                     executable,
-                                     dropped_argv,
-                                     caller_uid,
-                                     caller_gid,
-                                     static_cast<ino_t>(expected_netns),
-                                     dropped,
-                                     true,
-                                     kCleanupMs,
-                                     abandoned_status,
-                                     root_control);
+        const OwnedWaitResult abandoned = wait_owned_child_bounded(dropped,
+                                                                   executable,
+                                                                   dropped_argv,
+                                                                   caller_uid,
+                                                                   caller_gid,
+                                                                   ino_t{expected_netns},
+                                                                   dropped,
+                                                                   true,
+                                                                   kCleanupMs,
+                                                                   abandoned_status,
+                                                                   root_control);
         close(root_control);
         if (credential_pair[0] >= 0) close(credential_pair[0]);
         if (abandoned != OwnedWaitResult::Error) dropped_cleanup.disarm();
@@ -9245,7 +9238,7 @@ static int root_broker_main(const char* executable,
                                  dropped_argv,
                                  caller_uid,
                                  caller_gid,
-                                 static_cast<ino_t>(expected_netns),
+                                 ino_t{expected_netns},
                                  dropped,
                                  true,
                                  dropped_wait_ms,
@@ -9325,17 +9318,16 @@ static int launcher_main(const char* executable,
     OwnedChildCleanup broker_cleanup(broker);
     if (getppid() != parent) {
         int abandoned_status = 0;
-        const OwnedWaitResult abandoned =
-            wait_owned_child_bounded(broker,
-                                     executable,
-                                     broker_argv,
-                                     0,
-                                     0,
-                                     static_cast<ino_t>(expected_netns_value),
-                                     getpgrp(),
-                                     false,
-                                     kCleanupMs,
-                                     abandoned_status);
+        const OwnedWaitResult abandoned = wait_owned_child_bounded(broker,
+                                                                   executable,
+                                                                   broker_argv,
+                                                                   0,
+                                                                   0,
+                                                                   ino_t{expected_netns_value},
+                                                                   getpgrp(),
+                                                                   false,
+                                                                   kCleanupMs,
+                                                                   abandoned_status);
         if (abandoned != OwnedWaitResult::Error) broker_cleanup.disarm();
         return abandoned == OwnedWaitResult::Exited ? 13 : 14;
     }
@@ -9346,7 +9338,7 @@ static int launcher_main(const char* executable,
                                  broker_argv,
                                  0,
                                  0,
-                                 static_cast<ino_t>(expected_netns_value),
+                                 ino_t{expected_netns_value},
                                  getpgrp(),
                                  false,
                                  launcher_broker_wait_ms(scenario),
@@ -9796,11 +9788,10 @@ static bool retained_anchor_self_check(std::string& error) {
     root_credentials.uid_values.fill(0);
     root_credentials.uid = 0;
     const auto uid_sentinel = [&](uid_t caller) {
-        if (caller == 0) return static_cast<uid_t>(1);
-        if (caller == 1) return static_cast<uid_t>(2);
-        if (caller == std::numeric_limits<uid_t>::max())
-            return static_cast<uid_t>(caller - static_cast<uid_t>(1));
-        return static_cast<uid_t>(caller + static_cast<uid_t>(1));
+        if (caller == 0) return uid_t{1};
+        if (caller == 1) return uid_t{2};
+        if (caller == std::numeric_limits<uid_t>::max()) return uid_t{caller - uid_t{1}};
+        return uid_t{caller + uid_t{1}};
     };
     const auto rejects_uid_slot = [&](size_t slot) {
         RetainedAnchorEvidence changed = retained_sudo;
@@ -9808,8 +9799,7 @@ static bool retained_anchor_self_check(std::string& error) {
         if (slot == 0) {
             changed.uid_values[slot] = uid_sentinel(anchor.caller_uid);
         } else {
-            changed.uid_values[slot] =
-                anchor.caller_uid == 0 ? static_cast<uid_t>(1) : anchor.caller_uid;
+            changed.uid_values[slot] = anchor.caller_uid == 0 ? uid_t{1} : anchor.caller_uid;
         }
         changed.uid = changed.uid_values[0];
         return changed.uid_values[slot] != before && !accepted(changed, launcher);
@@ -9817,8 +9807,7 @@ static bool retained_anchor_self_check(std::string& error) {
     const auto rejects_gid_slot = [&](size_t slot) {
         RetainedAnchorEvidence changed = retained_sudo;
         const gid_t before = changed.gid_values[slot];
-        changed.gid_values[slot] =
-            anchor.caller_gid == 0 ? static_cast<gid_t>(1) : anchor.caller_gid;
+        changed.gid_values[slot] = anchor.caller_gid == 0 ? gid_t{1} : anchor.caller_gid;
         changed.gid = changed.gid_values[0];
         return changed.gid_values[slot] != before && !accepted(changed, launcher);
     };
@@ -10011,7 +10000,7 @@ static GroupScanResult scan_group_stat(pid_t pgid,
                     result = GroupScanResult::Unreadable;
                     break;
                 }
-                start = static_cast<std::uint64_t>(value);
+                start = std::uint64_t{value};
             } else {
                 long long value = 0;
                 if (!(fields >> value)) {
@@ -10468,10 +10457,9 @@ static bool validate_root_broker(const Report& report,
         launcher.exe_dev != sudo_launch.allowed.launcher_stage.exe_dev ||
         launcher.exe_ino != sudo_launch.allowed.launcher_stage.exe_ino ||
         launcher.cmdline != expected_launcher_argv ||
-        report.no_new_privs != static_cast<u64>(proc.no_new_privs) ||
-        report.capabilities_clear != static_cast<u64>(proc.capabilities_clear) ||
-        report.groups_clear > 1 || report.groups_unchanged > 1 ||
-        report.groups_clear + report.groups_unchanged != 1 ||
+        report.no_new_privs != u64{proc.no_new_privs} ||
+        report.capabilities_clear != u64{proc.capabilities_clear} || report.groups_clear > 1 ||
+        report.groups_unchanged > 1 || report.groups_clear + report.groups_unchanged != 1 ||
         (report.groups_clear == 1 && proc.supplementary_groups != 0)) {
         sudo_launch.reason = "root broker report/peer/current /proc fields were not exact";
         return false;
@@ -10507,9 +10495,9 @@ static ProcIdentity proc_from_bundle_role(const identity_bundle::RoleManifest& m
     proc.pgid = manifest.pgid;
     proc.uid = manifest.uid;
     proc.gid = manifest.gid;
-    proc.netns = static_cast<ino_t>(manifest.netns);
-    proc.exe_dev = static_cast<dev_t>(manifest.exe_dev);
-    proc.exe_ino = static_cast<ino_t>(manifest.exe_ino);
+    proc.netns = ino_t{manifest.netns};
+    proc.exe_dev = dev_t{manifest.exe_dev};
+    proc.exe_ino = ino_t{manifest.exe_ino};
     proc.exe = executable;
     proc.cmdline = argv;
     return proc;
@@ -10631,9 +10619,9 @@ static ProcIdentity proc_from_dropped_evidence(
     proc.pgid = identity.pgid;
     proc.uid = identity.uid;
     proc.gid = identity.gid;
-    proc.netns = static_cast<ino_t>(identity.netns);
-    proc.exe_dev = static_cast<dev_t>(identity.exe_dev);
-    proc.exe_ino = static_cast<ino_t>(identity.exe_ino);
+    proc.netns = ino_t{identity.netns};
+    proc.exe_dev = dev_t{identity.exe_dev};
+    proc.exe_ino = ino_t{identity.exe_ino};
     proc.exe = executable;
     proc.cmdline = evidence.cmdline;
     proc.no_new_privs = evidence.status.no_new_privs;
@@ -10681,12 +10669,11 @@ static bool validate_dropped_identity_binding(
         root_proc.sid > 1 && root_proc.exe == executable && identity.pgid == identity.pid &&
         identity.sid == root_proc.sid && identity.uid == caller_uid && identity.gid == caller_gid &&
         identity.netns == topology.holder_netns && expected_executable_ok &&
-        root_proc.exe_dev == static_cast<dev_t>(expected_executable.st_dev) &&
-        root_proc.exe_ino == static_cast<ino_t>(expected_executable.st_ino) &&
-        identity.exe_dev == static_cast<u64>(root_proc.exe_dev) &&
-        identity.exe_ino == static_cast<u64>(root_proc.exe_ino) &&
-        identity.exe_dev == static_cast<u64>(expected_executable.st_dev) &&
-        identity.exe_ino == static_cast<u64>(expected_executable.st_ino) &&
+        root_proc.exe_dev == dev_t{expected_executable.st_dev} &&
+        root_proc.exe_ino == ino_t{expected_executable.st_ino} &&
+        identity.exe_dev == u64{root_proc.exe_dev} && identity.exe_ino == u64{root_proc.exe_ino} &&
+        identity.exe_dev == u64{expected_executable.st_dev} &&
+        identity.exe_ino == u64{expected_executable.st_ino} &&
         identity.argv_length == dropped_argv.size() &&
         identity.argv_hash == probe_hash(dropped_argv) && evidence.cmdline == dropped_argv &&
         live_state && uid_slots && gid_slots && evidence.status.supplementary_groups.empty() &&
@@ -10741,12 +10728,12 @@ static MutationDiagnostic dropped_identity_mutation_checks(
                         : MutationDiagnostic{false, label, "mutation accepted unexpectedly"};
     };
     const auto distinct_uid = [caller_uid]() {
-        return caller_uid == std::numeric_limits<uid_t>::max() ? static_cast<uid_t>(caller_uid - 1)
-                                                               : static_cast<uid_t>(caller_uid + 1);
+        return caller_uid == std::numeric_limits<uid_t>::max() ? uid_t{caller_uid - 1}
+                                                               : uid_t{caller_uid + 1};
     };
     const auto distinct_gid = [caller_gid]() {
-        return caller_gid == std::numeric_limits<gid_t>::max() ? static_cast<gid_t>(caller_gid - 1)
-                                                               : static_cast<gid_t>(caller_gid + 1);
+        return caller_gid == std::numeric_limits<gid_t>::max() ? gid_t{caller_gid - 1}
+                                                               : gid_t{caller_gid + 1};
     };
     std::string baseline_error;
     if (!validate_dropped_identity_binding(evidence,
@@ -10942,15 +10929,14 @@ static bool validate_identity_manifest_binding(
         root.ppid != launcher.pid || root.ppid != static_cast<pid_t>(report.wrapper_pid) ||
         root.pgid != sudo_launch.anchor.pgid || root.sid != sudo_launch.anchor.sid ||
         root.uid != 0 || root.gid != 0 || root.netns != topology.holder_netns ||
-        root.exe_dev != static_cast<u64>(expected_dev) ||
-        root.exe_ino != static_cast<u64>(expected_ino) || !argv_exact(root, expected_root_argv) ||
+        root.exe_dev != u64{expected_dev} || root.exe_ino != u64{expected_ino} ||
+        !argv_exact(root, expected_root_argv) ||
         launcher.pid != static_cast<pid_t>(report.wrapper_pid) || launcher.start == 0 ||
         (launcher.pid == sudo_launch.anchor.pid ? launcher.ppid != getpid()
                                                 : launcher.ppid != sudo_launch.anchor.pid) ||
         launcher.pgid != sudo_launch.anchor.pgid || launcher.sid != sudo_launch.anchor.sid ||
         launcher.uid != 0 || launcher.gid != 0 || launcher.netns != topology.holder_netns ||
-        launcher.exe_dev != static_cast<u64>(expected_dev) ||
-        launcher.exe_ino != static_cast<u64>(expected_ino) ||
+        launcher.exe_dev != u64{expected_dev} || launcher.exe_ino != u64{expected_ino} ||
         !argv_exact(launcher, expected_launcher_argv) || report.exe != executable ||
         report.exe_dev != root.exe_dev || report.exe_ino != root.exe_ino ||
         report.argv != expected_root_argv || report.uid != 0 || report.gid != 0 ||
@@ -11263,12 +11249,12 @@ static MutationDiagnostic live_identity_bundle_mutation_checks(
     changed_root_groups.supplementary_groups.push_back(
         changed_root_groups.supplementary_groups.empty()
             ? 1
-            : static_cast<gid_t>(changed_root_groups.supplementary_groups.back() + 1));
+            : gid_t{changed_root_groups.supplementary_groups.back() + 1});
     BundleStatusEvidence changed_launcher_groups = launcher_status;
     changed_launcher_groups.supplementary_groups.push_back(
         changed_launcher_groups.supplementary_groups.empty()
             ? 1
-            : static_cast<gid_t>(changed_launcher_groups.supplementary_groups.back() + 1));
+            : gid_t{changed_launcher_groups.supplementary_groups.back() + 1});
     auto detached = manifests;
     detached[0].pid += 100000;
     detached[0].ppid = 1;
@@ -11844,9 +11830,9 @@ static ProcIdentity proc_from_process_evidence(
     proc.start = evidence.identity.start;
     proc.uid = evidence.identity.uid;
     proc.gid = evidence.identity.gid;
-    proc.netns = static_cast<ino_t>(evidence.identity.netns);
-    proc.exe_dev = static_cast<dev_t>(evidence.identity.exe_dev);
-    proc.exe_ino = static_cast<ino_t>(evidence.identity.exe_ino);
+    proc.netns = ino_t{evidence.identity.netns};
+    proc.exe_dev = dev_t{evidence.identity.exe_dev};
+    proc.exe_ino = ino_t{evidence.identity.exe_ino};
     proc.cmdline = evidence.cmdline;
     return proc;
 }
@@ -12549,8 +12535,7 @@ static bool regular_temp_identity(const std::string& path, u64 dev, u64 ino) {
     struct stat status{};
     return dev != 0u && ino != 0u && lstat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode) &&
            (status.st_mode & 0777) == 0600 && status.st_uid == getuid() &&
-           status.st_gid == getgid() && static_cast<u64>(status.st_dev) == dev &&
-           static_cast<u64>(status.st_ino) == ino;
+           status.st_gid == getgid() && u64{status.st_dev} == dev && u64{status.st_ino} == ino;
 }
 
 static bool validate_exact_witness(const ExactRutReport& report,
@@ -12566,15 +12551,14 @@ static bool validate_exact_witness(const ExactRutReport& report,
     const std::string expected_argv = exact_argv(
         {lease.path, source_path, "--shards", "1", "--no-pin", "--drain", "0", "--opt", "2"});
     if (report.version != kExactProtocolVersion || report.child_pid <= 1u ||
-        report.child_pid > static_cast<u64>(std::numeric_limits<pid_t>::max()) ||
+        report.child_pid > u64{std::numeric_limits<pid_t>::max()} ||
         report.child_ppid != static_cast<u64>(target.pid) ||
         report.child_pgid != report.child_pid || report.child_sid != static_cast<u64>(target.sid) ||
         report.child_uid != getuid() || report.child_gid != getgid() ||
         report.child_netns != target.netns || report.child_exe_dev != lease.status.st_dev ||
         report.child_exe_ino != lease.status.st_ino ||
-        report.pidfd > static_cast<u64>(std::numeric_limits<int>::max()) ||
-        report.pidfd_cloexec != 1u || report.listener_inode == 0u ||
-        report.target_fd_count != held.current_fd_count + 1u ||
+        report.pidfd > u64{std::numeric_limits<int>::max()} || report.pidfd_cloexec != 1u ||
+        report.listener_inode == 0u || report.target_fd_count != held.current_fd_count + 1u ||
         (!generated_proxy && (report.response_bytes != 65u || report.response_exact != 1u ||
                               report.prompt_eof != 1u)) ||
         report.guard_connect_error != ECONNREFUSED || report.stable != 1u ||
@@ -12853,7 +12837,7 @@ static bool run_wildcard_live_parent(int control,
             }
         } else if (phase == 4u || phase == 5u) {
             valid = report.wildcard_pid > 1u &&
-                    report.wildcard_pid <= static_cast<u64>(std::numeric_limits<pid_t>::max()) &&
+                    report.wildcard_pid <= u64{std::numeric_limits<pid_t>::max()} &&
                     read_proc(static_cast<pid_t>(report.wildcard_pid), now) &&
                     now.start == report.wildcard_start && now.ppid == target.pid &&
                     now.netns == target.netns && now.uid == getuid() && now.gid == getgid() &&
@@ -12920,7 +12904,7 @@ static bool run_wildcard_live_parent(int control,
                 ProcIdentity child;
                 std::string expected, actual;
                 return report.wildcard_pid > 1u &&
-                       report.wildcard_pid <= static_cast<u64>(std::numeric_limits<pid_t>::max()) &&
+                       report.wildcard_pid <= u64{std::numeric_limits<pid_t>::max()} &&
                        read_proc(static_cast<pid_t>(report.wildcard_pid), child) &&
                        child.start == report.wildcard_start && child.ppid == target.pid &&
                        child.netns == target.netns && child.exe_dev == executable.status.st_dev &&

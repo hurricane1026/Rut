@@ -19,6 +19,10 @@
 static struct rut_downstream_publication_gate* gate;
 static __thread int gate_inside;
 
+// Linux supplies nonnegative process IDs (including zero for a parent
+// outside the current PID namespace).
+_Static_assert(sizeof(pid_t) <= sizeof(uint32_t), "PID wider than the gate protocol");
+
 static ssize_t (*real_write_fn)(int, const void*, size_t);
 static ssize_t (*real_writev_fn)(int, const struct iovec*, int);
 static ssize_t (*real_send_fn)(int, const void*, size_t, int);
@@ -30,11 +34,20 @@ static void gate_resolve_symbols(void) {
         real_recv_fn != 0)
         return;
     gate_inside++;
-    *(void**)(&real_write_fn) = dlsym(RTLD_NEXT, "write");
-    *(void**)(&real_writev_fn) = dlsym(RTLD_NEXT, "writev");
-    *(void**)(&real_send_fn) = dlsym(RTLD_NEXT, "send");
-    *(void**)(&real_sendmsg_fn) = dlsym(RTLD_NEXT, "sendmsg");
-    *(void**)(&real_recv_fn) = dlsym(RTLD_NEXT, "recv");
+    // dlsym returns the address of a function as void*. Copy its representation
+    // into the function pointer without accessing either through an alias.
+#define RESOLVE_GATE_SYMBOL(function, name)                                                     \
+    do {                                                                                        \
+        void* address = dlsym(RTLD_NEXT, name);                                                 \
+        _Static_assert(sizeof(function) == sizeof(address), "incompatible dlsym pointer size"); \
+        memcpy(&function, &address, sizeof(function));                                          \
+    } while (0)
+    RESOLVE_GATE_SYMBOL(real_write_fn, "write");
+    RESOLVE_GATE_SYMBOL(real_writev_fn, "writev");
+    RESOLVE_GATE_SYMBOL(real_send_fn, "send");
+    RESOLVE_GATE_SYMBOL(real_sendmsg_fn, "sendmsg");
+    RESOLVE_GATE_SYMBOL(real_recv_fn, "recv");
+#undef RESOLVE_GATE_SYMBOL
     gate_inside--;
 }
 
@@ -59,14 +72,16 @@ __attribute__((constructor)) static void gate_initialize(void) {
     const int fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) return;
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size != (off_t)sizeof(*gate)) {
+    _Static_assert(sizeof(*gate) <= INT_MAX, "gate layout exceeds the supported file size");
+    const off_t gate_size = sizeof(*gate);
+    if (fstat(fd, &st) != 0 || st.st_size != gate_size) {
         close(fd);
         return;
     }
     void* mapping = mmap(0, sizeof(*gate), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (mapping == MAP_FAILED) return;
-    gate = (struct rut_downstream_publication_gate*)mapping;
+    gate = mapping;
     if (!gate_protocol_valid()) {
         munmap(mapping, sizeof(*gate));
         gate = 0;
@@ -83,7 +98,7 @@ __attribute__((constructor)) static void gate_initialize(void) {
     rut_downstream_gate_store(&gate->hook_magic_ok, 1);
     if (gate_is_target_master()) {
         uint32_t expected = 0;
-        const uint32_t master = (uint32_t)getpid();
+        const uint32_t master = getpid();
         if (!__atomic_compare_exchange_n(&gate->target_master_pid,
                                          &expected,
                                          master,
@@ -150,7 +165,7 @@ static int gate_wait_for_request_two(int fd) {
         }
         struct pollfd poll_fd = {.fd = fd, .events = POLLIN, .revents = 0};
         const int64_t remaining = deadline - now;
-        const int poll_timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        const int poll_timeout = remaining > INT_MAX ? INT_MAX : remaining;
         const long ready = syscall(SYS_poll, &poll_fd, 1, poll_timeout);
         if (ready < 0) {
             if (errno == EINTR) continue;
@@ -172,7 +187,7 @@ static int gate_wait_for_request_two(int fd) {
             rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_PEEK);
             return 0;
         }
-        const size_t available = (size_t)received;
+        const size_t available = received;
         const size_t compare = available < expected_length ? available : expected_length;
         if (memcmp(peek, gate->request_two, compare) != 0 || available > expected_length) {
             rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_REQUEST_MISMATCH);
@@ -197,12 +212,12 @@ static void gate_before_publication(int fd,
     }
 
     gate->intercepted_fd = fd;
-    gate->intercepted_pid = (uint32_t)getpid();
-    gate->intercepted_ppid = (uint32_t)getppid();
+    gate->intercepted_pid = getpid();
+    gate->intercepted_ppid = getppid();
     gate->intercepted_operation = operation;
     gate->intercepted_length = length;
     gate->intercepted_prefix_length = prefix_length < RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY
-                                          ? (uint32_t)prefix_length
+                                          ? prefix_length
                                           : RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY;
     memcpy(gate->intercepted_prefix, prefix, gate->intercepted_prefix_length);
     uint32_t expected = RUT_DOWNSTREAM_GATE_ARMED;
@@ -262,8 +277,7 @@ static ssize_t gate_coalesced_ingress_recv(int fd, void* data, size_t length, in
             rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_RECV);
         return real_recv_fn(fd, data, length, flags);
     }
-    if ((uint32_t)peeked != expected_length ||
-        memcmp(peek, gate->request_two, expected_length) != 0) {
+    if (peeked != expected_length || memcmp(peek, gate->request_two, expected_length) != 0) {
         rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_REQUEST_MISMATCH);
         return real_recv_fn(fd, data, length, flags);
     }
@@ -274,7 +288,7 @@ static ssize_t gate_coalesced_ingress_recv(int fd, void* data, size_t length, in
     // independently equal the entire configured R1||R2 wire.
     const ssize_t received = real_recv_fn(fd, data, length, flags);
     const int received_errno = errno;
-    if (received != (ssize_t)expected_length ||
+    if (received < 0 || received != expected_length ||
         memcmp(data, gate->request_two, expected_length) != 0) {
         rut_downstream_gate_fail(gate,
                                  received < 0 ? RUT_DOWNSTREAM_GATE_ERROR_RECV
@@ -284,10 +298,10 @@ static ssize_t gate_coalesced_ingress_recv(int fd, void* data, size_t length, in
     }
 
     gate->intercepted_fd = fd;
-    gate->intercepted_pid = (uint32_t)getpid();
-    gate->intercepted_ppid = (uint32_t)getppid();
+    gate->intercepted_pid = getpid();
+    gate->intercepted_ppid = getppid();
     gate->intercepted_operation = RUT_DOWNSTREAM_GATE_OP_RECV;
-    gate->intercepted_length = (uint64_t)received;
+    gate->intercepted_length = expected_length;
     gate->intercepted_prefix_length = expected_length < RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY
                                           ? expected_length
                                           : RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY;
@@ -326,8 +340,7 @@ ssize_t write(int fd, const void* data, size_t length) {
         return -1;
     }
     gate_inside++;
-    gate_before_publication(
-        fd, RUT_DOWNSTREAM_GATE_OP_WRITE, length, (const unsigned char*)data, length);
+    gate_before_publication(fd, RUT_DOWNSTREAM_GATE_OP_WRITE, length, data, length);
     gate_inside--;
     return real_write_fn(fd, data, length);
 }
@@ -347,8 +360,7 @@ ssize_t writev(int fd, const struct iovec* iov, int count) {
     unsigned char prefix[RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY];
     uint64_t total = 0;
     size_t prefix_length = 0;
-    if (count > 0)
-        prefix_length = gate_copy_iov_prefix(prefix, sizeof(prefix), iov, (size_t)count, &total);
+    if (count > 0) prefix_length = gate_copy_iov_prefix(prefix, sizeof(prefix), iov, count, &total);
     gate_inside++;
     gate_before_publication(fd, RUT_DOWNSTREAM_GATE_OP_WRITEV, total, prefix, prefix_length);
     gate_inside--;
@@ -368,8 +380,7 @@ ssize_t send(int fd, const void* data, size_t length, int flags) {
         return -1;
     }
     gate_inside++;
-    gate_before_publication(
-        fd, RUT_DOWNSTREAM_GATE_OP_SEND, length, (const unsigned char*)data, length);
+    gate_before_publication(fd, RUT_DOWNSTREAM_GATE_OP_SEND, length, data, length);
     gate_inside--;
     return real_send_fn(fd, data, length, flags);
 }

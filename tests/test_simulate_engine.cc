@@ -1,3 +1,4 @@
+#include "rut/common/trap.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -62,7 +63,7 @@ static CaptureEntry make_entry(const char* req, u16 status, const char* upstream
     u32 len = 0;
     while (req[len]) len++;
     const u32 bounded_len =
-        len > CaptureEntry::kMaxHeaderLen ? static_cast<u32>(CaptureEntry::kMaxHeaderLen) : len;
+        len > CaptureEntry::kMaxHeaderLen ? u32{CaptureEntry::kMaxHeaderLen} : len;
     __builtin_memcpy(entry.raw_headers, req, bounded_len);
     entry.raw_header_len = static_cast<u16>(bounded_len);
     entry.resp_status = status;
@@ -84,7 +85,7 @@ static bool init_engine(const Manifest& manifest, ModuleContext& ctx, Engine& en
 
 static Str arena_copy(MmapArena& arena, const char* src, u32 len) {
     char* mem = arena.alloc_array<char>(len + 1);
-    if (!mem) __builtin_trap();
+    if (!mem) RUT_TRAP("Simulator test arena allocation failed");
     for (u32 i = 0; i < len; i++) mem[i] = src[i];
     mem[len] = '\0';
     return {mem, len};
@@ -313,14 +314,13 @@ static bool write_capture_file(i32 fd,
     CaptureFileHeader hdr;
     capture_file_header_init(&hdr);
     hdr.entry_count = declared_count;
-    if (write(fd, &hdr, sizeof(hdr)) != static_cast<ssize_t>(sizeof(hdr))) return false;
+    if (write(fd, &hdr, sizeof(hdr)) != ssize_t{sizeof(hdr)}) return false;
     for (u32 i = 0; i < entry_count; i++) {
         if (capture_write_entry(fd, entries[i]) != 0) return false;
     }
     if (partial_entry && partial_len > 0) {
         if (partial_len > sizeof(CaptureEntry)) return false;
-        if (write(fd, partial_entry, partial_len) != static_cast<ssize_t>(partial_len))
-            return false;
+        if (write(fd, partial_entry, partial_len) != ssize_t{partial_len}) return false;
     }
     return true;
 }
@@ -535,7 +535,7 @@ TEST(simulate_engine, routes_using_uncaptured_transport_metadata_are_unsupported
         __builtin_memcpy(request, prefix, sizeof(prefix) - 1);
         __builtin_memcpy(request + sizeof(prefix) - 1, path, path_len);
         const char suffix[] = " HTTP/1.1\r\nHost: x\r\n\r\n";
-        const u32 request_len = static_cast<u32>(sizeof(prefix) - 1) + path_len;
+        const u32 request_len = u32{sizeof(prefix) - 1} + path_len;
         __builtin_memcpy(request + request_len, suffix, sizeof(suffix));
         const SimulateResult result = simulate_one(engine, make_entry(request, 201));
         CHECK_EQ(result.verdict, Verdict::Unsupported);
@@ -1649,7 +1649,7 @@ TEST(simulate_engine, load_manifest_rejects_too_large_file) {
     char path[] = "/tmp/rut_sim_manifest_XXXXXX";
     i32 fd = mkstemp(path);
     REQUIRE(fd >= 0);
-    const i32 rc = ftruncate(fd, static_cast<off_t>(1ULL << 32));
+    const i32 rc = ftruncate(fd, off_t{1ULL << 32});
     if (rc != 0) {
         const i32 truncate_errno = errno;
         close(fd);

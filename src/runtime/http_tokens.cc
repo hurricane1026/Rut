@@ -1,6 +1,7 @@
 #include "rut/runtime/http_tokens.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 #include <arpa/inet.h>
@@ -21,11 +22,9 @@ bool parse_tokens(Str text, Tokens& tokens) {
     if (offset == text.len) return true;
     while (offset < text.len) {
         const u32 kStart = offset;
-        while (offset < text.len && is_http_tchar(static_cast<u8>(text.ptr[offset]))) ++offset;
+        while (offset < text.len && is_http_tchar(byte_value(text.ptr[offset]))) ++offset;
         if (offset == kStart || tokens.count == kMaxHttpTokenListItems) return false;
-        tokens.values[tokens.count++] = {
-            text.ptr + static_cast<i64>(kStart),
-            static_cast<u32>(static_cast<i64>(offset) - static_cast<i64>(kStart))};
+        tokens.values[tokens.count++] = text.slice(kStart, offset);
         while (offset < text.len && (text.ptr[offset] == ' ' || text.ptr[offset] == '\t')) ++offset;
         if (offset == text.len) return true;
         if (text.ptr[offset++] != ',') return false;
@@ -45,18 +44,18 @@ bool valid_origin(Str origin) {
     u32 end = start;
     if (origin.ptr[start] == '[') {
         while (end < origin.len && origin.ptr[end] != ']') ++end;
-        const i64 address_len = static_cast<i64>(end) - static_cast<i64>(start);
-        if (end == origin.len || address_len <= 1 || address_len - 1 >= INET6_ADDRSTRLEN)
-            return false;
-        for (u32 i = static_cast<u32>(static_cast<i64>(start) + 1); i < end; ++i) {
-            const char kC = origin.ptr[i];
+        if (end == origin.len) return false;
+        ++start;
+        const Str literal = origin.slice(start, end);
+        if (literal.empty() || literal.len >= INET6_ADDRSTRLEN) return false;
+        for (u32 i = 0; i < literal.len; ++i) {
+            const char kC = literal.ptr[i];
             const bool kHex =
                 (kC >= '0' && kC <= '9') || (kC >= 'a' && kC <= 'f') || (kC >= 'A' && kC <= 'F');
             if (!kHex && kC != ':' && kC != '.') return false;
         }
         char address[INET6_ADDRSTRLEN]{};
-        __builtin_memcpy(
-            address, origin.ptr + static_cast<i64>(start) + 1, static_cast<u32>(address_len - 1));
+        __builtin_memcpy(address, literal.ptr, literal.len);
         in6_addr parsed{};
         if (inet_pton(AF_INET6, address, &parsed) != 1) return false;
         ++end;
@@ -65,9 +64,10 @@ bool valid_origin(Str origin) {
         while (end < origin.len && origin.ptr[end] != ':') {
             const char kC = origin.ptr[end];
             if (kC == '.') {
-                if (end == label_start || origin.ptr[static_cast<i64>(end) - 1] == '-')
+                if (end == label_start || *(origin.ptr + range_int{end}.index() - 1) == '-')
                     return false;
-                label_start = static_cast<u32>(static_cast<i64>(end) + 1);
+                label_start = end;
+                ++label_start;
             } else {
                 const bool kAlnum = (kC >= 'a' && kC <= 'z') || (kC >= 'A' && kC <= 'Z') ||
                                     (kC >= '0' && kC <= '9');
@@ -76,18 +76,19 @@ bool valid_origin(Str origin) {
             ++end;
         }
         if (end == start || end == label_start) return false;
-        if (origin.ptr[static_cast<i64>(end) - 1] == '-') return false;
+        if (*(origin.ptr + range_int{end}.index() - 1) == '-') return false;
     }
     if (end == origin.len) return true;
     if (origin.ptr[end] != ':') return false;
     if (++end == origin.len) return false;
-    u32 port = 0;
+    u16 port = 0;
     for (; end < origin.len; ++end) {
-        const char kC = origin.ptr[end];
-        if (kC < '0' || kC > '9') return false;
-        const i64 next_port = static_cast<i64>(port) * 10 + static_cast<i64>(kC - '0');
-        if (next_port > 65535) return false;
-        port = static_cast<u32>(next_port);
+        using Digit = range_int<0, 10>;
+        Digit digit;
+        const auto byte = range_int{byte_value(origin.ptr[end])};
+        if (!Digit::try_from_i64((byte - range_int<'0', '0' + 1>{}).value(), &digit) ||
+            !(range_int{port}.scaled_by<10>() + digit).to(&port))
+            return false;
     }
     return true;
 }
@@ -125,11 +126,12 @@ bool http_origin_list_allows(Str allowed, Str origin, bool credentials) {
         const u32 kStart = offset;
         while (offset < allowed.len && allowed.ptr[offset] != ',') ++offset;
         u32 end = offset;
-        while (end > kStart && (allowed.ptr[static_cast<i64>(end) - 1] == ' ' ||
-                                allowed.ptr[static_cast<i64>(end) - 1] == '\t'))
+        while (end > kStart) {
+            const char last = *(allowed.ptr + range_int{end}.index() - 1);
+            if (last != ' ' && last != '\t') break;
             --end;
-        const Str kItem{allowed.ptr + static_cast<i64>(kStart),
-                        static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(kStart))};
+        }
+        const Str kItem = allowed.slice(kStart, end);
         if (++count > 32 || !valid_origin(kItem)) return false;
         found |= kItem.eq(origin);
         if (offset == allowed.len) return found;

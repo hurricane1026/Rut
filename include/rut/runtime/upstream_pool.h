@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/platform/socket.h"
 #include "rut/runtime/route_table.h"
@@ -90,8 +92,8 @@ struct UpstreamPool {
         // The active socket has completed one more clean request at this boundary.
         i32 completed_after = 0;
         if (completed < 0 || max_requests < 0 ||
-            (max_requests && (__builtin_add_overflow(completed, 1, &completed_after) ||
-                              completed_after >= max_requests)))
+            (max_requests &&
+             (add_overflow(completed, 1, &completed_after) || completed_after >= max_requests)))
             return false;
         if (fd < 0 || upstream_id >= RouteConfig::kMaxUpstreams ||
             backend_idx >= UpstreamTarget::kMaxBackends ||
@@ -128,12 +130,12 @@ struct UpstreamPool {
         for (u32 i = idle_head; i != kNoSlot;) {
             const u32 next = idle_next[i];
             UpstreamConn& c = conns[i];
-            u32 idle = 0;
-            (void)__builtin_sub_overflow(now_sec, static_cast<u32>(c.parked_time), &idle);
+            const u32 idle =
+                wrapping_sub(now_sec, bounded_remainder<(u64{1} << 32)>(c.parked_time).to<u32>());
             u64 idle_us = 0;
             if (idle_timeout_configured
-                    ? !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
-                          idle_us >= static_cast<u64>(max_idle_sec) * 1000000u
+                    ? !sub_overflow(now_us, c.parked_time, &idle_us) &&
+                          idle_us >= range_int(max_idle_sec).scaled_by<1'000'000>().to_u64()
                     : idle >= max_idle_sec) {
                 ::close(c.fd);
                 release_slot(i);
@@ -169,9 +171,10 @@ struct UpstreamPool {
             const i32 fd = c.fd;
             const i32 prior_completed = c.completed_requests;
             u64 idle_us = 0;
-            const bool expired = idle_timeout_configured && idle_timeout_sec != 0 &&
-                                 !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
-                                 idle_us >= static_cast<u64>(idle_timeout_sec) * 1000000u;
+            const bool expired =
+                idle_timeout_configured && idle_timeout_sec != 0 &&
+                !sub_overflow(now_us, c.parked_time, &idle_us) &&
+                idle_us >= range_int(idle_timeout_sec).scaled_by<1'000'000>().to_u64();
             release_slot(i);
             if (expired) {
                 ::close(fd);
@@ -224,11 +227,13 @@ struct UpstreamPool {
     static i32 create_socket() { return platform::stream_socket(); }
 
 private:
-    static u64 clock_us() {
+    [[nodiscard]] static u64 clock_us() {
         timespec ts{};
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        u64 now_us = static_cast<u64>(ts.tv_sec) * 1000000u;
-        (void)__builtin_add_overflow(now_us, static_cast<u64>(ts.tv_nsec) / 1000u, &now_us);
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0) return 0;
+        u64 now_us;
+        if (mul_overflow(ts.tv_sec, 1'000'000u, &now_us) ||
+            add_overflow(now_us, ts.tv_nsec / 1000, &now_us))
+            return UINT64_MAX;
         return now_us;
     }
 
@@ -277,10 +282,11 @@ private:
         push_free_slot(i);
         u32 count = idle_count.load(std::memory_order_relaxed);
         while (count > 0 &&
-               !idle_count.compare_exchange_weak(count,
-                                                 static_cast<u32>(static_cast<i64>(count) - 1),
-                                                 std::memory_order_release,
-                                                 std::memory_order_relaxed)) {
+               !idle_count.compare_exchange_weak(
+                   count,
+                   (range_int(count) - range_int<1, 2>{}).max(range_int<0, 1>{}).to<u32>(),
+                   std::memory_order_release,
+                   std::memory_order_relaxed)) {
         }
     }
 };

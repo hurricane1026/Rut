@@ -217,7 +217,7 @@ TEST(target_transform, replacement_prefix_static_query_grammar_is_bounded_and_fa
     const char space[] = {'/', '?', ' '};
     const char tab[] = {'/', '?', '\t'};
     const char control[] = {'/', '?', '\0'};
-    const char del[] = {'/', '?', static_cast<char>(0x7f)};
+    const char del[] = {'/', '?', char{0x7f}};
     const char non_ascii[] = {'/', '?', static_cast<char>(0x80)};
     const Str forbidden[] = {{fragment, 3},
                              {percent, 3},

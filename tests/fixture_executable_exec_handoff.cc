@@ -49,8 +49,8 @@ bool exact_live_identity(pid_t pid,
         !environment.empty())
         return false;
     return identity.pid == pid && identity.ppid == getpid() && identity.exe == path &&
-           static_cast<std::uint64_t>(identity.exe_dev) == expected_executable.device &&
-           static_cast<std::uint64_t>(identity.exe_ino) == expected_executable.inode &&
+           std::uint64_t{identity.exe_dev} == expected_executable.device &&
+           std::uint64_t{identity.exe_ino} == expected_executable.inode &&
            identity.cmdline.size() == expected_arguments.encoded_bytes &&
            (identity.cmdline.empty() || std::memcmp(identity.cmdline.data(),
                                                     expected_arguments.arena.data(),
@@ -215,8 +215,8 @@ bool ExecutableExecHandoffLease::validate_custody(Diagnostic& diagnostic) const 
         struct stat status{};
         if (descriptor_flags < 0 || status_flags < 0 || fstat(fd, &status) != 0 ||
             (descriptor_flags & FD_CLOEXEC) == 0 || (status_flags & O_PATH) != O_PATH ||
-            static_cast<std::uint64_t>(status.st_dev) != identity_.device ||
-            static_cast<std::uint64_t>(status.st_ino) != identity_.inode) {
+            std::uint64_t{status.st_dev} != identity_.device ||
+            std::uint64_t{status.st_ino} != identity_.inode) {
             fail(diagnostic, FailurePhase::Custody, errno == 0 ? ESTALE : errno);
             return false;
         }
@@ -247,8 +247,8 @@ bool ExecutableExecHandoffLease::validate_status_triad(int first,
         struct stat status{};
         if (descriptor_flags < 0 || status_flags < 0 || fstat(fd, &status) != 0 ||
             (descriptor_flags & FD_CLOEXEC) == 0 || (status_flags & O_ACCMODE) != access_mode ||
-            static_cast<std::uint64_t>(status.st_dev) != status_device_ ||
-            static_cast<std::uint64_t>(status.st_ino) != status_inode_) {
+            std::uint64_t{status.st_dev} != status_device_ ||
+            std::uint64_t{status.st_ino} != status_inode_) {
             fail(diagnostic, FailurePhase::Custody, errno == 0 ? ESTALE : errno);
             return false;
         }
@@ -386,8 +386,8 @@ bool ExecutableExecHandoffLease::make_child_plan_with_arguments(
         (void)close_one(status_writer_authority_two_fd_, ignored);
         return false;
     }
-    status_device_ = static_cast<std::uint64_t>(status_identity.st_dev);
-    status_inode_ = static_cast<std::uint64_t>(status_identity.st_ino);
+    status_device_ = std::uint64_t{status_identity.st_dev};
+    status_inode_ = std::uint64_t{status_identity.st_ino};
     if (!validate_status_custody(false, diagnostic)) {
         ::close(status_reader_fd_);
         ::close(status_reader_authority_one_fd_);
@@ -764,8 +764,8 @@ void ExecutableExecHandoffLease::destructor_close_status_triad(
         candidates[index] = descriptor_flags >= 0 && status_flags >= 0 && fstat(fd, &status) == 0 &&
                             (descriptor_flags & FD_CLOEXEC) != 0 &&
                             (status_flags & O_ACCMODE) == access_mode &&
-                            static_cast<std::uint64_t>(status.st_dev) == status_device_ &&
-                            static_cast<std::uint64_t>(status.st_ino) == status_inode_;
+                            std::uint64_t{status.st_dev} == status_device_ &&
+                            std::uint64_t{status.st_ino} == status_inode_;
     }
     std::array<std::array<bool, 3>, 3> same{};
     unsigned int same_edges = 0;
@@ -827,8 +827,7 @@ void ExecutableExecHandoffLease::destructor_cleanup() {
     const bool xa = same_ofd(getpid(), getpid(), executable_fd_, authority_one_fd_);
     const bool xb = same_ofd(getpid(), getpid(), executable_fd_, authority_two_fd_);
     const bool ab = same_ofd(getpid(), getpid(), authority_one_fd_, authority_two_fd_);
-    const unsigned agreements =
-        static_cast<unsigned>(xa) + static_cast<unsigned>(xb) + static_cast<unsigned>(ab);
+    const unsigned agreements = unsigned{xa} + unsigned{xb} + unsigned{ab};
     if (agreements != 1u && agreements != 3u) return;
     Diagnostic ignored;
     if (agreements == 3u) {

@@ -1,11 +1,14 @@
 // Exercise permanent upstream enrollment and byte-accurate atomic ownership.
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/ebpf_bytecode.h"
 #include "rut/common/ebpf_handoff_bytecode.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/ebpf_handoff.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <linux/tcp.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -62,37 +65,48 @@ struct Connection {
         return true;
     }
 };
-bool send_all(int fd, const char* bytes, size_t size) {
+bool send_all(int fd, const void* data, size_t size) {
+    const auto* bytes = reinterpret_cast<const u8*>(data);
     while (size) {
         ssize_t const kN = send(fd, bytes, size, MSG_NOSIGNAL);
         if (kN < 0 && errno == EINTR) continue;
         if (kN <= 0) return false;
         bytes += kN;
-        size -= static_cast<size_t>(kN);
+        size -= range_int(i64{kN}).max(range_int<0, 1>{}).to_u64();
     }
     return true;
 }
-bool read_exact(int fd, char* bytes, u32 length) {
-    u32 read = 0;
+bool read_exact(int fd, void* data, size_t length) {
+    auto* bytes = reinterpret_cast<u8*>(data);
+    size_t read = 0;
     while (read < length) {
         const ssize_t kN = recv(fd, bytes + read, length - read, MSG_WAITALL);
         if (kN < 0 && errno == EINTR) continue;
         if (kN <= 0) {
-            fprintf(stderr, "exact recv: %u/%u stopped %zd errno %d\n", read, length, kN, errno);
+            fprintf(stderr, "exact recv: %zu/%zu stopped %zd errno %d\n", read, length, kN, errno);
             return false;
         }
-        read += static_cast<u32>(kN);
+        read += range_int(i64{kN}).max(range_int<0, 1>{}).to_u64();
     }
     return true;
 }
 u64 now_ns() {
     timespec now{};
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return static_cast<u64>(now.tv_sec) * 1000000000u + static_cast<u64>(now.tv_nsec);
+    u64 seconds, result;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_nsec < 0 ||
+        mul_overflow(now.tv_sec, 1'000'000'000u, &seconds) ||
+        add_overflow(seconds, now.tv_nsec, &result))
+        return 0;
+    return result;
 }
 u64 cpu_ns(const rusage& usage) {
-    return static_cast<u64>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000000000ull +
-           static_cast<u64>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) * 1000ull;
+    u64 seconds, micros, nanos, result;
+    if (add_overflow(usage.ru_utime.tv_sec, usage.ru_stime.tv_sec, &seconds) ||
+        add_overflow(usage.ru_utime.tv_usec, usage.ru_stime.tv_usec, &micros) ||
+        mul_overflow(seconds, 1'000'000'000u, &seconds) || mul_overflow(micros, 1'000u, &nanos) ||
+        add_overflow(seconds, nanos, &result))
+        return 0;
+    return result;
 }
 struct ThreadMeasurement {
     u64& cpu;
@@ -105,7 +119,8 @@ struct ThreadMeasurement {
     }
 };
 u8 payload(u32 offset) {
-    return static_cast<u8>((offset * 131u + offset / 4096u) % 251u);
+    return bounded_remainder<251>(wrapping_add(wrapping_mul(offset, u32{131}), offset / 4096u))
+        .to<u8>();
 }
 struct Writer {
     int fd;
@@ -119,21 +134,22 @@ struct Writer {
     u64 cpu = 0;
 };
 void* write_response(void* argument) {
-    auto& writer = *static_cast<Writer*>(argument);
+    auto& writer = *reinterpret_cast<Writer*>(argument);
     const ThreadMeasurement kMeasurement(writer.cpu);
-    char initial[8192];
-    const u32 kHeaderSize = static_cast<u32>(strlen(writer.header));
+    u8 initial[8192];
+    const size_t kHeaderSize = strlen(writer.header);
+    if (kHeaderSize > sizeof(initial) || writer.prequeue > sizeof(initial) - kHeaderSize)
+        return nullptr;
     memcpy(initial, writer.header, kHeaderSize);
-    for (u32 i = 0; i < writer.prequeue; ++i)
-        initial[kHeaderSize + i] = static_cast<char>(payload(i));
+    for (u32 i = 0; i < writer.prequeue; ++i) initial[kHeaderSize + i] = payload(i);
     if (!send_all(writer.fd, initial, kHeaderSize + writer.prequeue)) return nullptr;
     if (writer.delay) usleep(writer.delay);
     constexpr char kSuccessor[] = "next-response-1234";
-    char block[65536 + sizeof(kSuccessor) - 1];
+    u8 block[65536 + sizeof(kSuccessor) - 1];
     for (u32 offset = writer.prequeue; offset < writer.size;) {
         const u32 kCount =
             writer.size - offset < writer.chunk_bytes ? writer.size - offset : writer.chunk_bytes;
-        for (u32 i = 0; i < kCount; ++i) block[i] = static_cast<char>(payload(offset + i));
+        for (u32 i = 0; i < kCount; ++i) block[i] = payload(offset + i);
         u32 send_size = kCount;
         if (writer.coalesced_tail && offset + kCount == writer.size) {
             memcpy(block + kCount, kSuccessor, sizeof(kSuccessor) - 1);
@@ -158,12 +174,12 @@ struct Reader {
     u64 cpu = 0;
 };
 void* read_response(void* argument) {
-    auto& reader = *static_cast<Reader*>(argument);
+    auto& reader = *reinterpret_cast<Reader*>(argument);
     const ThreadMeasurement kMeasurement(reader.cpu);
     if (reader.delay) usleep(reader.delay);
-    char block[65536];
-    const u32 kHeaderSize = static_cast<u32>(strlen(reader.header));
-    if (!read_exact(reader.fd, block, kHeaderSize) ||
+    u8 block[65536];
+    const size_t kHeaderSize = strlen(reader.header);
+    if (kHeaderSize > sizeof(block) || !read_exact(reader.fd, block, kHeaderSize) ||
         memcmp(block, reader.header, kHeaderSize) != 0)
         return nullptr;
     for (u32 offset = 0; offset < reader.size;) {
@@ -171,13 +187,15 @@ void* read_response(void* argument) {
             reader.size - offset < reader.chunk_bytes ? reader.size - offset : reader.chunk_bytes;
         const ssize_t kReceived = recv(reader.fd, block, kCount, 0);
         if (kReceived < 0 && errno == EINTR) continue;
-        if (kReceived <= 0) return nullptr;
-        for (ssize_t i = 0; i < kReceived; ++i)
-            if (static_cast<u8>(block[i]) != payload(offset + static_cast<u32>(i))) {
-                fprintf(stderr, "response mismatch at %u\n", offset + static_cast<u32>(i));
+        u32 received;
+        if (kReceived <= 0 || !range_int(i64{kReceived}).to(&received) || received > kCount)
+            return nullptr;
+        for (u32 i = 0; i < received; ++i)
+            if (block[i] != payload(offset + i)) {
+                fprintf(stderr, "response mismatch at %u\n", offset + i);
                 return nullptr;
             }
-        offset += static_cast<u32>(kReceived);
+        offset += received;
     }
     reader.ok = true;
     return nullptr;
@@ -187,17 +205,17 @@ bool number(const char* text, u32& out) {
     out = 0;
     for (; *text; ++text) {
         if (*text < '0' || *text > '9' || out > (0xffffffffu - (*text - '0')) / 10u) return false;
-        out = out * 10u + static_cast<u32>(*text - '0');
+        out = out * 10u + bounded_remainder<16>(byte_value(*text)).to<u32>();
     }
     return true;
 }
-bool load_export(const char* prefix, const char* suffix, void* out, u32 size) {
+bool load_export(const char* prefix, const char* suffix, void* out, size_t size) {
     char path[4096];
     const int kLength = snprintf(path, sizeof(path), "%s.%s", prefix, suffix);
-    if (kLength < 0 || static_cast<u32>(kLength) >= sizeof(path)) return false;
+    if (kLength < 0 || kLength >= i64{sizeof(path)}) return false;
     const int kFd = open(path, O_RDONLY | O_CLOEXEC);
     if (kFd < 0) return false;
-    auto* cursor = static_cast<u8*>(out);
+    auto* cursor = reinterpret_cast<u8*>(out);
     bool ok = true;
     while (size) {
         const ssize_t kN = read(kFd, cursor, size);
@@ -207,7 +225,7 @@ bool load_export(const char* prefix, const char* suffix, void* out, u32 size) {
             break;
         }
         cursor += kN;
-        size -= static_cast<u32>(kN);
+        size -= range_int(i64{kN}).max(range_int<0, 1>{}).to_u64();
     }
     char extra = 0;
     ssize_t n;
@@ -224,7 +242,7 @@ bool control_selftest(EbpfHandoffKernel& kernel) {
     state.control = 17;
     if (!EbpfHandoffKernel::update(kernel.fds[EbpfHandoffKernel::State], &kCookie, &state))
         return false;
-    const u64 kDesired = (static_cast<u64>(ebpf::kHandoffOwned | 4096u) << 32u) | 17u;
+    const u64 kDesired = (u64{ebpf::kHandoffOwned | 4096u} << 32u) | 17u;
     if (kernel.run_command({kCookie, 16, kDesired}) != EbpfHandoffKernel::Result::Retry ||
         !kernel.inspect(kCookie, state) || state.control != 17)
         return false;
@@ -455,6 +473,9 @@ int main(int argc, char** argv) {
              sizeof(rewritten),
              "HTTP/1.1 200 OK\r\nContent-Length: %u\r\nX-Test: rewritten\r\n\r\n",
              size);
+    range_int<0, sizeof(original)> header_size;
+    if (!decltype(header_size)::try_from_u64(strlen(original), &header_size)) return 2;
+    const u32 kHeaderSize = header_size.to<u32>();
     Writer writer{source.client, size, prequeue, delay, original, coalesced_tail};
     Reader reader{target.client, size, slow, rewritten};
     writer.chunk_bytes = reader.chunk_bytes = chunk;
@@ -470,7 +491,6 @@ int main(int argc, char** argv) {
         pthread_create(&reader_thread, nullptr, read_response, &reader) != 0)
         return 2;
     char buffer[65536];
-    const u32 kHeaderSize = static_cast<u32>(strlen(original));
     bool ok =
         read_exact(source.relay, buffer, kHeaderSize) && memcmp(buffer, original, kHeaderSize) == 0;
     if (ok && available && !packet)
@@ -508,20 +528,26 @@ int main(int argc, char** argv) {
                 break;
             }
             for (ssize_t pending = kN; pending > 0;) {
-                const ssize_t kSent = splice(pipe.fds[0],
-                                             nullptr,
-                                             target.relay,
-                                             nullptr,
-                                             static_cast<size_t>(pending),
-                                             SPLICE_F_MOVE);
+                const ssize_t kSent =
+                    splice(pipe.fds[0],
+                           nullptr,
+                           target.relay,
+                           nullptr,
+                           range_int(i64{pending}).max(range_int<0, 1>{}).to_u64(),
+                           SPLICE_F_MOVE);
                 if (kSent < 0 && errno == EINTR) continue;
                 if (kSent <= 0) {
                     ok = false;
                     break;
                 }
+                u32 sent;
+                if (kSent > pending || !range_int(i64{kSent}).to(&sent) || sent > size - copied) {
+                    ok = false;
+                    break;
+                }
                 pending -= kSent;
-                copied += static_cast<u32>(kSent);
-                spliced += static_cast<u32>(kSent);
+                copied += sent;
+                spliced += sent;
             }
             continue;
         }
@@ -535,11 +561,13 @@ int main(int argc, char** argv) {
             usleep(100);
             continue;
         }
-        if (kN <= 0 || !send_all(target.relay, buffer, static_cast<size_t>(kN))) {
+        u32 received;
+        if (kN <= 0 || !range_int(i64{kN}).to(&received) || received > kLeft ||
+            !send_all(target.relay, buffer, received)) {
             ok = false;
             break;
         }
-        copied += static_cast<u32>(kN);
+        copied += received;
     }
     ebpf::HandoffState state{};
     const u64 kCopyDone = now_ns();
@@ -613,8 +641,8 @@ int main(int argc, char** argv) {
         ebpf::HandoffState failed_state{};
         if (available && kernel.inspect(source_cookie, failed_state))
             fprintf(stderr,
-                    "failed state: control=%llu frame=%u failed=%u copied=%u\n",
-                    static_cast<unsigned long long>(failed_state.control),
+                    "failed state: control=%" PRIu64 " frame=%u failed=%u copied=%u\n",
+                    failed_state.control,
                     failed_state.frame,
                     failed_state.failed,
                     copied);
@@ -640,7 +668,8 @@ int main(int argc, char** argv) {
     bool retired = true;
     if (available) retired = kernel.retire(source_cookie, target_cookie);
     const bool kPassed = ok && writer.ok && reader.ok && kBoundaryOk && kEofOk && retired;
-    const u64 kElapsed = now_ns() - kStarted;
+    const u64 kFinished = now_ns();
+    const u64 kElapsed = kFinished - kStarted;
     rusage after{};
     getrusage(RUSAGE_SELF, &after);
     rusage relay_after{};
@@ -653,11 +682,17 @@ int main(int argc, char** argv) {
         "\"copied_body_bytes\":%u,\"redirected_body_bytes\":%u,\"spliced_body_bytes\":%u,"
         "\"successor_userspace_bytes\":%zu,"
         "\"half_close_ok\":%s,\"retired\":%s,\"commit_retries\":%u,\"unavailable_errno\":%d,"
-        "\"elapsed_ns\":%llu,\"cpu_ns\":%llu,\"packet_verdict\":%s,\"tail_body_bytes\":%u,"
-        "\"chunk_bytes\":%u,\"relay_cpu_ns\":%llu,\"writer_cpu_ns\":%llu,\"reader_cpu_ns\":%llu,"
-        "\"setup_ns\":%llu,\"header_ns\":%llu,\"copy_or_handoff_ns\":%llu,\"control_ns\":%llu,"
-        "\"redirect_wait_ns\":%llu,\"tail_ns\":%llu,\"barrier_ns\":%llu,\"barrier_checks\":%u,"
-        "\"peer_join_ns\":%llu,\"retire_ns\":%llu}\n",
+        "\"elapsed_ns\":%" PRIu64 ",\"cpu_ns\":%" PRIu64
+        ",\"packet_verdict\":%s,\"tail_body_bytes\":%u,"
+        "\"chunk_bytes\":%u,\"relay_cpu_ns\":%" PRIu64 ",\"writer_cpu_ns\":%" PRIu64
+        ",\"reader_cpu_ns\":%" PRIu64
+        ","
+        "\"setup_ns\":%" PRIu64 ",\"header_ns\":%" PRIu64 ",\"copy_or_handoff_ns\":%" PRIu64
+        ",\"control_ns\":%" PRIu64
+        ","
+        "\"redirect_wait_ns\":%" PRIu64 ",\"tail_ns\":%" PRIu64 ",\"barrier_ns\":%" PRIu64
+        ",\"barrier_checks\":%u,"
+        "\"peer_join_ns\":%" PRIu64 ",\"retire_ns\":%" PRIu64 "}\n",
         mode,
         available ? "true" : "false",
         committed ? "sockhash" : (kSplice ? "splice" : "copy"),
@@ -671,24 +706,24 @@ int main(int argc, char** argv) {
         retired ? "true" : "false",
         retries,
         unavailable,
-        static_cast<unsigned long long>(kElapsed),
-        static_cast<unsigned long long>(cpu_ns(after) - cpu_ns(before)),
+        kElapsed,
+        cpu_ns(after) - cpu_ns(before),
         packet ? "true" : "false",
         state.tail_body,
         chunk,
-        static_cast<unsigned long long>(relay_cpu),
-        static_cast<unsigned long long>(writer.cpu),
-        static_cast<unsigned long long>(reader.cpu),
-        static_cast<unsigned long long>(kSetupDone - kStarted),
-        static_cast<unsigned long long>(kHeaderDone - kSetupDone),
-        static_cast<unsigned long long>(kCopyDone - kHeaderDone),
-        static_cast<unsigned long long>(control_ns),
-        static_cast<unsigned long long>(kRedirectDone - kCopyDone),
-        static_cast<unsigned long long>(kTailDone - kRedirectDone),
-        static_cast<unsigned long long>(barrier_ns),
+        relay_cpu,
+        writer.cpu,
+        reader.cpu,
+        kSetupDone - kStarted,
+        kHeaderDone - kSetupDone,
+        kCopyDone - kHeaderDone,
+        control_ns,
+        kRedirectDone - kCopyDone,
+        kTailDone - kRedirectDone,
+        barrier_ns,
         barrier_checks,
-        static_cast<unsigned long long>(kPeerDone - kTailDone),
-        static_cast<unsigned long long>(kStarted + kElapsed - kPeerDone));
+        kPeerDone - kTailDone,
+        kFinished - kPeerDone);
     return kPassed ? 0 : 1;
 }
 // NOLINTEND(misc-include-cleaner)

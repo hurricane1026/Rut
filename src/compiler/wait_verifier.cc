@@ -38,11 +38,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
     model.weak_fairness = kPending;
     out.operation_count = static_cast<u8>(kOperationCount);
 
-    const auto kAdd = [&](Action action) -> u32 {
-        const u32 kIndex = model.action_count++;
-        out.actions[kIndex] = action;
-        return kIndex;
-    };
+    const auto kAdd = [&](Action action) { out.actions[model.action_count++] = action; };
     for (u32 generation = 0; generation < 2; ++generation) {
         const u32 kArmCount = counts[generation];
         const u32 kOperationBase = generation == 0 ? 0 : counts[0];
@@ -67,7 +63,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
             submit.to = static_cast<u16>(submit.from + 1);
             submit.set = kPendingBit | kSlotBit | kStartedBit;
             submit.assert_clear = kPendingBit | kSlotBit | kWaiting | kClosed;
-            (void)kAdd(submit);
+            kAdd(submit);
 
             Action win{};
             win.actor = kActor;
@@ -78,7 +74,8 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
             win.assert_clear = kSeenBit | kClosed;
             win.clear = kPendingBit | kGenerationSlots | kWaitingBit;
             win.set = kResumedBit | kSeenBit;
-            out.win_actions[kOperation] = kAdd(win);
+            out.win_actions[kOperation] = model.action_count;
+            kAdd(win);
 
             // This is also the target CQE after cancellation. No callback
             // ownership remains, so it may release IO but cannot resume.
@@ -90,7 +87,8 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
             drain.guard_clear = kSlotBit;
             drain.clear = kPendingBit;
             drain.assert_clear = kSlotBit;
-            out.drain_actions[kOperation] = kAdd(drain);
+            out.drain_actions[kOperation] = model.action_count;
+            kAdd(drain);
 
             // A cancel owns a separate completion. Its acknowledgement can
             // arrive before or after the target final completion; neither one
@@ -101,21 +99,22 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
             cancel.guard_set = kPendingBit;
             cancel.guard_clear = kSlotBit | kCancelIssuedBit;
             cancel.set = kCancelBit | kCancelIssuedBit;
-            (void)kAdd(cancel);
+            kAdd(cancel);
 
             Action acknowledge{};
             acknowledge.actor = kActor;
             acknowledge.fairness = static_cast<u8>(kOperation);
             acknowledge.guard_set = kCancelBit;
             acknowledge.clear = kCancelBit;
-            out.cancel_ack_actions[kOperation] = kAdd(acknowledge);
+            out.cancel_ack_actions[kOperation] = model.action_count;
+            kAdd(acknowledge);
 
             Action retire{};
             retire.actor = kActor;
             retire.to = 1;
             retire.guard_set = kStartedBit;
             retire.guard_clear = kPendingBit | kCancelBit;
-            (void)kAdd(retire);
+            kAdd(retire);
 
             // Close/submit failure may occur before this operation is armed.
             for (u32 choice = 0; choice < 2; ++choice) {
@@ -124,7 +123,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
                 unused.to = 1;
                 unused.guard_set = choice == 0 ? kClosed : kFinished;
                 unused.guard_clear = kStartedBit;
-                (void)kAdd(unused);
+                kAdd(unused);
             }
         }
         Action publish{};
@@ -132,7 +131,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
         publish.to = static_cast<u16>(publish.from + 1);
         publish.set = kWaitingBit;
         publish.assert_clear = kWaiting | kResumed | kClosed;
-        (void)kAdd(publish);
+        kAdd(publish);
 
         Action resume{};
         resume.from = publish.to;
@@ -141,7 +140,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
         resume.assert_clear = kGenerationSlots | kWaitingBit;
         resume.clear = kResumedBit;
         if (generation == 1) resume.set = kFinished;
-        (void)kAdd(resume);
+        kAdd(resume);
     }
     // Close, operation failure and submit failure are all fail-closed exits;
     // they can happen before arming, after partial arming, or while waiting.
@@ -151,14 +150,15 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
         close.to = kDraining;
         close.set = kClosed | kFinished;
         close.clear = kSlots | kWaiting | kResumed;
-        (void)kAdd(close);
+        kAdd(close);
     }
     Action reclaim{};
     reclaim.from = kDraining;
     reclaim.to = static_cast<u16>(kDraining + 1);
     reclaim.guard_clear = kPending | kCancels;
     reclaim.assert_clear = kPending | kSlots | kWaiting | kCancels;
-    out.reclaim_action = kAdd(reclaim);
+    out.reclaim_action = model.action_count;
+    kAdd(reclaim);
     out.invariants[model.invariant_count++] = {kClosed, 0, 0, kSlots | kWaiting};
     return true;
 }

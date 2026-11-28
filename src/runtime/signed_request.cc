@@ -72,7 +72,7 @@ bool parse_authorization(Str auth, AuthFields& out) {
         ++pos;
         if (pos >= auth.len || auth.ptr[pos] != '"') return false;
         ++pos;
-        const Str kName{auth.ptr + static_cast<i64>(kNameBegin),
+        const Str kName{auth.ptr + i64{kNameBegin},
                         static_cast<u32>(static_cast<i64>(pos) - static_cast<i64>(kNameBegin) - 2)};
         const u32 kValueBegin = pos;
         while (pos < auth.len && auth.ptr[pos] != '"') {
@@ -81,7 +81,7 @@ bool parse_authorization(Str auth, AuthFields& out) {
             ++pos;
         }
         if (pos >= auth.len) return false;
-        const Str kValue{auth.ptr + static_cast<i64>(kValueBegin),
+        const Str kValue{auth.ptr + i64{kValueBegin},
                          static_cast<u32>(static_cast<i64>(pos) - static_cast<i64>(kValueBegin))};
         ++pos;
 
@@ -125,7 +125,7 @@ bool parse_http_date(Str value, u64& seconds) {
     auto number = [&](u32 start, u32 count, u32& result) {
         result = 0;
         for (u32 i = 0; i < count; ++i) {
-            const char kC = p[static_cast<i64>(start) + static_cast<i64>(i)];
+            const char kC = p[i64{start} + i64{i}];
             if (kC < '0' || kC > '9') return false;
             result = static_cast<u32>(static_cast<i64>(result) * 10 + static_cast<i64>(kC - '0'));
         }
@@ -139,7 +139,7 @@ bool parse_http_date(Str value, u64& seconds) {
     constexpr char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
     constexpr u32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     u32 month = 0;
-    while (month < 12 && !equal({p + 8, 3}, kMonths + static_cast<i64>(month) * 3, 3)) ++month;
+    while (month < 12 && !equal({p + 8, 3}, kMonths + i64{month} * 3, 3)) ++month;
     if (month == 12) return false;
     const bool kLeap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     if (day == 0 ||
@@ -153,27 +153,21 @@ bool parse_http_date(Str value, u64& seconds) {
     for (u32 i = 0; i < month; ++i) days += static_cast<i64>(kDays[i]) + (i == 1 && kLeap ? 1 : 0);
     days += static_cast<i64>(day) - 1;
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
-    if (!equal({p, 3}, kWeekdays + static_cast<i64>((days + 4) % 7) * 3, 3)) return false;
-    const i64 seconds_wide = days * 86400 + static_cast<i64>(hour) * 3600 +
-                             static_cast<i64>(minute) * 60 + static_cast<i64>(second);
+    if (!equal({p, 3}, kWeekdays + i64{(days + 4) % 7} * 3, 3)) return false;
+    const i64 seconds_wide = days * 86400 + i64{hour} * 3600 + i64{minute} * 60 + i64{second};
     seconds = static_cast<u64>(seconds_wide);
     return true;
 }
 
 bool fresh_enough(u64 timestamp, i64 now) {
     if (now <= 0) return false;
-    const u64 kCurrent = static_cast<u64>(now);
-    u64 delta = 0;
-    if (timestamp > kCurrent) {
-        (void)__builtin_sub_overflow(timestamp, kCurrent, &delta);
-    } else {
-        (void)__builtin_sub_overflow(kCurrent, timestamp, &delta);
-    }
-    return delta <= 300;
+    // RUT_INTEGER_RANGE: the untrusted timestamp can use the full u64 range.
+    const auto kDelta = __int128_t{timestamp} - __int128_t{now};
+    return kDelta >= -300 && kDelta <= 300;
 }
 
 bool matches_canonical_base64(Str value, const u8* bytes, u32 length) {
-    u8 expected[static_cast<size_t>(static_cast<i64>(kBase64Size) + 1)]{};
+    u8 expected[size_t{i64{kBase64Size} + 1}]{};
     u32 expected_len = 0;
     const bool kEncoded =
         rut_crypto_base64_encode_v1(bytes, length, expected, sizeof(expected), &expected_len) != 0;
@@ -224,7 +218,7 @@ bool signed_request_hmac_sha256_valid(Str method,
                               &body_hash_len) ||
         body_hash_len != sizeof(body_hash))
         return false;
-    u8 expected_digest[static_cast<size_t>(static_cast<i64>(kBase64Size) + 1)]{};
+    u8 expected_digest[size_t{i64{kBase64Size} + 1}]{};
     u32 expected_digest_len = 0;
     const bool kDigestEncoded = rut_crypto_base64_encode_v1(body_hash,
                                                             sizeof(body_hash),
@@ -238,7 +232,7 @@ bool signed_request_hmac_sha256_valid(Str method,
                                        static_cast<i64>(kBase64Size)) &&
         __builtin_memcmp(digest.ptr, kDigestPrefix, sizeof(kDigestPrefix) - 1) == 0 &&
         rut_crypto_equal_v1(
-            reinterpret_cast<const u8*>(digest.ptr + static_cast<i64>(sizeof(kDigestPrefix) - 1)),
+            reinterpret_cast<const u8*>(digest.ptr + i64{sizeof(kDigestPrefix) - 1}),
             expected_digest,
             kBase64Size);
     rut_crypto_clear_v1(body_hash, sizeof(body_hash));

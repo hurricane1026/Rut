@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/http_parser.h"  // ParseStatus
+#include <utility>
 
 // RFC 6455 WebSocket framing primitives (§5). Pure, zero-allocation parse/serialize
 // for the 2..14-octet frame header, in-place payload unmasking, and frame-header
@@ -26,8 +27,8 @@ static constexpr u32 kWsMaxHeaderSize = 14;
 static constexpr u64 kWsMaxControlPayload = 125;
 
 // True for Close/Ping/Pong (the 0x8 opcode bit).
-inline bool ws_opcode_is_control(WsOpcode op) {
-    return (static_cast<u8>(op) & 0x8) != 0;
+[[nodiscard]] inline bool ws_opcode_is_control(WsOpcode op) {
+    return (std::to_underlying(op) & 0x8) != 0;
 }
 
 constexpr bool ws_opcode_valid(WsOpcode op) {
@@ -41,7 +42,7 @@ struct WsFrameHeader {
     bool masked;
     WsOpcode opcode;
     u8 mask_key[4];   // valid iff masked
-    u64 payload_len;  // 7-/16-/64-bit decoded length
+    i64 payload_len;  // decoded length, in [0, INT64_MAX]
     u32 header_len;   // octets this header consumed (2..14); payload starts at buf+header_len
     bool compressed = false;  // RFC 7692 RSV1, only on the first data fragment
 };
@@ -111,10 +112,10 @@ struct WsMessageAssembler {
 // Feed one DATA or CONTINUATION frame header (control frames are rejected here). On
 // Complete, *out_opcode = the message opcode (Text/Binary) and *out_total_len = the full
 // reassembled payload length. `max_message_size` == 0 means unbounded.
-WsMessageStatus ws_message_feed(WsMessageAssembler& m,
-                                const WsFrameHeader& h,
-                                u64 max_message_size,
-                                WsOpcode* out_opcode,
-                                u64* out_total_len);
+[[nodiscard]] WsMessageStatus ws_message_feed(WsMessageAssembler& m,
+                                              const WsFrameHeader& h,
+                                              u64 max_message_size,
+                                              WsOpcode* out_opcode,
+                                              u64* out_total_len);
 
 }  // namespace rut

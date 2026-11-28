@@ -12,7 +12,7 @@ uint32_t rut_crypto_error_scope_begin_internal(void) {
 }
 void rut_crypto_error_scope_end_internal(uint32_t marked) {
     if (marked)
-        (void)ERR_pop_to_mark();
+        ERR_pop_to_mark();
     else
         ERR_clear_error();
 }
@@ -21,15 +21,17 @@ void rut_crypto_rsa_key_free_internal(EVP_PKEY* key) {
     EVP_PKEY_free(key);
 }
 uint32_t rut_crypto_rsa_key_bits_internal(const EVP_PKEY* key) {
-    return key ? (uint32_t)EVP_PKEY_bits(key) : 0;
+    const int bits = key ? EVP_PKEY_bits(key) : 0;
+    return bits > 0 ? bits : 0;
 }
 
 EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length) {
     if (!der || !length || length > 8192) return 0;
+    const int64_t der_length = length;
     const uint8_t* cursor = der;
-    EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, length);
+    EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, der_length);
     if (!candidate) return 0;
-    if (cursor != der + (int64_t)length || EVP_PKEY_id(candidate) != EVP_PKEY_RSA) goto fail;
+    if (cursor != der + der_length || EVP_PKEY_id(candidate) != EVP_PKEY_RSA) goto fail;
     const int bits = EVP_PKEY_bits(candidate);
     if (bits < 2048 || bits > 4096) goto fail;
     const RSA* rsa = EVP_PKEY_get0_RSA(candidate);
@@ -38,8 +40,8 @@ EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length) 
     const BIGNUM* exponent = 0;
     RSA_get0_key(rsa, &modulus, &exponent, 0);
     if (!modulus || !exponent || !BN_is_odd(modulus) || !BN_is_word(exponent, 65537)) goto fail;
-    const int canonical_size = i2d_PUBKEY(candidate, 0);
-    if (canonical_size <= 0 || (uint32_t)canonical_size != length) goto fail;
+    const int64_t canonical_size = i2d_PUBKEY(candidate, 0);
+    if (canonical_size <= 0 || canonical_size != der_length) goto fail;
     uint8_t canonical[8192];
     uint8_t* output = canonical;
     if (i2d_PUBKEY(candidate, &output) != canonical_size) goto fail;
@@ -56,7 +58,8 @@ fail:
 EVP_PKEY* rut_crypto_rsa_from_modulus_internal(const uint8_t* modulus, uint32_t length) {
     if (!modulus || length < 256 || length > 512) return 0;
     RSA* rsa = RSA_new();
-    BIGNUM* n = BN_bin2bn(modulus, (int)length, 0);
+    const int modulus_size = length; /* Validated to be 256 through 512 bytes. */
+    BIGNUM* n = BN_bin2bn(modulus, modulus_size, 0);
     BIGNUM* e = BN_new();
     EVP_PKEY* owner = EVP_PKEY_new();
     EVP_PKEY* accepted = 0;
@@ -66,10 +69,12 @@ EVP_PKEY* rut_crypto_rsa_from_modulus_internal(const uint8_t* modulus, uint32_t 
         if (EVP_PKEY_set1_RSA(owner, rsa)) {
             uint8_t der[8192];
             const int size = i2d_PUBKEY(owner, 0);
-            if (size > 0 && (uint32_t)size <= sizeof(der)) {
+            const int der_capacity = sizeof(der);
+            if (size > 0 && size <= der_capacity) {
+                const uint32_t der_length = size;
                 uint8_t* cursor = der;
                 if (i2d_PUBKEY(owner, &cursor) == size)
-                    accepted = rut_crypto_rsa_load_der_internal(der, (uint32_t)size);
+                    accepted = rut_crypto_rsa_load_der_internal(der, der_length);
             }
         }
     }
@@ -129,7 +134,8 @@ uint32_t rut_crypto_rsa_workspace_init_internal(EVP_PKEY* source,
         goto fail;
     BN_zero(*input);
     BN_zero(*output);
-    *bytes = (uint32_t)((bits + 7) / 8);
+    /* The loaded RSA modulus has between 2048 and 4096 bits. */
+    *bytes = (bits + 7) / 8;
     return 1;
 fail:
     rut_crypto_rsa_workspace_reset_internal(
@@ -152,11 +158,12 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
         bytes > 512 || !signature || signature_len != bytes || (!message && message_len) ||
         message_len > 1024u * 1024u)
         return 0;
-    if (!BN_bin2bn(signature, (int)bytes, input) || BN_cmp(input, modulus) >= 0 ||
+    const int signature_size = bytes; /* Validated to be 256 through 512 bytes. */
+    if (!BN_bin2bn(signature, signature_size, input) || BN_cmp(input, modulus) >= 0 ||
         !BN_mod_exp_mont(output, input, exponent, modulus, scratch, mont))
         return 0;
     uint8_t actual[512];
-    if (BN_bn2binpad(output, actual, (int)bytes) != (int)bytes) return 0;
+    if (BN_bn2binpad(output, actual, signature_size) != signature_size) return 0;
     /* RFC 8017 9.2: compare the complete fixed SHA-256 encoded message. */
     static const uint8_t digest_info[] = {0x30,
                                           0x31,
@@ -178,13 +185,14 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
                                           0x04,
                                           0x20};
     uint8_t expected[512];
-    const int64_t padding_end = (int64_t)bytes - (int64_t)sizeof(digest_info) - 32 - 1;
+    const int digest_info_size = sizeof(digest_info);
+    const int hash_offset = signature_size - 32;
+    const int padding_end = hash_offset - digest_info_size - 1;
     expected[0] = 0;
     expected[1] = 1;
-    for (uint32_t i = 2; i < padding_end; ++i) expected[i] = 0xff;
+    for (int i = 2; i < padding_end; ++i) expected[i] = 0xff;
     expected[padding_end] = 0;
-    for (uint32_t i = 0; i < sizeof(digest_info); ++i)
-        expected[padding_end + 1 + (int64_t)i] = digest_info[i];
+    for (int i = 0; i < digest_info_size; ++i) expected[padding_end + 1 + i] = digest_info[i];
     uint32_t digest_len = 0;
     if (!rut_crypto_digest_v1(RUT_CRYPTO_SHA256_V1,
                               message,
@@ -192,7 +200,7 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
                               0,
                               0,
                               0,
-                              expected + ((int64_t)bytes - 32),
+                              expected + hash_offset,
                               32,
                               &digest_len) ||
         digest_len != 32)

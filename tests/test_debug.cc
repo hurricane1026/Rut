@@ -82,7 +82,7 @@ TEST(debug, format_conn_debug_snapshot_is_stable) {
     s.upstream_fd = -1;
     s.state = ConnState::Sending;
     s.slot_mask = kConnSlotSend;
-    s.armed_mask = static_cast<u8>(kConnArmedSend | kConnArmedYield);
+    s.armed_mask = u8{kConnArmedSend | kConnArmedYield};
     s.pending_ops = 2;
     s.resp_status = 204;
     s.pending_handler = true;

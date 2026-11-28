@@ -55,15 +55,15 @@ public:
     ~Es256Policies() { destroy(); }
     bool load(const Str* configurations, u32 count);
     bool activate(u32 shard);
-    bool verify(u32 shard,
-                Str configuration,
-                json::Document& document,
-                Str token,
-                i64 now,
-                char* payload,
-                u32 capacity,
-                u32& length,
-                u64 monotonic_ms = ~u64{0});
+    [[nodiscard]] bool verify(u32 shard,
+                              Str configuration,
+                              json::Document& document,
+                              Str token,
+                              i64 now,
+                              char* payload,
+                              u32 capacity,
+                              u32* length,
+                              u64 monotonic_ms = ~u64{0});
     void maintain(u32 shard, u64 monotonic_ms = ~u64{0});
     bool fetch_busy(u32 shard) const;
     void cancel(u32 shard);

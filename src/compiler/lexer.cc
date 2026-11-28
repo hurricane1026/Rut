@@ -1,5 +1,7 @@
 #include "rut/compiler/lexer.h"
 
+#include "rut/common/range_int.h"
+
 namespace rut {
 
 namespace {
@@ -99,30 +101,45 @@ constexpr Str kQuestionDetail =
 
 FrontendResult<void> lex_into(Str source, LexedTokens& out) {
     out.tokens.len = 0;
+    // EOF and source locations are one-based for line and column.
+    if (source.len == UINT32_MAX)
+        return frontend_error(
+            FrontendError::TooManyItems, {}, lit_str("source position exceeds 32 bits"));
     u32 pos = 0;
     u32 line = 1;
     u32 col = 1;
+    constexpr auto kOne = range_int<1, 2>{};
+    constexpr auto kTwo = range_int<2, 3>{};
+    constexpr auto kThree = range_int<3, 4>{};
+    const auto end = range_int(source.len);
+    const auto location_limit = (end + kOne).min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{});
+    auto position_after = [&](auto step) { return range_int(pos) + step; };
+    auto after = [&](auto step) { return position_after(step).value(); };
+    // Callers prove that the step consumes existing bytes. The length
+    // guard leaves room for the one-based line and column at EOF.
+    auto advance = [&](auto step) {
+        pos = position_after(step).min(end).template to<u32>();
+        col = (range_int(col) + step).min(location_limit).template to<u32>();
+    };
 
     while (pos < source.len) {
         const char c = source.ptr[pos];
 
         if (is_space(c)) {
             if (c == '\n') {
-                line++;
+                line = (range_int(line) + kOne).min(location_limit).to<u32>();
+                pos = position_after(kOne).min(end).to<u32>();
                 col = 1;
             } else {
-                col++;
+                advance(kOne);
             }
-            pos++;
             continue;
         }
 
-        if (c == '/' && pos + 1 < source.len && source.ptr[pos + 1] == '/') {
-            pos += 2;
-            col += 2;
+        if (c == '/' && after(kOne) < source.len && source.ptr[after(kOne)] == '/') {
+            advance(kTwo);
             while (pos < source.len && source.ptr[pos] != '\n') {
-                pos++;
-                col++;
+                advance(kOne);
             }
             continue;
         }
@@ -132,33 +149,30 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
         tok.line = line;
         tok.col = col;
 
-        if (c == 'r' && pos + 2 < source.len && source.ptr[pos + 1] == 'e' &&
-            source.ptr[pos + 2] == '"') {
+        if (c == 'r' && after(kTwo) < source.len && source.ptr[after(kOne)] == 'e' &&
+            source.ptr[after(kTwo)] == '"') {
             const u32 literal_start = pos;
             const u32 literal_col = col;
-            const u32 quote_start = pos + 2;
-            pos += 3;
-            col += 3;
-            tok.start = quote_start + 1;
-            tok.col += 3;
+            const u32 quote_start = position_after(kTwo).min(end).to<u32>();
+            advance(kThree);
+            tok.start = (range_int(quote_start) + kOne).min(end).to<u32>();
+            tok.col = (range_int(tok.col) + kThree).min(location_limit).to<u32>();
             while (pos < source.len) {
                 const char cur = source.ptr[pos];
                 if (cur == '"') break;
                 if (cur == '\\') {
-                    if (pos + 1 >= source.len) {
+                    if (after(kOne) >= source.len) {
                         return frontend_error(FrontendError::UnterminatedString,
                                               Span{literal_start, pos, tok.line, literal_col});
                     }
-                    pos += 2;
-                    col += 2;
+                    advance(kTwo);
                     continue;
                 }
                 if (cur == '\n') {
                     return frontend_error(FrontendError::UnterminatedString,
                                           Span{literal_start, pos, tok.line, literal_col});
                 }
-                pos++;
-                col++;
+                advance(kOne);
             }
             if (pos >= source.len || source.ptr[pos] != '"') {
                 return frontend_error(FrontendError::UnterminatedString,
@@ -167,19 +181,16 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
             tok.type = TokenType::RegexLit;
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
-            pos++;
-            col++;
+            advance(kOne);
             if (!out.tokens.push(tok))
                 return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
 
         if (is_ident_start(c)) {
-            pos++;
-            col++;
+            advance(kOne);
             while (pos < source.len && is_ident_continue(source.ptr[pos])) {
-                pos++;
-                col++;
+                advance(kOne);
             }
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
@@ -198,15 +209,14 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
             // adjacent unit identifier. `0b1`/`0b_1`/`0b2` keep their binary
             // prefix diagnostics.
             const bool zero_byte_suffix =
-                c == '0' && pos + 1 < source.len && source.ptr[pos + 1] == 'b' &&
-                (pos + 2 >= source.len || !is_ident_continue(source.ptr[pos + 2]));
-            if (!zero_byte_suffix && c == '0' && pos + 1 < source.len &&
-                (source.ptr[pos + 1] == 'b' || source.ptr[pos + 1] == 'o' ||
-                 source.ptr[pos + 1] == 'x')) {
-                const char kPrefix = source.ptr[pos + 1];
+                c == '0' && after(kOne) < source.len && source.ptr[after(kOne)] == 'b' &&
+                (after(kTwo) >= source.len || !is_ident_continue(source.ptr[after(kTwo)]));
+            if (!zero_byte_suffix && c == '0' && after(kOne) < source.len &&
+                (source.ptr[after(kOne)] == 'b' || source.ptr[after(kOne)] == 'o' ||
+                 source.ptr[after(kOne)] == 'x')) {
+                const char kPrefix = source.ptr[after(kOne)];
                 const u32 kRadix = kPrefix == 'b' ? 2u : kPrefix == 'o' ? 8u : 16u;
-                pos += 2;
-                col += 2;
+                advance(kTwo);
                 const u32 kDigitsStart = pos;
                 bool valid = true;
                 while (pos < source.len && is_ident_continue(source.ptr[pos])) {
@@ -214,15 +224,18 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
                     if (kDigit == '_') {
                         if (pos == kDigitsStart) valid = false;
                     } else {
-                        const u32 kValue =
-                            is_digit(kDigit)                 ? static_cast<u32>(kDigit - '0')
-                            : kDigit >= 'a' && kDigit <= 'f' ? static_cast<u32>(kDigit - 'a') + 10u
-                            : kDigit >= 'A' && kDigit <= 'F' ? static_cast<u32>(kDigit - 'A') + 10u
-                                                             : 16u;
+                        const auto kByte = range_int(static_cast<u8>(kDigit));
+                        constexpr auto kHexOffset = range_int<10, 11>{};
+                        const i64 kValue =
+                            is_digit(kDigit) ? (kByte - range_int<'0', '1'>{}).value()
+                            : kDigit >= 'a' && kDigit <= 'f'
+                                ? (kByte - range_int<'a', 'b'>{} + kHexOffset).value()
+                            : kDigit >= 'A' && kDigit <= 'F'
+                                ? (kByte - range_int<'A', 'B'>{} + kHexOffset).value()
+                                : 16;
                         if (kValue >= kRadix) valid = false;
                     }
-                    pos++;
-                    col++;
+                    advance(kOne);
                 }
                 tok.end = pos;
                 tok.text = source.slice(tok.start, tok.end);
@@ -233,37 +246,34 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
                     return frontend_error(FrontendError::TooManyTokens, token_span(tok));
                 continue;
             }
-            pos++;
-            col++;
+            advance(kOne);
             bool separated = false;
             while (pos < source.len && (is_digit(source.ptr[pos]) || source.ptr[pos] == '_')) {
                 separated |= source.ptr[pos] == '_';
-                pos++;
-                col++;
+                advance(kOne);
             }
             // Duration suffix check. Must immediately follow the digits
             // (no whitespace). Recognized units: ms, s, m, h. "ms" is
             // greedier than "m", so check it first. Unit must be at a
             // token boundary (not followed by another identifier char)
             // so e.g. `5mystery` isn't consumed as "5m" + "ystery".
-            auto is_boundary = [&](u32 after) {
+            auto is_boundary = [&](i64 after) {
                 return after >= source.len || !is_ident_continue(source.ptr[after]);
             };
             bool dur_matched = false;
             u32 unit_end = pos;
-            if (pos + 1 < source.len && source.ptr[pos] == 'm' && source.ptr[pos + 1] == 's' &&
-                is_boundary(pos + 2)) {
-                unit_end = pos + 2;
+            if (after(kOne) < source.len && source.ptr[pos] == 'm' &&
+                source.ptr[after(kOne)] == 's' && is_boundary(after(kTwo))) {
+                unit_end = position_after(kTwo).min(end).to<u32>();
                 dur_matched = true;
-            } else if (pos < source.len && is_boundary(pos + 1) &&
+            } else if (pos < source.len && is_boundary(after(kOne)) &&
                        (source.ptr[pos] == 's' || source.ptr[pos] == 'm' ||
                         source.ptr[pos] == 'h')) {
-                unit_end = pos + 1;
+                unit_end = position_after(kOne).min(end).to<u32>();
                 dur_matched = true;
             }
             if (dur_matched) {
-                col += unit_end - pos;
-                pos = unit_end;
+                advance((range_int(unit_end) - range_int(pos)).max(range_int<0, 1>{}));
                 tok.end = pos;
                 tok.text = source.slice(tok.start, tok.end);
                 // Duration is a distinct domain literal with decimal digits
@@ -285,50 +295,44 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
 
         if (c == '"') {
             const u32 quote_start = pos;
-            pos++;
-            col++;
+            advance(kOne);
             while (pos < source.len) {
                 const char cur = source.ptr[pos];
                 if (cur == '"') break;
                 if (cur == '\\') {
-                    if (pos + 1 >= source.len) {
+                    if (after(kOne) >= source.len) {
                         return frontend_error(FrontendError::UnterminatedString,
                                               Span{quote_start, pos, tok.line, tok.col});
                     }
-                    pos += 2;
-                    col += 2;
+                    advance(kTwo);
                     continue;
                 }
                 if (cur == '\n') {
                     return frontend_error(FrontendError::UnterminatedString,
                                           Span{quote_start, pos, tok.line, tok.col});
                 }
-                pos++;
-                col++;
+                advance(kOne);
             }
             if (pos >= source.len || source.ptr[pos] != '"') {
                 return frontend_error(FrontendError::UnterminatedString,
                                       Span{quote_start, pos, tok.line, tok.col});
             }
             tok.type = TokenType::StringLit;
-            tok.start = quote_start + 1;
-            tok.col++;  // keep col in sync with start, which now points past the opening quote
+            tok.start = (range_int(quote_start) + kOne).min(end).to<u32>();
+            tok.col = (range_int(tok.col) + kOne).min(location_limit).to<u32>();
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
-            pos++;
-            col++;
+            advance(kOne);
             if (!out.tokens.push(tok))
                 return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
 
-        pos++;
-        col++;
+        advance(kOne);
         tok.end = pos;
         tok.text = source.slice(tok.start, tok.end);
         if (c == '=' && pos < source.len && source.ptr[pos] == '=') {
-            pos++;
-            col++;
+            advance(kOne);
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::EqEq;
@@ -337,8 +341,7 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
             continue;
         }
         if (c == '=' && pos < source.len && source.ptr[pos] == '>') {
-            pos++;
-            col++;
+            advance(kOne);
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::Arrow;
@@ -347,8 +350,7 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
             continue;
         }
         if (c == '-' && pos < source.len && source.ptr[pos] == '>') {
-            pos++;
-            col++;
+            advance(kOne);
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             tok.type = TokenType::ThinArrow;
@@ -374,8 +376,7 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
             if (c == '<' && next == '=') two = TokenType::LtEq;
             if (c == '>' && next == '=') two = TokenType::GtEq;
             if (two != TokenType::Error) {
-                pos++;
-                col++;
+                advance(kOne);
                 tok.end = pos;
                 tok.text = source.slice(tok.start, tok.end);
                 tok.type = two;
@@ -450,13 +451,21 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
                 // not (`!x`) never directly follows a value token without
                 // whitespace, so "value token immediately before, no gap"
                 // identifies the postfix reading.
-                const Token* last = out.tokens.len > 0 ? &out.tokens[out.tokens.len - 1] : nullptr;
+                range_int<1, i64{UINT32_MAX} + 1> token_count;
+                const Token* last =
+                    decltype(token_count)::try_from_i64(out.tokens.len, &token_count)
+                        ? &out.tokens[(token_count - kOne).index()]
+                        : nullptr;
                 // String/regex tokens store `end` at the closing quote, so
                 // the character after the literal starts at end + 1.
                 const bool last_is_quoted =
                     last != nullptr &&
                     (last->type == TokenType::StringLit || last->type == TokenType::RegexLit);
-                const u32 last_end = last == nullptr ? 0 : last->end + (last_is_quoted ? 1 : 0);
+                const i64 last_end =
+                    last == nullptr
+                        ? 0
+                        : (range_int(last->end) + range_int(static_cast<u8>(last_is_quoted)))
+                              .value();
                 const bool after_value_token =
                     last != nullptr && last_end == tok.start &&
                     (last->type == TokenType::Ident || last->type == TokenType::IntLit ||

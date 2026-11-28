@@ -86,7 +86,7 @@ TEST(jwt_es256, authenticated_algorithm_header_and_claims_rejections) {
                                1700000000,
                                payload,
                                sizeof(payload),
-                               length);
+                               &length);
     };
     CHECK(check(test::Es256Fixture::header, test::Es256Fixture::claims));
     const Str headers[] = {lit_str("{}"),
@@ -144,7 +144,7 @@ TEST(jwt_es256, shard_activation_configuration_ownership_and_revocation) {
     u32 length = 0;
     Str signed_token = fixture.sign(test::Es256Fixture::header, test::Es256Fixture::claims, token);
     CHECK(!policies.verify(
-        0, policy, document, signed_token, 1700000000, payload, sizeof(payload), length));
+        0, policy, document, signed_token, 1700000000, payload, sizeof(payload), &length));
     REQUIRE(policies.activate(0));
     REQUIRE(policies.activate(2));
     CHECK(!policies.activate(kMaxShards));
@@ -163,7 +163,7 @@ TEST(jwt_es256, shard_activation_configuration_ownership_and_revocation) {
         REQUIRE(!signed_token.empty());
         CHECK_EQ(
             policies.verify(
-                2, policy, document, signed_token, 1700000000, payload, sizeof(payload), length),
+                2, policy, document, signed_token, 1700000000, payload, sizeof(payload), &length),
             i == 0);
         if (i != 0) {
             CHECK_EQ(length, 0u);
@@ -173,7 +173,7 @@ TEST(jwt_es256, shard_activation_configuration_ownership_and_revocation) {
     policies.destroy();
     policies.destroy();
     CHECK(!policies.verify(
-        2, policy, document, signed_token, 1700000000, payload, sizeof(payload), length));
+        2, policy, document, signed_token, 1700000000, payload, sizeof(payload), &length));
     Es256Policy invalid;
     json::Writer remote{policy_bytes};
     remote.text({fixture.policy.ptr, fixture.policy.len - 1});
@@ -308,7 +308,7 @@ TEST(jwt_es256, explicit_type_binds_protected_header_before_identity_publication
                                                       100,
                                                       payload,
                                                       sizeof(payload),
-                                                      length);
+                                                      &length);
                 tracking = false;
                 CHECK_EQ(allocations, 0u);
                 CHECK_EQ(accepted, policy ? item.typed : item.plain);
@@ -330,7 +330,7 @@ TEST(jwt_es256, explicit_type_binds_protected_header_before_identity_publication
     REQUIRE(value.len);
     json::Document document;
     u32 length = 99;
-    CHECK(!policies.verify(0, typed, document, value, 100, payload, sizeof(payload), length));
+    CHECK(!policies.verify(0, typed, document, value, 100, payload, sizeof(payload), &length));
     CHECK_EQ(length, 0u);
     CHECK(!document.valid);
 }

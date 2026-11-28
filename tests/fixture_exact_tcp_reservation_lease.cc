@@ -40,10 +40,10 @@ FdIdentity identity_from(int descriptor, const char* name, int proc_fd, int& err
         error_number = size < 0 && errno != 0 ? errno : ENAMETOOLONG;
         return {};
     }
-    identity.device = static_cast<std::uint64_t>(status.st_dev);
-    identity.inode = static_cast<std::uint64_t>(status.st_ino);
-    identity.mode = static_cast<std::uint64_t>(status.st_mode);
-    identity.rdevice = static_cast<std::uint64_t>(status.st_rdev);
+    identity.device = std::uint64_t{status.st_dev};
+    identity.inode = std::uint64_t{status.st_ino};
+    identity.mode = std::uint64_t{status.st_mode};
+    identity.rdevice = std::uint64_t{status.st_rdev};
     identity.proc_link.assign(link.data(), static_cast<std::size_t>(size));
     error_number = 0;
     return identity;
@@ -154,7 +154,7 @@ bool discover_eligible_ipv4(std::vector<std::uint32_t>& addresses, Diagnostic& d
     freeifaddrs(list);
     std::sort(addresses.begin(), addresses.end());
     addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
-    if (addresses.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    if (addresses.size() > std::size_t{std::numeric_limits<int>::max()}) {
         addresses.clear();
         fail(diagnostic, FailurePhase::Discovery, EOVERFLOW);
         valid = false;
@@ -254,10 +254,10 @@ bool ExactTcpReservationLease::reserve_impl(std::uint32_t host_order_ipv4,
     errno = 0;
     if (fstat(lease.descriptor_, &status) != 0)
         return abort_owned(FailurePhase::Identity, errno == 0 ? EIO : errno);
-    lease.socket_identity_ = {static_cast<std::uint64_t>(status.st_dev),
-                              static_cast<std::uint64_t>(status.st_ino),
-                              static_cast<std::uint64_t>(status.st_mode),
-                              static_cast<std::uint64_t>(status.st_rdev),
+    lease.socket_identity_ = {std::uint64_t{status.st_dev},
+                              std::uint64_t{status.st_ino},
+                              std::uint64_t{status.st_mode},
+                              std::uint64_t{status.st_rdev},
                               "socket:[" + std::to_string(status.st_ino) + "]"};
     if (!lease.validate_socket(diagnostic) || !lease.validate_held_inventory(diagnostic)) {
         const Diagnostic original = diagnostic;
@@ -310,10 +310,10 @@ bool ExactTcpReservationLease::validate_socket(Diagnostic& diagnostic) const {
     struct stat status{};
     errno = 0;
     if (fstat(descriptor_, &status) != 0 || !S_ISSOCK(status.st_mode) || status.st_ino == 0u ||
-        static_cast<std::uint64_t>(status.st_dev) != socket_identity_.device ||
-        static_cast<std::uint64_t>(status.st_ino) != socket_identity_.inode ||
-        static_cast<std::uint64_t>(status.st_mode) != socket_identity_.mode ||
-        static_cast<std::uint64_t>(status.st_rdev) != socket_identity_.rdevice) {
+        std::uint64_t{status.st_dev} != socket_identity_.device ||
+        std::uint64_t{status.st_ino} != socket_identity_.inode ||
+        std::uint64_t{status.st_mode} != socket_identity_.mode ||
+        std::uint64_t{status.st_rdev} != socket_identity_.rdevice) {
         fail(diagnostic, FailurePhase::Identity, errno == 0 ? ESTALE : errno);
         return false;
     }

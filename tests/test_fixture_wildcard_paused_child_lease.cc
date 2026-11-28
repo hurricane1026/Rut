@@ -83,7 +83,7 @@ int close_after_real_close(int fd, void* opaque) {
 
 volatile sig_atomic_t signal_count = 0;
 void count_signal(int) {
-    signal_count = static_cast<sig_atomic_t>(signal_count + 1);
+    signal_count = sig_atomic_t{signal_count + 1};
 }
 
 void check(bool value, const char* message) {
@@ -478,8 +478,8 @@ void destructor_does_not_resignal_after_success() {
     close(evidence_pipe[0]);
     int witness_status = 0;
     check(waitpid(witness, &witness_status, 0) == witness, "destructor no-resignal reap");
-    check(ready == 1 && received == static_cast<ssize_t>(sizeof(evidence)) &&
-              WIFEXITED(witness_status) && WEXITSTATUS(witness_status) == 0,
+    check(ready == 1 && received == ssize_t{sizeof(evidence)} && WIFEXITED(witness_status) &&
+              WEXITSTATUS(witness_status) == 0,
           "destructor no-resignal bounded witness");
     check(evidence.first_cleanup_timed_out && evidence.sigkill_attempts == 1 &&
               evidence.sigkill_sent && evidence.terminal && evidence.reaped &&

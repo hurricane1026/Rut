@@ -82,11 +82,11 @@ def main():
             probe.unlink()
         for before, after in [
             ("completed <= received &&", ""),
-            ("static_cast<i64>(buffered) + static_cast<i64>(completed)",
-             "static_cast<i64>(buffered + completed)"),
-            ("static_cast<i64>(header) + static_cast<i64>(received)",
-             "static_cast<i64>(header + received)"),
-            ("+\n                                                static_cast<i64>(newly_copied)", ""),
+            ("i64{buffered} + i64{completed}",
+             "i64{buffered + completed}"),
+            ("i64{header} + i64{received}",
+             "i64{header + received}"),
+            ("+ i64{newly_copied}", ""),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Buffered response violates retained byte accounting", source=source)
@@ -108,7 +108,7 @@ def main():
             probe.unlink()
         for before, after in [
             ("raw_offset > capacity", "static_cast<u32>(raw_offset) > capacity"),
-            ("if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;",
+            ("if (add_overflow(kOffset, count, &kEnd)) return false;",
              "kEnd = kOffset + count;"),
             ("if (kEnd > capacity) return false;", "if (kEnd >= capacity) return false;"),
             ("if (kEnd > node_dirty) node_dirty = kEnd;", "node_dirty = kEnd;"),
@@ -145,10 +145,10 @@ def main():
         source = "src/runtime/send_progress.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
-            ("completed > remaining", "completed >= remaining"),
+            ("completed > kRemaining.value()", "completed >= kRemaining.value()"),
             ("total <= INT32_MAX", "total <= UINT32_MAX"),
-            ("remaining = static_cast<u32>(static_cast<i64>(remaining) - "
-             "static_cast<i64>(completed));", "remaining = 0;"),
+            ("remaining = (kRemaining - kDelta).max(range_int<0, 1>{}).to<u32>();",
+             "remaining = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/send_progress.h", before, after)
             check(compiler, root, overlay, "Partial send violates byte accounting contract",
@@ -179,8 +179,8 @@ def main():
             ("event.copy_begin == expected_begin &&", ""),
             ("event.result > 0 &&", "event.result >= 0 &&"),
             ("event.copy_witness == IoEventCopyWitness::Full &&", ""),
-            ("static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) ==",
-             "static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) >="),
+            ("i64{event.copy_end} - i64{event.copy_begin} ==",
+             "i64{event.copy_end} - i64{event.copy_begin} >="),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/io_event.h", before, after)
             check(compiler, root, overlay, "Response copy violates positive span contract", source=source)
@@ -203,11 +203,9 @@ def main():
         source = "src/runtime/buffered_send_vector.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
-            ("source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len))",
-             "source + kStep"),
+            ("source + range_int{offset}.index()", "source + kStep"),
             ("++message.msg_iov;", "/* leave the previous span selected */"),
-            ("\n            n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));",
-             "\n            n = 0;"),
+            ("n = unsent;", "n = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
                            before, after)
@@ -261,8 +259,9 @@ def main():
 
         source = "src/runtime/response_read_timer.cc"
         for before, after in [
-            ("ms / 1000", "ms / 1001"),
-            ("(ms % 1000) * 1'000'000", "(ms * 1'000'000u) % 1'000'000'000u"),
+            ("divided_by<1000>()", "divided_by<1001>()"),
+            ("bounded_remainder<1000>(ms).scaled_by<1'000'000>()",
+             "bounded_remainder<1000>(ms * 1'000'000u).scaled_by<1'000'000>()"),
             ("ts.tv_nsec < 1'000'000'000", "ts.tv_nsec <= 1'000'000'000"),
             ("(ts.tv_sec != 0 || ts.tv_nsec != 0)", "true"),
         ]:
@@ -274,10 +273,12 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
-            ("const u64 kMillis = rounded;",
-             "const u64 kMillis = (remaining + 999'999) / 1'000'000;"),
-            ("const u64 kMillis = rounded;", "const u64 kMillis = remaining / 1'000'000;"),
-            ("kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis)", "static_cast<u32>(kMillis)"),
+            ("bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}",
+             "bounded_quotient<1'000'000>(kRounded + 1'000'000)"),
+            ("bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}",
+             "bounded_quotient<1'000'000>(kRounded + 1)"),
+            ("kMillis.min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}).to<u32>()",
+             "static_cast<u32>(kMillis.value())"),
             ("now_ns >= deadline", "now_ns > deadline"),
             ("last_progress_ns == 0 || ", ""),
         ]:
@@ -298,7 +299,7 @@ def main():
         for before, after in [
             ("generation == 0 || generation != owner_generation", "generation == 0"),
             ("cancel ? cancel_owned : target_owned", "cancel ? target_owned : cancel_owned"),
-            ("target_owned || cancel_owned ?", "target_owned && cancel_owned ?"),
+            ("*target_owned || *cancel_owned ?", "*target_owned && *cancel_owned ?"),
         ]:
             mutate(root / "include", overlay, header, before, after)
             check(compiler, root, overlay, "Response-read timer completion violates ownership contract",

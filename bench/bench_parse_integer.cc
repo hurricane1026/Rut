@@ -2,6 +2,7 @@
 // CSV: corpus, implementation, best ns/call (five trials), consumed checksum.
 #include "rut/runtime/parse_integer.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,14 +21,13 @@ static uint64_t rng() {
     return random_state;
 }
 template <bool Wide>
-static bool finish(uint64_t n, bool negative, int64_t& result) {
+static bool finish(uint64_t n, bool negative, int64_t* result) {
     const uint64_t limit = (Wide ? 9223372036854775807ULL : 2147483647ULL) + negative;
     if (n > limit) return false;
-    result = negative ? static_cast<int64_t>(uint64_t(0) - n) : static_cast<int64_t>(n);
-    return true;
+    return rut::try_signed_magnitude(n, negative, result);
 }
 template <bool Wide>
-__attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_t& result) {
+__attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_t* result) {
     if (!len) return false;
     bool negative = *p == '-';
     if (negative || *p == '+') {
@@ -37,28 +37,30 @@ __attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_
     uint64_t n = 0;
     const uint64_t limit = (Wide ? 9223372036854775807ULL : 2147483647ULL) + negative;
     for (uint32_t i = 0; i < len; ++i) {
-        uint32_t digit = static_cast<unsigned char>(p[i]) - uint32_t('0');
+        const uint32_t digit = rut::byte_value(p[i]) - uint32_t{'0'};
         if (digit > 9 || n > (limit - digit) / 10) return false;
         n = n * 10 + digit;
     }
     return finish<Wide>(n, negative, result);
 }
 template <bool Wide>
-__attribute__((noinline)) static bool parse(const char* data, uint32_t length, int64_t& value) {
+__attribute__((noinline)) static bool parse(const char* data, uint32_t length, int64_t* value) {
     return rut::parse_integer<Wide>({data, length}, value);
 }
 template <bool Wide>
-__attribute__((noinline)) static bool selected(const char* data, uint32_t length, int64_t& value) {
+__attribute__((noinline)) static bool selected(const char* data, uint32_t length, int64_t* value) {
     if constexpr (Wide) return rut::parse_integer64({data, length}, value);
     return rut::parse_integer32({data, length}, value);
 }
 static double now() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+    const double seconds = ts.tv_sec;
+    const double nanos = ts.tv_nsec;
+    return seconds + nanos * 1e-9;
 }
 int main() {
-    using Fn = bool (*)(const char*, uint32_t, int64_t&);
+    using Fn = bool (*)(const char*, uint32_t, int64_t*);
     const bool widths[] = {false, true};
     for (bool wide : widths) {
         random_state = 0x123456789abcdef;
@@ -81,8 +83,8 @@ int main() {
                     value %= scale;
                 }
                 bool neg = (rng() % 4) == 0;
-                int count = snprintf(
-                    e.text, sizeof(e.text), "%s%llu", neg ? "-" : "", (unsigned long long)value);
+                int count =
+                    snprintf(e.text, sizeof(e.text), "%s%" PRIu64 "", neg ? "-" : "", value);
                 e.len = uint32_t(count);
                 if (set == 4) {
                     const char* bad[] = {"",
@@ -105,15 +107,17 @@ int main() {
                 if (set == 5) {
                     e.len = 8 + rng() % 120;
                     memset(e.text, '0', e.len);
-                    e.text[e.len - 1] = static_cast<char>('1' + rng() % 9);
+                    e.text[e.len - 1] =
+                        (rut::range_int<'1', '2'>{} + rut::bounded_remainder<9>(rng()))
+                            .to<rut::i8>();
                 }
             }
             for (auto& e : entries) {
                 int64_t expected = 0;
-                bool ok = functions[0](e.text, e.len, expected);
+                bool ok = functions[0](e.text, e.len, &expected);
                 for (auto f : functions) {
                     int64_t actual = 0;
-                    bool got = f(e.text, e.len, actual);
+                    bool got = f(e.text, e.len, &actual);
                     if (got != ok || (got && actual != expected)) {
                         fprintf(stderr, "mismatch set=%u text=%.*s\n", set, e.len, e.text);
                         return 1;
@@ -128,18 +132,18 @@ int main() {
                     for (unsigned repeat = 0; repeat < 512; ++repeat)
                         for (auto& e : entries) {
                             int64_t value = 0;
-                            bool ok = functions[which](e.text, e.len, value);
+                            bool ok = functions[which](e.text, e.len, &value);
                             checksum += ok ? uint64_t(value) : 13;
                         }
                     double elapsed = now() - start;
                     if (elapsed < best) best = elapsed;
                 }
-                printf("%u,%s,%s,%.3f,%llu\n",
+                printf("%u,%s,%s,%.3f,%" PRIu64 "\n",
                        wide ? 64u : 32u,
                        sets[set],
                        names[which],
                        best * 1e9 / (512 * 4096),
-                       (unsigned long long)checksum);
+                       checksum);
             }
         }
     }

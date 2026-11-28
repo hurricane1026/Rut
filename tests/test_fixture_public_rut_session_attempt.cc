@@ -279,13 +279,11 @@ bool partial_prepare(Owners& owners, attempt::PrepareFailurePoint point) {
         explicitly_cleaned =
             check(lease.cleanup(Clock::now(), diagnostic), "partial cleanup idempotent replay") &&
             check(cleanup->explicit_cleanup_calls == 2u &&
-                      static_cast<unsigned>(cleanup->child_attempted) == child_attempts &&
-                      static_cast<unsigned>(cleanup->handoff_attempted) == handoff_attempts &&
-                      static_cast<unsigned>(cleanup->null_attempted) == null_attempts &&
-                      static_cast<unsigned>(cleanup->capture_settle_attempted) ==
-                          capture_settle_attempts &&
-                      static_cast<unsigned>(cleanup->capture_close_attempted) ==
-                          capture_close_attempts,
+                      unsigned{cleanup->child_attempted} == child_attempts &&
+                      unsigned{cleanup->handoff_attempted} == handoff_attempts &&
+                      unsigned{cleanup->null_attempted} == null_attempts &&
+                      unsigned{cleanup->capture_settle_attempted} == capture_settle_attempts &&
+                      unsigned{cleanup->capture_close_attempted} == capture_close_attempts,
                   "partial cleanup does not repeat owned operations") &&
             prepare_diagnostic.phase == attempt::FailurePhase::Injected &&
             prepare_diagnostic.error_number == EIO && explicitly_cleaned;
@@ -316,9 +314,8 @@ bool exec_failure(Owners& owners) {
     const char bytes[] = "not-an-executable\n";
     bool made = writer >= 0;
     if (writer >= 0) {
-        made =
-            write(writer, bytes, sizeof(bytes) - 1u) == static_cast<ssize_t>(sizeof(bytes) - 1u) &&
-            fsync(writer) == 0;
+        made = write(writer, bytes, sizeof(bytes) - 1u) == ssize_t{sizeof(bytes) - 1u} &&
+               fsync(writer) == 0;
         made = close(writer) == 0 && made;
     }
     executable::ExecutableLease bad_executable;

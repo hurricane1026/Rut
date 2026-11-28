@@ -173,7 +173,7 @@ struct Explorer {
         State initial{};
         initial.bits = model.initial_bits;
         for (u32 a = 0; a < model.actor_count; ++a) initial.locations[a] = model.actors[a].initial;
-        (void)intern(initial, kNoIndex, kNoIndex);
+        if (intern(initial, kNoIndex, kNoIndex) == kNoIndex) return fail(Issue::StateLimit);
         for (u32 id = 0; id < result.state_count; ++id) {
             Node& node = nodes[id];
             for (u32 i = 0; i < model.invariant_count; ++i) {

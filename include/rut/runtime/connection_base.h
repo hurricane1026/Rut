@@ -1,12 +1,16 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/byte_span.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
+#include "rut/common/range_int.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/route_host.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
@@ -270,7 +274,7 @@ struct RelayOwner {
     i32 destination_fd = -1;
     u32 segment_len = 0;
     u32 segment_sent = 0;
-    u32 body_bytes = 0;
+    i64 body_bytes = 0;
     bool read_armed = false;
     bool write_armed = false;
     bool close_pending = false;
@@ -540,15 +544,13 @@ struct ConnectionBase {
     // from upstream_recv_buf. Keeping the header block independent lets a full
     // upstream body buffer stream normally even when mutations grow the headers.
     u8* response_header_slice;
-    Buffer response_header_buf;
+    SliceBuffer response_header_buf;
 
     void reanchor_request_overrides(const u8* old_base, u32 old_len, const u8* new_base) {
         auto reanchor = [&](Str& value) {
             if (value.ptr == nullptr) return;
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr < old_base ||
-                ptr + static_cast<i64>(value.len) > old_base + static_cast<i64>(old_len))
-                return;
+            if (ptr < old_base || ptr + i64{value.len} > old_base + i64{old_len}) return;
             value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
         };
         reanchor(req_path_override);
@@ -563,9 +565,7 @@ struct ConnectionBase {
             auto& value = resp_header_mutations[i].value;
             if (value.ptr == nullptr) continue;
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr < old_base ||
-                ptr + static_cast<i64>(value.len) > old_base + static_cast<i64>(old_len))
-                continue;
+            if (ptr < old_base || ptr + i64{value.len} > old_base + i64{old_len}) continue;
             value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
         }
     }
@@ -594,13 +594,15 @@ struct ConnectionBase {
     // Copy request-backed mutation values out of a synthesized request before
     // HTTP/2 reuses its request scratch for the encoded response. Literal values
     // already live in JIT-owned storage and do not need copying.
-    bool stabilize_response_mutations(const u8* source, u32 source_len) {
-        auto survives_folding = [&](u32 index) {
+    [[nodiscard]] bool stabilize_response_mutations(const u8* source, u32 source_len) {
+        const u8 count = resp_header_mutation_count;
+        if (count > kMaxRespHeaderMutations) return false;
+
+        auto survives_folding = [&](u8 index) {
             const auto& current = resp_header_mutations[index];
             if (current.mode == RespHeaderMutationMode::Remove) return false;
-            for (u32 later_index = static_cast<u32>(static_cast<i64>(index) + 1);
-                 later_index < resp_header_mutation_count;
-                 later_index++) {
+            const auto next = range_int(index) + range_int<1, 2>{};
+            for (u32 later_index = next.to<u32>(); later_index < count; later_index++) {
                 const auto& later = resp_header_mutations[later_index];
                 if (later.mode != RespHeaderMutationMode::Add &&
                     http_header_name_eq_ci(
@@ -609,33 +611,27 @@ struct ConnectionBase {
             }
             return true;
         };
-        u32 needed = 0;
-        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+
+        const auto* source_chars = reinterpret_cast<const char*>(source);
+        u32 remaining = response_header_buf.capacity_u32();
+        for (u8 i = 0; i < count; i++) {
             if (!survives_folding(i)) continue;
             const auto& value = resp_header_mutations[i].value;
-            if (value.ptr == nullptr) continue;
-            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr >= source &&
-                ptr + static_cast<i64>(value.len) <= source + static_cast<i64>(source_len)) {
-                u32 next_needed = 0;
-                if (__builtin_add_overflow(needed, value.len, &next_needed)) return false;
-                needed = next_needed;
-            }
+            if (!byte_span_within(source_chars, source_len, value.ptr, value.len)) continue;
+            // Both operands fit in u32. Their i64 difference fits in u32 only
+            // when this value fits in the remaining space.
+            if (!(range_int(remaining) - range_int(value.len)).to(&remaining)) return false;
         }
-        if (needed > response_header_buf.capacity()) return false;
+
         response_header_buf.reset();
-        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+        for (u8 i = 0; i < count; i++) {
             if (!survives_folding(i)) continue;
             auto& value = resp_header_mutations[i].value;
-            if (value.ptr == nullptr) continue;
+            if (!byte_span_within(source_chars, source_len, value.ptr, value.len)) continue;
+            const auto offset = range_int(response_header_buf.len());
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr < source ||
-                ptr + static_cast<i64>(value.len) > source + static_cast<i64>(source_len))
-                continue;
-            const u32 offset = response_header_buf.len();
             if (response_header_buf.write(ptr, value.len) != value.len) return false;
-            value.ptr = reinterpret_cast<const char*>(response_header_buf.data() +
-                                                      static_cast<i64>(offset));
+            value.ptr = reinterpret_cast<const char*>(response_header_buf.data() + offset.index());
         }
         return true;
     }
@@ -762,13 +758,13 @@ struct ConnectionBase {
     bool alloc_ws_buffers(SlicePool& pool) {
         if (ws_max_message_size > kWsMaxMessageCapacity) return false;
         const u32 kCapacity = ws_buffer_capacity();
+#if RUT_ENABLE_WEBSOCKET
         const WsDeflateOptions kDownstream{ws_downstream_deflate.client_window,
                                            ws_downstream_deflate.server_window,
                                            ws_downstream_deflate.client_no_context_takeover};
         const WsDeflateOptions kUpstream{ws_upstream_deflate.server_window,
                                          ws_upstream_deflate.client_window,
                                          ws_upstream_deflate.server_no_context_takeover};
-#if RUT_ENABLE_WEBSOCKET
         const bool kCodecsMatch =
             (ws_downstream_deflate.enabled
                  ? ws_downstream_codec && ws_deflate_matches(*ws_downstream_codec, kDownstream)
@@ -778,8 +774,6 @@ struct ConnectionBase {
                  : ws_upstream_codec == nullptr);
 #else
         const bool kCodecsMatch = !ws_downstream_codec && !ws_upstream_codec;
-        (void)kDownstream;
-        (void)kUpstream;
         if (ws_downstream_deflate.enabled || ws_upstream_deflate.enabled) return false;
 #endif
         if (ws_c2u_msg || ws_u2c_msg || ws_c2u_out || ws_u2c_out)
@@ -820,12 +814,10 @@ struct ConnectionBase {
         ws_u2c_out = buffers[3];
         return true;
     }
-    void free_ws_codecs(SlicePool& pool) {
+    void free_ws_codecs([[maybe_unused]] SlicePool& pool) {
 #if RUT_ENABLE_WEBSOCKET
         ws_deflate_destroy(pool, ws_downstream_codec);
         ws_deflate_destroy(pool, ws_upstream_codec);
-#else
-        (void)pool;
 #endif
         ws_downstream_codec = nullptr;
         ws_upstream_codec = nullptr;
@@ -873,10 +865,8 @@ struct ConnectionBase {
         return context;
     }
     // Dedicated inline control storage is never reused while its send is pending.
-    u8 ws_close_frame_client[static_cast<i64>(kWsMaxHeaderSize) +
-                             static_cast<i64>(kWsMaxControlPayload)];
-    u8 ws_close_frame_upstream[static_cast<i64>(kWsMaxHeaderSize) +
-                               static_cast<i64>(kWsMaxControlPayload)];
+    u8 ws_close_frame_client[i64{kWsMaxHeaderSize} + i64{kWsMaxControlPayload}];
+    u8 ws_close_frame_upstream[i64{kWsMaxHeaderSize} + i64{kWsMaxControlPayload}];
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -901,7 +891,7 @@ struct ConnectionBase {
     u16 jit_ready_state = 0;
     bool jit_ready_queued = false;
     alignas(alignof(u64)) u8
-        handler_ctx_storage[sizeof(jit::HandlerCtx) + static_cast<i64>(kMaxJitHandlerSlots) * 8]{};
+        handler_ctx_storage[sizeof(jit::HandlerCtx) + i64{kMaxJitHandlerSlots} * 8]{};
 
     jit::HandlerCtx* reset_jit_ctx() {
         __builtin_memset(handler_ctx_storage, 0, sizeof(handler_ctx_storage));
@@ -1124,8 +1114,8 @@ struct ConnectionBase {
         const auto result = consume_response_read_timer_owner(response_read_timer_phase,
                                                               response_read_timer_owner_generation,
                                                               tagged_generation,
-                                                              response_read_timer_target_owned,
-                                                              response_read_timer_cancel_owned);
+                                                              &response_read_timer_target_owned,
+                                                              &response_read_timer_cancel_owned);
         if (result == TimerCompletion::Rejected) return false;
         if (result == TimerCompletion::Drained) {
             const bool cleared = clear_response_read_timer_owner();
@@ -1213,8 +1203,8 @@ struct ConnectionBase {
             response_read_deadline_post_commit_inflight_body != len ||
             response_read_deadline_post_commit_downstream_submitted <
                 response_read_deadline_post_commit_downstream_completed ||
-            static_cast<i64>(response_read_deadline_post_commit_downstream_submitted) -
-                    static_cast<i64>(response_read_deadline_post_commit_downstream_completed) !=
+            i64{response_read_deadline_post_commit_downstream_submitted} -
+                    i64{response_read_deadline_post_commit_downstream_completed} !=
                 len ||
             response_read_deadline_post_commit_origin_received <=
                 response_read_deadline_post_commit_downstream_completed)
@@ -1491,9 +1481,9 @@ struct ConnectionBase {
     // `tls` above); io_uring leaves `tls` null and uses `tls_engine`.
     TlsEngine tls_engine;
     u8* tls_in_slice;  // ciphertext arriving from the network (recv lands here)
-    Buffer tls_in_buf;
+    SliceBuffer tls_in_buf;
     u8* tls_out_slice;  // ciphertext to send: handshake flights + encrypted app data
-    Buffer tls_out_buf;
+    SliceBuffer tls_out_buf;
     // A tls_out_buf send is in flight; the buffer cannot be reused until its CQE.
     bool tls_out_inflight;
     // Bytes the in-flight raw send covers. Read-ahead may append more ciphertext
@@ -1553,7 +1543,7 @@ struct ConnectionBase {
 
     // Body streaming state (proxy large body support)
     u32 req_header_end;        // offset past request headers (\r\n\r\n)
-    u32 req_content_length;    // original Content-Length value (for send capping)
+    i64 req_content_length;    // original Content-Length value (for send capping)
     u32 req_initial_send_len;  // max bytes to send in initial upstream forward
     // Idle-reuse retry snapshot length. When a request is forwarded to a REUSED
     // pooled upstream socket, recv_buf is reset at request-sent (so pipelined
@@ -1693,23 +1683,22 @@ struct ConnectionBase {
             req_header_end > req_initial_send_len || !recv_buf.valid() || recv_buf.is_released())
             return invalid;
 
-        const u32 capacity = recv_buf.capacity();
+        const u32 capacity = recv_buf.capacity_u32();
         const u32 count = recv_buf.len();
         if (recv_slice == nullptr || recv_slice_capacity == 0 || capacity != recv_slice_capacity ||
             count > capacity || req_header_end > count || req_initial_send_len > count ||
             req_raw_target_offset >= req_header_end)
             return invalid;
-        const i64 target_end =
-            static_cast<i64>(req_raw_target_offset) + static_cast<i64>(req_raw_target_length);
-        if (target_end >= static_cast<i64>(req_header_end) ||
-            target_end > static_cast<i64>(count) || target_end > static_cast<i64>(capacity))
+        const i64 target_end = i64{req_raw_target_offset} + i64{req_raw_target_length};
+        if (target_end >= i64{req_header_end} || target_end > i64{count} ||
+            target_end > i64{capacity})
             return invalid;
 
         const u8* base = recv_buf.data();
         const uintptr_t address = reinterpret_cast<uintptr_t>(base);
         uintptr_t address_end = 0;
         if (base != recv_slice || address < 4096 ||
-            __builtin_add_overflow(address, static_cast<uintptr_t>(capacity), &address_end))
+            !raw_byte_span_address_end(base, capacity, &address_end))
             return invalid;
 
         const char* method = nullptr;
@@ -1767,9 +1756,9 @@ struct ConnectionBase {
         // Bounds above are proven before these bytes are examined.
         const bool h10 = req_http_version == static_cast<u8>(HttpVersion::Http10);
         const bool h11 = req_http_version == static_cast<u8>(HttpVersion::Http11);
-        if ((!h10 && !h11) || base[static_cast<i64>(req_raw_target_offset) - 1] != ' ' ||
+        if ((!h10 && !h11) || base[i64{req_raw_target_offset} - 1] != ' ' ||
             base[req_raw_target_offset] != '/' || base[target_end] != ' ' ||
-            target_end + 11 > static_cast<i64>(req_header_end) || base[target_end + 1] != 'H' ||
+            target_end + 11 > i64{req_header_end} || base[target_end + 1] != 'H' ||
             base[target_end + 2] != 'T' || base[target_end + 3] != 'T' ||
             base[target_end + 4] != 'P' || base[target_end + 5] != '/' ||
             base[target_end + 6] != '1' || base[target_end + 7] != '.' ||
@@ -1777,7 +1766,7 @@ struct ConnectionBase {
             base[target_end + 9] != '\r' || base[target_end + 10] != '\n')
             return invalid;
         return {RawRequestTargetWitnessState::Valid,
-                {reinterpret_cast<const char*>(base + static_cast<i64>(req_raw_target_offset)),
+                {reinterpret_cast<const char*>(base + i64{req_raw_target_offset}),
                  req_raw_target_length}};
     }
 
@@ -1843,7 +1832,7 @@ struct ConnectionBase {
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
     bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
     BodyMode req_body_mode;
-    u32 req_body_remaining;          // bytes left for request body (Content-Length)
+    i64 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
     // True once any request-body byte has started streaming upstream (recv_buf is
     // reset + refilled with body chunks, so the original headers+body are gone).
@@ -1851,9 +1840,9 @@ struct ConnectionBase {
     // reused-socket retry predicate refuses it. Reset at the per-request boundary.
     bool req_body_streamed;
     BodyMode resp_body_mode;
-    u32 resp_body_remaining;          // bytes left for Content-Length mode
+    i64 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
-    u32 resp_body_sent;               // total response body bytes sent (for access log)
+    i64 resp_body_sent;               // total response body bytes sent (for access log)
     u32 upstream_send_len;            // bytes from upstream_recv_buf in current client send
 
     // io_uring multishot recv tracking: true while the multishot SQE is
@@ -1964,10 +1953,10 @@ struct ConnectionBase {
     // Access-log metadata captured from the request/peer.
     u8 req_method;
     // Raw HTTP/1 request bytes received downstream and assigned to this request boundary.
-    u32 downstream_req_size;
+    i64 downstream_req_size;
     // Internal request/upstream-policy length bookkeeping; not the preserved downstream access
     // size or actual partial-send telemetry.
-    u32 req_size;
+    i64 req_size;
     u32 peer_addr;
     u16 peer_port;
     char routing_host_bytes[254]{};
@@ -2046,8 +2035,8 @@ struct ConnectionBase {
     // Last actual origin write, used only by the opt-in upload idle timeout.
     u64 upstream_write_idle_progress_us = 0;
     u8* send_slice;
-    Buffer recv_buf;
-    Buffer send_buf;
+    SliceBuffer recv_buf;
+    SliceBuffer send_buf;
     // JSON results own slices until the request completes. Never point a
     // pending response at a thread-local helper workspace.
     SliceArena json_arena{};
@@ -2073,7 +2062,7 @@ struct ConnectionBase {
     // 3. Client Recv during response streaming polluting upstream body data
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
-    Buffer upstream_recv_buf;
+    SliceBuffer upstream_recv_buf;
     ResponseBodyChain response_body_tail{};
     ChainDirectRecvOwner chain_direct_recv_owner{};
     RelayOwner relay_owner{};
@@ -2124,7 +2113,7 @@ struct ConnectionBase {
         const auto* next = response_body_tail.head->next;
         return response_send_vector.first_source == buffered_response_data() &&
                response_send_vector.second_source ==
-                   ResponseBodyChain::payload(next) + static_cast<i64>(next->offset) &&
+                   ResponseBodyChain::payload(next) + i64{next->offset} &&
                response_send_vector.first_size == first && response_send_vector.total_size == len;
     }
     u32 buffered_response_len() const {
@@ -2196,7 +2185,7 @@ struct ConnectionBase {
     void reset() {
         // Loop retirement must release this CPU-only slice before slot reuse.
         if (ws_handshake_slice != nullptr || ws_handshake_phase != WsHandshakePhase::None)
-            __builtin_trap();
+            RUT_TRAP("Connection %u reset before releasing its WebSocket handshake slice", id);
         json_arena.destroy();
         jit_response_body = {};
         jit_response_body_valid = false;
@@ -2338,8 +2327,8 @@ struct ConnectionBase {
         ws_forward_text_count = 0;
         ws_c2u.reset();
         ws_u2c.reset();
-        ws_c2u.message_len = 0;
-        ws_u2c.message_len = 0;
+        ws_c2u.message_len = {};
+        ws_u2c.message_len = {};
         ws_c2u_msg = nullptr;
         ws_u2c_msg = nullptr;
         ws_c2u_out = nullptr;

@@ -8,26 +8,23 @@ using namespace rut;
 
 namespace {
 // Round-trip a frame header through write + parse.
-Http2FrameHeader roundtrip(u32 length, Http2FrameType type, u8 flags, u32 stream_id) {
+[[nodiscard]] ParseStatus roundtrip(
+    u32 length, Http2FrameType type, u8 flags, u32 stream_id, Http2FrameHeader* out) {
     u8 buf[kFrameHeaderSize];
     Http2FrameHeader in;
     in.length = length;
     in.type = static_cast<u8>(type);
     in.flags = flags;
     in.stream_id = stream_id;
-    write_frame_header(buf, in);
-    Http2FrameHeader out;
-    out.length = 0;
-    out.type = 0;
-    out.flags = 0;
-    out.stream_id = 0;
-    parse_frame_header(buf, sizeof(buf), &out);
-    return out;
+    const u32 written = write_frame_header(buf, in);
+    return parse_frame_header(buf, written, out);
 }
 }  // namespace
 
 TEST(http2_frame, header_roundtrip) {
-    Http2FrameHeader h = roundtrip(16384, Http2FrameType::Data, http2_flag::kEndStream, 5);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(roundtrip(16384, Http2FrameType::Data, http2_flag::kEndStream, 5, &h),
+               ParseStatus::Complete);
     CHECK_EQ(h.length, 16384u);
     CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Data));
     CHECK_EQ(h.flags, http2_flag::kEndStream);
@@ -36,7 +33,9 @@ TEST(http2_frame, header_roundtrip) {
 
 TEST(http2_frame, header_max_values) {
     // Max 24-bit length, max 31-bit stream id.
-    Http2FrameHeader h = roundtrip(0xffffff, Http2FrameType::Headers, 0xff, 0x7fffffff);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(roundtrip(0xffffff, Http2FrameType::Headers, 0xff, 0x7fffffff, &h),
+               ParseStatus::Complete);
     CHECK_EQ(h.length, 0xffffffu);
     CHECK_EQ(h.stream_id, 0x7fffffffu);
     CHECK_EQ(h.flags, 0xffu);
@@ -64,9 +63,9 @@ TEST(http2_frame, write_truncates_oversized_fields) {
     in.type = static_cast<u8>(Http2FrameType::Ping);
     in.flags = 0;
     in.stream_id = 0xffffffffu;  // -> 0x7fffffff after 31-bit mask
-    write_frame_header(buf, in);
+    REQUIRE_EQ(write_frame_header(buf, in), kFrameHeaderSize);
     Http2FrameHeader out;
-    parse_frame_header(buf, sizeof(buf), &out);
+    CHECK_EQ(parse_frame_header(buf, sizeof(buf), &out), ParseStatus::Complete);
     CHECK_EQ(out.length, 0x000001u);
     CHECK_EQ(out.stream_id, 0x7fffffffu);
 }
@@ -206,7 +205,7 @@ TEST(http2_frame, settings_ack) {
     u32 n = write_settings_ack(buf);
     CHECK_EQ(n, kFrameHeaderSize);
     Http2FrameHeader h;
-    parse_frame_header(buf, n, &h);
+    CHECK_EQ(parse_frame_header(buf, n, &h), ParseStatus::Complete);
     CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Settings));
     CHECK_EQ(h.flags, http2_flag::kAck);
     CHECK_EQ(h.length, 0u);
@@ -217,7 +216,7 @@ TEST(http2_frame, goaway) {
     u32 n = write_goaway(buf, 7, Http2Error::ProtocolError);
     CHECK_EQ(n, kFrameHeaderSize + 8u);
     Http2FrameHeader h;
-    parse_frame_header(buf, n, &h);
+    CHECK_EQ(parse_frame_header(buf, n, &h), ParseStatus::Complete);
     CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Goaway));
     CHECK_EQ(h.length, 8u);
     CHECK_EQ(h.stream_id, 0u);
@@ -232,7 +231,7 @@ TEST(http2_frame, window_update) {
     u32 n = write_window_update(buf, 3, 65535);
     CHECK_EQ(n, kFrameHeaderSize + 4u);
     Http2FrameHeader h;
-    parse_frame_header(buf, n, &h);
+    CHECK_EQ(parse_frame_header(buf, n, &h), ParseStatus::Complete);
     CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::WindowUpdate));
     CHECK_EQ(h.stream_id, 3u);
     CHECK_EQ(h.length, 4u);
@@ -243,7 +242,7 @@ TEST(http2_frame, rst_stream) {
     u32 n = write_rst_stream(buf, 9, Http2Error::Cancel);
     CHECK_EQ(n, kFrameHeaderSize + 4u);
     Http2FrameHeader h;
-    parse_frame_header(buf, n, &h);
+    CHECK_EQ(parse_frame_header(buf, n, &h), ParseStatus::Complete);
     CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::RstStream));
     CHECK_EQ(h.stream_id, 9u);
     CHECK_EQ(h.length, 4u);

@@ -3,6 +3,7 @@
 // Shared test infrastructure — mock event loop, real socket helpers.
 
 #include "mock_backend.h"
+#include "rut/common/trap.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/connection.h"
 #ifdef __APPLE__
@@ -198,7 +199,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
 
     void free_ws_handshake_slice(u8* slice) {
         if (slice == nullptr) return;
-        if (slice != ws_handshake_storage || !ws_handshake_in_use) __builtin_trap();
+        if (slice != ws_handshake_storage || !ws_handshake_in_use)
+            RUT_TRAP("Test fixture released an unowned WebSocket handshake slice");
         ws_handshake_in_use = false;
         ws_handshake_free_calls++;
     }
@@ -220,7 +222,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         if (!ws_terminate_in_use || c.id != ws_terminate_owner_id) return;
         if (c.ws_c2u_msg != ws_terminate_storage[0] || c.ws_u2c_msg != ws_terminate_storage[1] ||
             c.ws_c2u_out != ws_terminate_storage[2] || c.ws_u2c_out != ws_terminate_storage[3])
-            __builtin_trap();
+            RUT_TRAP("Test fixture WebSocket buffer ownership mismatch");
         c.ws_c2u_msg = nullptr;
         c.ws_u2c_msg = nullptr;
         c.ws_c2u_out = nullptr;
@@ -367,7 +369,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                 break;
             }
             case IoEventType::Timeout:
-                timer.tick([this](Connection* c) {
+                timer.advance([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
                     if (ws_handle_timer_tick(this, *c)) return;
 #endif
@@ -853,7 +855,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                 }
                 break;
             case IoEventType::Timeout:
-                timer.tick([this](Connection* c) {
+                timer.advance([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
                     if (ws_handle_timer_tick(this, *c)) return;
 #endif
@@ -1296,7 +1298,7 @@ inline bool send_all(i32 fd, const char* d, u32 len) {
 inline i64 test_mono_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+    return i64{ts.tv_sec} * 1000 + ts.tv_nsec / 1'000'000;
 }
 
 inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
@@ -1311,7 +1313,7 @@ inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
         if (left < 1) left = 1;
         struct timeval tv;
         tv.tv_sec = left / 1000;
-        tv.tv_usec = static_cast<long>(left % 1000) * 1000L;
+        tv.tv_usec = long{left % 1000} * 1000L;
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         ssize_t n = recv(fd, buf, len, 0);
         if (n >= 0) return static_cast<i32>(n);
@@ -1367,7 +1369,7 @@ struct LoopThread {
     static i64 mono_ms() {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+        return i64{ts.tv_sec} * 1000 + ts.tv_nsec / 1'000'000;
     }
     static void* run(void* arg) {
         auto* lt = static_cast<LoopThread*>(arg);
@@ -1451,8 +1453,7 @@ static void inject_upstream_response(Loop& loop, Connection& conn) {
     u8* dst = conn.upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
     conn.upstream_recv_buf.commit(kMockHttpResponseLen);
-    IoEvent ev =
-        make_ev(conn.id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    IoEvent ev = make_ev(conn.id, IoEventType::UpstreamRecv, i32{kMockHttpResponseLen});
     // Inject directly without going through inject_and_dispatch (which would
     // overwrite our carefully crafted upstream_recv_buf with garbage bytes).
     loop.backend.inject(ev);

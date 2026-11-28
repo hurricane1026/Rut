@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -43,14 +45,13 @@ namespace epoll_yield {
 // their sizes from this single source so they can't drift.
 static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
 
-inline u64 monotonic_ns() {
+[[nodiscard]] inline u64 monotonic_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     u64 seconds = 0;
-    if (__builtin_mul_overflow(static_cast<u64>(ts.tv_sec), u64{1'000'000'000}, &seconds))
-        return UINT64_MAX;
+    if (mul_overflow(static_cast<u64>(ts.tv_sec), u64{1'000'000'000}, &seconds)) return UINT64_MAX;
     u64 result = 0;
-    if (__builtin_add_overflow(seconds, static_cast<u64>(ts.tv_nsec), &result)) return UINT64_MAX;
+    if (add_overflow(seconds, static_cast<u64>(ts.tv_nsec), &result)) return UINT64_MAX;
     return result;
 }
 
@@ -70,8 +71,7 @@ struct YieldHeap {
     // entries that linger briefly between close and their deadline.
     // Derived from the shared epoll_yield::kMaxConns so the heap and
     // EpollEventLoop always agree on capacity.
-    static constexpr u32 kCap =
-        static_cast<u32>(static_cast<i64>(kMaxConns) + static_cast<i64>(256));
+    static constexpr u32 kCap = u32{i64{kMaxConns} + i64{256}};
     MappedArray<Entry> entries;
     u32 capacity = 0;
     u32 size = 0;
@@ -103,9 +103,7 @@ struct YieldHeap {
     const Entry& top() const { return entries[0]; }
 
     bool push(u64 deadline_ns, u32 handler_gen, u32 conn_id) {
-        if (capacity == 0 ||
-            static_cast<i64>(size) >= static_cast<i64>(capacity) + static_cast<i64>(256))
-            return false;
+        if (capacity == 0 || i64{size} >= i64{capacity} + i64{256}) return false;
         u32 i = size++;
         entries[i] = {deadline_ns, handler_gen, conn_id};
         sift_up(i);
@@ -277,7 +275,7 @@ public:
         }
         if (!capture_region_) {
             void* region = mmap(nullptr,
-                                static_cast<size_t>(connection_capacity) * kCaptureSliceSize,
+                                size_t{connection_capacity} * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS,
                                 -1,
@@ -290,8 +288,7 @@ public:
         }
         for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf =
-                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
+                conns[i].capture_buf = capture_region_ + i64{i} * i64{kCaptureSliceSize};
         }
         return true;
     }
@@ -411,7 +408,7 @@ public:
                     running_.store(false, std::memory_order_relaxed);
                 } else {
                     u64 deadline = 0;
-                    if (__builtin_add_overflow(start, static_cast<u64>(period), &deadline))
+                    if (add_overflow(start, static_cast<u64>(period), &deadline))
                         deadline = UINT64_MAX;
                     if (monotonic_secs() < deadline) continue;
                     force_close_all();
@@ -457,17 +454,13 @@ public:
 
     void epoch_enter() {
         if (epoch) {
-            u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
-            u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
@@ -479,7 +472,7 @@ public:
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
-            munmap(capture_region_, static_cast<u64>(connection_capacity) * kCaptureSliceSize);
+            munmap(capture_region_, u64{connection_capacity} * kCaptureSliceSize);
             capture_region_ = nullptr;
         }
         destroy_slot_storage();
@@ -683,8 +676,7 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf =
-                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
+            conns[id].capture_buf = capture_region_ + i64{id} * i64{kCaptureSliceSize};
         return &conns[id];
     }
 
@@ -747,7 +739,7 @@ public:
                !c.request_body_fully_buffered && !c.req_body_streamed &&
                c.request_upload_complete && c.throttle_down_bps == 0 && c.http_cache_ttl == 0 &&
                c.http_cache_mutation_host == 0 && !c.is_ws_terminate_route && !c.h1_tls_upstream &&
-               c.resp_body_remaining >= 64 * 1024 && c.upstream_recv_buf.len() == 0 &&
+               c.resp_body_remaining >= i64{64} * 1024 && c.upstream_recv_buf.len() == 0 &&
                !c.upstream_recv_armed && !c.upstream_recv_direct_armed && !c.upstream_send_armed &&
                !c.send_armed && c.upstream_relay_send_len == 0 && !c.relay_owner.active() &&
                c.relay_owner.segment_len == 0 && c.relay_owner.segment_sent == 0 &&
@@ -763,7 +755,7 @@ public:
         if (send_len == 0 || c.upstream_recv_buf.len() != send_len) return false;
         // Eligibility is checked again after the ordinary prefix send retires.
         if (c.tls_active || c.response_policy_id != 0 ||
-            c.resp_body_mode != BodyMode::ContentLength || c.resp_body_remaining < 64 * 1024 ||
+            c.resp_body_mode != BodyMode::ContentLength || c.resp_body_remaining < i64{64} * 1024 ||
             c.throttle_down_bps != 0 || c.http_cache_ttl != 0 || c.http_cache_mutation_host != 0 ||
             !c.response_read_deadline_owner_is_neutral())
             return false;
@@ -800,7 +792,7 @@ public:
             int fds[2];
             if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
             if (::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize) <
-                static_cast<i32>(kResponseSpliceChunkSize)) {
+                i32{kResponseSpliceChunkSize}) {
                 ::close(fds[0]);
                 ::close(fds[1]);
                 return false;
@@ -844,10 +836,22 @@ public:
         // ready connections can run before this owner gets another turn.
         for (u32 calls = 0; calls < 4; ++calls) {
             const bool writing = r.segment_len != 0;
-            const u32 want = writing ? static_cast<u32>(static_cast<i64>(r.segment_len) -
-                                                        static_cast<i64>(r.segment_sent))
-                                     : (c.resp_body_remaining < kResponseSpliceChunkSize
-                                            ? c.resp_body_remaining
+            if (writing && r.segment_sent > r.segment_len) {
+                this->close_conn(c);
+                return;
+            }
+            if (!writing && c.resp_body_remaining < 0) {
+                this->close_conn(c);
+                return;
+            }
+            const u32 want = writing ? (range_int(r.segment_len) - range_int(r.segment_sent))
+                                           .max(range_int(u32{0}))
+                                           .to<u32>()
+                                     : (c.resp_body_remaining < i64{kResponseSpliceChunkSize}
+                                            ? range_int(c.resp_body_remaining)
+                                                  .max(range_int(u32{0}))
+                                                  .min(range_int(UINT32_MAX))
+                                                  .to<u32>()
                                             : kResponseSpliceChunkSize);
             ssize_t n;
             do {
@@ -874,7 +878,11 @@ public:
             }
             if (writing) {
                 r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
-                c.resp_body_sent = static_cast<u32>(static_cast<i64>(c.resp_body_sent) + n);
+                if (i64{n} > INT64_MAX - c.resp_body_sent) {
+                    this->close_conn(c);
+                    return;
+                }
+                c.resp_body_sent += i64{n};
                 if (r.segment_sent == r.segment_len) r.segment_len = r.segment_sent = 0;
                 if (r.segment_len == 0 && c.resp_body_remaining == 0) {
                     const i32 pipe_read = r.pipe_read, pipe_write = r.pipe_write;
@@ -891,10 +899,16 @@ public:
             } else {
                 r.segment_len = static_cast<u32>(n);
                 r.segment_sent = 0;
-                r.body_bytes = static_cast<u32>(static_cast<i64>(r.body_bytes) +
-                                                static_cast<i64>(r.segment_len));
-                c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
-                                                         static_cast<i64>(r.segment_len));
+                if (i64{r.segment_len} > INT64_MAX - r.body_bytes) {
+                    this->close_conn(c);
+                    return;
+                }
+                r.body_bytes += i64{r.segment_len};
+                if (i64{r.segment_len} > c.resp_body_remaining) {
+                    this->close_conn(c);
+                    return;
+                }
+                c.resp_body_remaining -= i64{r.segment_len};
             }
             timer.refresh(&c,
                           c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
@@ -1069,10 +1083,9 @@ public:
         // recv interest until the next submit_recv rearms it.
         backend.pause_recv(conn.id);
         u64 now = epoll_yield::monotonic_ns();
-        u64 delay_ns = 0;
-        if (__builtin_mul_overflow(static_cast<u64>(ms), u64{1'000'000}, &delay_ns)) return false;
+        const u64 delay_ns = range_int(ms).scaled_by<1'000'000>().to_u64();
         u64 deadline = 0;
-        if (__builtin_add_overflow(now, delay_ns, &deadline)) deadline = UINT64_MAX;
+        if (add_overflow(now, delay_ns, &deadline)) deadline = UINT64_MAX;
         if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
             conn.yield_armed = true;
             rearm_yield_timerfd();
@@ -1123,8 +1136,7 @@ public:
         if (!conn.ws_shutdown_deadline_armed)
             timer.remove(&conn);  // precise timer owns the wakeup; off the keepalive wheel
         u64 kDeadline = 0;
-        if (__builtin_add_overflow(epoll_yield::monotonic_ns(), delay_ns, &kDeadline))
-            kDeadline = UINT64_MAX;
+        if (add_overflow(epoll_yield::monotonic_ns(), delay_ns, &kDeadline)) kDeadline = UINT64_MAX;
         if (yield_heap.push(kDeadline, conn.handler_gen, conn.id)) {
             rearm_yield_timerfd();
             return true;
@@ -1229,7 +1241,7 @@ public:
                 break;
             case IoEventType::Timeout: {
                 i32 ticks = ev.result > 0 ? ev.result : 1;
-                const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
+                const i32 max_ticks = i32{TimerWheel::kSlots};
                 if (ticks > max_ticks) ticks = max_ticks;
                 const bool catchup_reaches_probe_timeout =
                     ticks > 1 && ticks >= static_cast<i32>(upstream_timeout);
@@ -1248,7 +1260,7 @@ public:
                 if (!catchup_reaches_probe_timeout && !is_draining())
                     request_health_sweep_after_batch();
                 for (i32 t = 0; t < ticks; t++) {
-                    timer.tick([this](Connection* c) {
+                    timer.advance([this](Connection* c) {
                         // A stalled active health probe: it accepted the connect
                         // (or stayed pending) but never produced a parseable
                         // response within upstream_timeout. Record a health FAILURE

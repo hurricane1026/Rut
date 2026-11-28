@@ -73,8 +73,11 @@ struct TlsOrigin {
             const int fd = accept(self.listener, nullptr, nullptr);
             if (fd < 0) continue;
             timeval timeout{2, 0};
-            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-            (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+                close(fd);
+                continue;
+            }
             SSL* ssl = SSL_new(self.context);
             if (ssl && SSL_set_fd(ssl, fd) == 1 && SSL_accept(ssl) == 1) {
                 u32 length = 0;
@@ -169,8 +172,9 @@ TEST(https_fetch, bounded_json_response_framing_fragmentation_and_limits) {
     for (const char* response : invalid) {
         BoundedJsonResponse parser;
         parser.reset();
-        (void)parser.append(text(response));
-        CHECK_EQ(parser.finish(), BoundedJsonResponse::Result::Error);
+        const auto result = parser.append(text(response));
+        if (result != BoundedJsonResponse::Result::Error)
+            CHECK_EQ(parser.finish(), BoundedJsonResponse::Result::Error);
         CHECK(parser.body().ptr == nullptr);
     }
     BoundedJsonResponse parser;
@@ -263,8 +267,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
                   static_cast<long long>(now),
                   static_cast<long long>(now + 600))
             : 0;
-    if (access && (claims_size <= 0 || claims_size >= static_cast<int>(sizeof(access_claims))))
-        return 2;
+    if (access && (claims_size <= 0 || claims_size >= int{sizeof(access_claims)})) return 2;
     const Str claims =
         access ? Str{access_claims, static_cast<u32>(strlen(access_claims))}
         : discovery
@@ -317,7 +320,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"other-client","jti":"access-bad-client","scope":"orders:read"})",
             static_cast<long long>(now),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_client =
             first.sign(header, {altered, static_cast<u32>(length)}, bad_client_bytes);
         length = snprintf(
@@ -326,7 +329,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-scope","scope":"orders:write"})",
             static_cast<long long>(now),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_scope =
             first.sign(header, {altered, static_cast<u32>(length)}, bad_scope_bytes);
         length = snprintf(
@@ -335,7 +338,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-iat","scope":"orders:read"})",
             static_cast<long long>(now + 301),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_iat = first.sign(header, {altered, static_cast<u32>(length)}, bad_iat_bytes);
         length = snprintf(
             altered,
@@ -343,7 +346,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"","scope":"orders:read"})",
             static_cast<long long>(now),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_jti = first.sign(header, {altered, static_cast<u32>(length)}, bad_jti_bytes);
         const Str bad_kid = first.sign(Fixture::unapproved_access_header, claims, bad_kid_bytes);
         const Str bad_type = first.sign(Fixture::wrong_type_access_header, claims, bad_type_bytes);
@@ -459,7 +462,7 @@ static void remote_rotation(test::TestCase* _tc) {
     u32 length = 7;
     const auto verify = [&](u32 shard, Str token, u64 now) {
         const bool valid = policies.verify(
-            shard, policy, document, token, 100, payload, sizeof(payload), length, now);
+            shard, policy, document, token, 100, payload, sizeof(payload), &length, now);
         if (!valid) {
             CHECK_EQ(length, 0u);
             CHECK(!document.valid);
@@ -653,7 +656,7 @@ static void remote_new_kid_admission(test::TestCase* _tc) {
     REQUIRE(stale.len);
     u32 length = 9;
     CHECK(!policies.verify(
-        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), length, 100));
+        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), &length, 100));
     CHECK_EQ(length, 0u);
     const auto refresh = [&](u64 now, u32 expected) {
         u32 completed = 0;
@@ -667,19 +670,19 @@ static void remote_new_kid_admission(test::TestCase* _tc) {
     };
     REQUIRE(refresh(100, 1));
     CHECK(policies.verify(
-        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), length, 100));
+        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), &length, 100));
     CHECK(!policies.verify(
-        0, policy_bytes, document, stale, 100, payload, sizeof(payload), length, 100));
+        0, policy_bytes, document, stale, 100, payload, sizeof(payload), &length, 100));
     // A malformed refresh keeps the admitted bank only within its original age.
     REQUIRE(refresh(1100, 2));
     CHECK(policies.verify(
-        0, policy_bytes, document, admitted, 1100, payload, sizeof(payload), length, 1100));
+        0, policy_bytes, document, admitted, 1100, payload, sizeof(payload), &length, 1100));
     CHECK(!policies.verify(
-        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), length, 2100));
+        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), &length, 2100));
     // An authoritative empty set removes the admitted keys immediately.
     REQUIRE(refresh(2100, 3));
     CHECK(!policies.verify(
-        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), length, 2100));
+        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), &length, 2100));
     policies.cancel(0);
 }
 
@@ -830,12 +833,14 @@ static void failed_remote_activation(test::TestCase* _tc) {
     const Str token = fixture.sign(Fixture::header, Fixture::claims, token_bytes);
     json::Document document;
     u32 length = 99;
-    CHECK(!policies.verify(0, policy, document, token, 100, payload, sizeof(payload), length, 100));
+    CHECK(
+        !policies.verify(0, policy, document, token, 100, payload, sizeof(payload), &length, 100));
     CHECK_EQ(length, 0u);
     CHECK(!document.valid);
     policies.maintain(0, 100);
     policies.cancel(0);
-    CHECK(!policies.verify(0, policy, document, token, 100, payload, sizeof(payload), length, 100));
+    CHECK(
+        !policies.verify(0, policy, document, token, 100, payload, sizeof(payload), &length, 100));
 }
 
 TEST(https_fetch, failed_tls_activation_cannot_serve_bootstrap_or_initialize_on_verification) {
@@ -1484,7 +1489,7 @@ struct DnsOrigin {
             answer[sizeof(answer) - 1] = second;
             __builtin_memcpy(packet + length + sizeof(answer), answer, sizeof(answer));
         }
-        const auto kResponseSize = length + packet[7] * static_cast<ssize_t>(sizeof(answer));
+        const auto kResponseSize = length + packet[7] * ssize_t{sizeof(answer)};
         return sendto(fd,
                       packet,
                       static_cast<u32>(kResponseSize),

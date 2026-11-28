@@ -3,6 +3,8 @@
 // HTTP/2 WebSocket transport adapters. Included after the shared bounded
 // exchange pump. HTTP/1 upstreams own a dedicated Connection and its ordinary
 // send slice, so cancellation never frees bytes referenced by kernel I/O.
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/chunked_parser.h"
 
 #include <sys/socket.h>
@@ -46,7 +48,7 @@ bool h2ws_h1_pause(Loop* loop, Connection& c) {
 }
 
 template <typename Loop>
-bool h2ws_h1_tls_finished(Loop* loop, Connection& c) {
+[[nodiscard]] bool h2ws_h1_tls_finished(Loop*, Connection& c) {
     c.ws_tls_shutdown_pending = c.ws_tls_shutdown_need_read = false;
     c.ws_upstream_send_pending = false;
     c.on_send = nullptr;
@@ -58,7 +60,6 @@ bool h2ws_h1_tls_finished(Loop* loop, Connection& c) {
             x->request_end_sent = true;
     }
     c.ws_client_write_shutdown = true;
-    (void)loop;
     return true;
 }
 
@@ -100,11 +101,11 @@ void h2ws_h1_drive(Loop* loop, Connection& c) {
             loop->close_conn(c);
             return;
         }
-        c.send_buf.write(x->request_headers, n);
+        c.send_buf.append_prefix(x->request_headers, n);
         x->request_headers_sent = true;
     } else if (x->ws_accepted && output_len) {
-        n = output_len < c.send_buf.capacity() ? output_len : c.send_buf.capacity();
-        c.send_buf.write(output, n);
+        n = output_len < c.send_buf.capacity() ? output_len : c.send_buf.capacity_u32();
+        c.send_buf.append_prefix(output, n);
         grpc_consume_output(*x, true, n);
     } else if (x->ws_accepted && !x->upload_len && x->request_end && !x->request_end_sent) {
         if (c.tls_active) {
@@ -140,13 +141,13 @@ void h2ws_h1_drive(Loop* loop, Connection& c) {
     if (down) grpc_kick_downstream(loop, *down);
 }
 
-inline bool h2ws_h1_response_headers(Connection& c,
-                                     GrpcExchange& x,
-                                     const ParsedResponse& response,
-                                     hpack::Header* headers,
-                                     u32* count,
-                                     char* names,
-                                     u32 capacity) {
+[[nodiscard]] inline bool h2ws_h1_response_headers(Connection& c,
+                                                   GrpcExchange& x,
+                                                   const ParsedResponse& response,
+                                                   hpack::Header* headers,
+                                                   u32* count,
+                                                   char* names,
+                                                   u32 capacity) {
     if (response.headers_truncated || response.content_length_count > 1 ||
         (response.chunked && response.has_content_length))
         return false;
@@ -184,16 +185,17 @@ inline bool h2ws_h1_response_headers(Connection& c,
                 u32 end = start;
                 while (end < connection.value.len && connection.value.ptr[end] != ',') ++end;
                 u32 last = end;
-                while (last > start && (connection.value.ptr[static_cast<i64>(last) - 1] == ' ' ||
-                                        connection.value.ptr[static_cast<i64>(last) - 1] == '\t'))
+                while (last > start && (connection.value.ptr[i64{last} - 1] == ' ' ||
+                                        connection.value.ptr[i64{last} - 1] == '\t'))
                     --last;
-                u32 token_len = 0;
-                (void)__builtin_sub_overflow(last, start, &token_len);
-                nominated |= http_header_name_eq_ci(h.name.ptr,
-                                                    h.name.len,
-                                                    connection.value.ptr + static_cast<i64>(start),
-                                                    token_len);
-                (void)__builtin_add_overflow(end, 1u, &start);
+                const u32 token_len =
+                    (range_int(last) - range_int(start)).max(range_int<0, 1>{}).to<u32>();
+                nominated |= http_header_name_eq_ci(
+                    h.name.ptr, h.name.len, connection.value.ptr + i64{start}, token_len);
+                if (end == connection.value.len) break;
+                start = (range_int(end) + range_int<1, 2>{})
+                            .min(range_int(connection.value.len))
+                            .to<u32>();
             }
         }
         if (nominated && kUpgraded &&
@@ -202,16 +204,16 @@ inline bool h2ws_h1_response_headers(Connection& c,
             return false;
         if (nominated) continue;
         u32 available = 0;
-        if (*count >= Http2Conn::kMaxHeadersPerReq ||
-            __builtin_sub_overflow(capacity, used, &available) || h.name.len > available)
+        if (*count >= Http2Conn::kMaxHeadersPerReq || sub_overflow(capacity, used, &available) ||
+            h.name.len > available)
             return false;
         for (u32 j = 0; j < h.name.len; ++j) {
             const char kCh = h.name.ptr[j];
-            names[static_cast<i64>(used) + static_cast<i64>(j)] =
+            names[i64{used} + i64{j}] =
                 kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
         }
-        headers[(*count)++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
-        (void)__builtin_add_overflow(used, h.name.len, &used);
+        headers[(*count)++] = {{names + i64{used}, h.name.len}, h.value};
+        used = (range_int(used) + range_int(h.name.len)).min(range_int(capacity)).to<u32>();
     }
     if (!kUpgraded) {
         c.resp_body_mode = response.status_code == 304   ? BodyMode::None
@@ -302,15 +304,16 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
     }
     while (g.websocket_http1_headers && !x->response_end && c.recv_buf.len() &&
            x->download_len < sizeof(x->download)) {
-        u32 n = 0;
-        (void)__builtin_sub_overflow(static_cast<u32>(sizeof(x->download)), x->download_len, &n);
+        constexpr i64 kCapacity = sizeof(x->download);
+        const auto kAvailable = range_int<kCapacity, kCapacity + 1>{} - range_int(x->download_len);
+        u32 n = kAvailable.max(range_int<0, 1>{}).to<u32>();
         if (n > c.recv_buf.len()) n = c.recv_buf.len();
         u32 consumed = n, start = 0, produced = n;
         if (!x->ws_accepted) {
             if (c.resp_body_mode == BodyMode::ContentLength) {
                 if (n > c.resp_body_remaining) n = c.resp_body_remaining;
                 consumed = produced = n;
-                (void)__builtin_sub_overflow(c.resp_body_remaining, n, &c.resp_body_remaining);
+                c.resp_body_remaining -= i64{n};
             } else if (c.resp_body_mode == BodyMode::Chunked) {
                 const auto kResult =
                     c.resp_chunk_parser.feed(c.recv_buf.data(), n, &consumed, &start, &produced);
@@ -325,11 +328,16 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
                 break;
             }
         }
+        u32 buffered;
+        if (!(range_int(x->download_len) + range_int(produced)).to(&buffered) ||
+            buffered > kCapacity) {
+            x->failure = 13;
+            break;
+        }
         if (produced)
-            __builtin_memcpy(x->download + static_cast<i64>(x->download_len),
-                             c.recv_buf.data() + static_cast<i64>(start),
-                             produced);
-        (void)__builtin_add_overflow(x->download_len, produced, &x->download_len);
+            __builtin_memcpy(
+                x->download + i64{x->download_len}, c.recv_buf.data() + i64{start}, produced);
+        x->download_len = buffered;
         if (x->ws && x->ws_accepted && !ws_h2_process(*x, false)) x->failure = 13;
         c.consume_request_receive_buffer(consumed);
         if (!x->ws_accepted && c.resp_body_mode == BodyMode::ContentLength &&

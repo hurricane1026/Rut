@@ -10,10 +10,11 @@
 
 EVP_PKEY* rut_crypto_ec_load_der_internal(const uint8_t* der, uint32_t length) {
     if (!der || !length || length > 8192) return 0;
+    const int64_t der_length = length;
     const uint8_t* cursor = der;
-    EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, length);
+    EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, der_length);
     if (!candidate) return 0;
-    if (cursor != der + (int64_t)length || EVP_PKEY_id(candidate) != EVP_PKEY_EC) goto fail;
+    if (cursor != der + der_length || EVP_PKEY_id(candidate) != EVP_PKEY_EC) goto fail;
     const EC_KEY* ec = EVP_PKEY_get0_EC_KEY(candidate);
     const EC_GROUP* group = ec ? EC_KEY_get0_group(ec) : 0;
     const EC_POINT* point = ec ? EC_KEY_get0_public_key(ec) : 0;
@@ -21,8 +22,8 @@ EVP_PKEY* rut_crypto_ec_load_der_internal(const uint8_t* der, uint32_t length) {
         EC_GROUP_get_asn1_flag(group) != OPENSSL_EC_NAMED_CURVE ||
         EC_POINT_is_at_infinity(group, point) != 0 || EC_KEY_check_key(ec) != 1)
         goto fail;
-    const int kSize = i2d_PUBKEY(candidate, 0);
-    if (kSize <= 0 || (uint32_t)kSize != length) goto fail;
+    const int64_t kSize = i2d_PUBKEY(candidate, 0);
+    if (kSize <= 0 || kSize != der_length) goto fail;
     uint8_t canonical[8192];
     uint8_t* output = canonical;
     if (i2d_PUBKEY(candidate, &output) != kSize) goto fail;
@@ -43,9 +44,10 @@ EVP_PKEY* rut_crypto_ec_from_coordinates_internal(const uint8_t x[32], const uin
                                       0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04};
     uint8_t der[91];
     for (uint32_t i = 0; i < sizeof(kPrefix); ++i) der[i] = kPrefix[i];
-    for (uint32_t i = 0; i < 32; ++i) {
-        der[(int64_t)sizeof(kPrefix) + (int64_t)i] = x[i];
-        der[(int64_t)sizeof(kPrefix) + 32 + (int64_t)i] = y[i];
+    const int coordinate_start = sizeof(kPrefix);
+    for (int i = 0; i < 32; ++i) {
+        der[coordinate_start + i] = x[i];
+        der[coordinate_start + 32 + i] = y[i];
     }
     return rut_crypto_ec_load_der_internal(der, sizeof(der));
 }

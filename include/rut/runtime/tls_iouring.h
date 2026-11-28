@@ -236,7 +236,7 @@ TlsFill tls_fill_output(Self* loop, Connection& c, const u8* src, u32 len, u32& 
         TlsOp st = TlsOp::Ok;
         const i32 kW =
             tls_engine_write(c.tls_engine,
-                             src + static_cast<i64>(off),
+                             src + i64{off},
                              static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(off)),
                              st);
         c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));  // commit every pass
@@ -378,7 +378,7 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         const TlsFill kSt = tls_fill_output<Self>(
             loop,
             c,
-            c.tls_send_src + static_cast<i64>(c.tls_send_off),
+            c.tls_send_src + i64{c.tls_send_off},
             static_cast<u32>(static_cast<i64>(c.tls_send_len) - static_cast<i64>(c.tls_send_off)),
             consumed);
         c.tls_send_off =
@@ -1019,7 +1019,7 @@ void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
         kSt = tls_fill_output<Self>(
             loop,
             c,
-            c.tls_send_src + static_cast<i64>(c.tls_send_off),
+            c.tls_send_src + i64{c.tls_send_off},
             static_cast<u32>(static_cast<i64>(c.tls_send_len) - static_cast<i64>(c.tls_send_off)),
             consumed);
         c.tls_send_off =

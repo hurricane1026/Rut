@@ -654,7 +654,7 @@ bool run_real_shebang_enoent_case() {
     if (fd < 0) return false;
     constexpr char contents[] = "#!/definitely/missing/rut-interpreter\n";
     const bool prepared =
-        write(fd, contents, sizeof(contents) - 1) == static_cast<ssize_t>(sizeof(contents) - 1) &&
+        write(fd, contents, sizeof(contents) - 1) == ssize_t{sizeof(contents) - 1} &&
         fchmod(fd, 0700) == 0 && close(fd) == 0;
     const bool result =
         prepared && run_external_exec_case(path, handoff::ExecOutcome::ExecFailure, ENOENT);

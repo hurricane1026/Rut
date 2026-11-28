@@ -34,12 +34,12 @@ TEST(listener, metadata_layout_defaults_and_legacy_aggregates_are_pinned) {
     CHECK_EQ(defaults.ipv4_host, 0u);
 
     ListenerSpec legacy_three_field{
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(9000)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{9000}};
     CHECK(legacy_three_field.valid());
     CHECK_EQ(legacy_three_field.ipv4_host, 0u);
 
     ListenerContext legacy_context{
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     CHECK(legacy_context.valid());
     CHECK_EQ(legacy_context.ipv4_host, 0u);
     ListenerContext exact_context{

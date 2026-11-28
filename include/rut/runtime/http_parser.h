@@ -68,7 +68,7 @@ struct ParsedRequest {
     Header headers[kMaxHeaders];
     u32 header_count;
 
-    u32 content_length;  // From Content-Length header, 0 if absent.
+    i64 content_length;  // From Content-Length header, 0 if absent.
     bool keep_alive;     // Derived from Connection header + HTTP version.
     bool chunked;        // Transfer-Encoding: chunked
     RequestTransferEncoding transfer_encoding;
@@ -105,14 +105,15 @@ struct ParsedRequest {
     }
 };
 
-inline bool request_content_length_identity_is_valid(bool has_content_length,
-                                                     u8 content_length_count,
-                                                     u32 content_length) {
-    return has_content_length ? content_length_count != 0 && content_length_count <= kMaxHeaders
+[[nodiscard]] inline bool request_content_length_identity_is_valid(bool has_content_length,
+                                                                   u8 content_length_count,
+                                                                   i64 content_length) {
+    return has_content_length ? content_length >= 0 && content_length_count != 0 &&
+                                    content_length_count <= kMaxHeaders
                               : content_length_count == 0 && content_length == 0;
 }
 
-inline bool request_content_length_identity_is_valid(const ParsedRequest& request) {
+[[nodiscard]] inline bool request_content_length_identity_is_valid(const ParsedRequest& request) {
     return request_content_length_identity_is_valid(
         request.has_content_length, request.content_length_count, request.content_length);
 }
@@ -149,7 +150,7 @@ struct ParsedResponse {
     u16 status_code;  // 100-599
     u32 header_count;
     Header headers[kMaxHeaders];
-    u32 content_length;
+    i64 content_length;
     bool has_content_length;
     u8 content_length_count;
     bool chunked;

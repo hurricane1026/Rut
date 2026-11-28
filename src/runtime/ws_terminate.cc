@@ -1,5 +1,7 @@
 #include "rut/runtime/ws_terminate.h"
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
 #include "rut/runtime/http_parser.h"
@@ -18,16 +20,32 @@ json::Document& ws_json_document() {
     return document;
 }
 
+[[nodiscard]] bool ws_json_input(const u8* payload, u64 len, Str path, Str* input) {
+    using JsonLength = range_int<0, i64{json::kMaxBytes} + 1>;
+    JsonLength length;
+    if (!payload || !JsonLength::try_from_u64(len, &length) || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len))
+        return false;
+    *input = {reinterpret_cast<const char*>(payload), length.to<u32>()};
+    return true;
+}
+
+[[nodiscard]] bool ws_json_suffix_matches(Str actual, Str suffix) {
+    if (suffix.empty()) return true;
+    u32 offset;
+    return (range_int{actual.len} - range_int{suffix.len}).to(&offset) &&
+           memcmp(actual.ptr + range_int{offset}.index(), suffix.ptr, suffix.len) == 0;
+}
+
 bool ws_json_stringify_to_workspace(
     json::Document& document, const u8* payload, u64 len, Str path, u32& output_len) {
     output_len = 0;
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     json::Writer encoded{document.other};
     const bool kSerialized = kId != json::kNone && document.write(kId, encoded) && encoded.ok;
@@ -40,22 +58,20 @@ bool ws_json_stringify_to_workspace(
 
 bool ws_json_has_path(const u8* payload, u64 len, Str path) {
     // One bounded workspace per worker thread. Never narrow an unchecked message length.
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kValid =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kValid = document.parse(input);
     const bool kPresent = kValid && document.pointer(path) != json::kNone;
     document.source = {};  // do not retain a borrowed message view between callbacks
     return kPresent;
 }
 
 bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsString = kId != json::kNone && document.nodes[kId].kind == json::Kind::String;
     document.source = {};
@@ -65,13 +81,12 @@ bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
 WsJsonStringScanResult ws_json_scan_string_at_path(
     const u8* payload, u64 len, Str path, WsJsonStringScanner scanner, void* context) {
     json::Document& document = ws_json_document();
-    if (!scanner || !payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!scanner || !ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return WsJsonStringScanResult::Error;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     json::Writer decoded{document.scratch};
     const bool kDecoded = kId != json::kNone && document.nodes[kId].kind == json::Kind::String &&
@@ -83,13 +98,12 @@ WsJsonStringScanResult ws_json_scan_string_at_path(
 
 bool ws_json_number_text_at_path(const u8* payload, u64 len, Str path) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsNumber = kId != json::kNone && document.nodes[kId].kind == json::Kind::Number;
     document.source = {};
@@ -99,13 +113,12 @@ bool ws_json_number_text_at_path(const u8* payload, u64 len, Str path) {
 bool ws_json_number_text_matches_at_path(
     const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len) || (!expected.ptr && expected.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input) || (!expected.ptr && expected.len)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool matches = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
@@ -122,11 +135,7 @@ bool ws_json_number_text_matches_at_path(
                     (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
                 break;
             case WsJsonStringMatch::Suffix:
-                matches = expected.len <= kActual.len &&
-                          (expected.len == 0 || memcmp(kActual.ptr + static_cast<i64>(kActual.len) -
-                                                           static_cast<i64>(expected.len),
-                                                       expected.ptr,
-                                                       expected.len) == 0);
+                matches = ws_json_suffix_matches(kActual, expected);
                 break;
             case WsJsonStringMatch::Contains:
                 matches = expected.len == 0 ||
@@ -169,11 +178,7 @@ bool ws_json_stringify_matches_at_path(
                       (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
             break;
         case WsJsonStringMatch::Suffix:
-            matches = expected.len <= kActual.len &&
-                      (expected.len == 0 || memcmp(kActual.ptr + static_cast<i64>(kActual.len) -
-                                                       static_cast<i64>(expected.len),
-                                                   expected.ptr,
-                                                   expected.len) == 0);
+            matches = ws_json_suffix_matches(kActual, expected);
             break;
         case WsJsonStringMatch::Contains:
             matches = expected.len == 0 ||
@@ -193,12 +198,10 @@ bool ws_json_string_equals_at_path(const u8* payload, u64 len, Str path, Str exp
 
 bool ws_json_string_matches_at_path(
     const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len) || (!expected.ptr && expected.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input) || (!expected.ptr && expected.len)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool matches = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::String) {
@@ -216,12 +219,7 @@ bool ws_json_string_matches_at_path(
                                memcmp(document.scratch, expected.ptr, expected.len) == 0);
                     break;
                 case WsJsonStringMatch::Suffix:
-                    matches = expected.len <= decoded.len &&
-                              (expected.len == 0 ||
-                               memcmp(document.scratch + static_cast<i64>(decoded.len) -
-                                          static_cast<i64>(expected.len),
-                                      expected.ptr,
-                                      expected.len) == 0);
+                    matches = ws_json_suffix_matches({document.scratch, decoded.len}, expected);
                     break;
                 case WsJsonStringMatch::Contains:
                     matches = expected.len == 0 ||
@@ -237,11 +235,10 @@ bool ws_json_string_matches_at_path(
 }
 
 bool ws_json_bool_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsBool = kId != json::kNone && document.nodes[kId].kind == json::Kind::Boolean;
     document.source = {};
@@ -249,11 +246,10 @@ bool ws_json_bool_at_path(const u8* payload, u64 len, Str path) {
 }
 
 bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expected) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kEqual = kId != json::kNone && document.nodes[kId].kind == json::Kind::Boolean &&
                         document.raw(kId).eq(expected ? lit_str("true") : lit_str("false"));
@@ -262,11 +258,10 @@ bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expe
 }
 
 bool ws_json_int_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     i64 value = 0;
     const bool kIsInt = kId != json::kNone && document.nodes[kId].kind == json::Kind::Number &&
@@ -277,11 +272,10 @@ bool ws_json_int_at_path(const u8* payload, u64 len, Str path) {
 
 bool ws_json_int_compare_at_path(
     const u8* payload, u64 len, Str path, i64 expected, WsJsonIntComparison comparison) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     i64 value = 0;
     bool matches = false;
@@ -304,12 +298,10 @@ bool ws_json_int_compare_at_path(
 }
 
 bool ws_json_kind_equals_at_path(const u8* payload, u64 len, Str path, Str expected) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len) || (!expected.ptr && expected.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input) || (!expected.ptr && expected.len)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     Str kind{};
     if (kId != json::kNone) {
@@ -340,11 +332,10 @@ bool ws_json_kind_equals_at_path(const u8* payload, u64 len, Str path, Str expec
 }
 
 bool ws_json_count_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsContainer =
         kId != json::kNone && (document.nodes[kId].kind == json::Kind::Array ||
@@ -355,16 +346,15 @@ bool ws_json_count_at_path(const u8* payload, u64 len, Str path) {
 
 bool ws_json_count_compare_at_path(
     const u8* payload, u64 len, Str path, i32 expected, WsJsonIntComparison comparison) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool matches = false;
     if (kId != json::kNone && (document.nodes[kId].kind == json::Kind::Array ||
                                document.nodes[kId].kind == json::Kind::Object)) {
-        const i32 kCount = static_cast<i32>(document.size(kId));
+        const i64 kCount = range_int{document.size(kId)}.to<i64>();
         switch (comparison) {
             case WsJsonIntComparison::Lt:
                 matches = kCount < expected;
@@ -392,42 +382,45 @@ namespace {
 // Re-serialize one frame (header + `len`-byte cleartext payload) into out[*produced..],
 // masking the payload with a fresh key when `masked`. Returns false if it won't fit or the
 // header is refused.
-bool emit_frame(u8* out,
-                u32 out_cap,
-                u32* produced,
-                WsOpcode op,
-                const u8* payload,
-                u64 len,
-                bool masked,
-                u64& mask_rng,
-                Str prefix = {},
-                Str suffix = {},
-                bool compressed = false) {
+[[nodiscard]] bool emit_frame(u8* out,
+                              u32 out_cap,
+                              u32* produced,
+                              WsOpcode op,
+                              const u8* payload,
+                              u64 len,
+                              bool masked,
+                              const u64& /*mask_rng*/,
+                              Str prefix = {},
+                              Str suffix = {},
+                              bool compressed = false) {
     u8 key[4] = {0, 0, 0, 0};
-    (void)mask_rng;  // Retained for compatibility with the existing inspector API.
     if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
-    const u64 output_len = static_cast<u64>(static_cast<i64>(len) + static_cast<i64>(prefix.len) +
-                                            static_cast<i64>(suffix.len));
+    using PayloadLength = range_int<0, __int128_t{UINT32_MAX} + 1>;
+    PayloadLength payload_count;
+    if (!PayloadLength::try_from_u64(len, &payload_count)) return false;
+    u32 output_len;
+    if (!(payload_count + range_int{prefix.len} + range_int{suffix.len}).to(&output_len))
+        return false;
     const u32 kHeaderLength =
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
     if (kHeaderLength == 0) return false;
-    if (static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength) +
-            static_cast<i64>(output_len) >
-        static_cast<i64>(out_cap))
+    const auto cursor = range_int{*produced};
+    const auto payload_start = cursor + range_int{kHeaderLength};
+    PayloadLength end;
+    if (!range_int{out_cap}.try_count((payload_start + range_int{output_len}).value(), &end))
         return false;
-    for (u32 i = 0; i < kHeaderLength; i++)
-        out[static_cast<i64>(*produced) + static_cast<i64>(i)] = hdr[i];
-    u8* dst = out + static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength);
-    for (u32 i = 0; i < prefix.len; i++) dst[i] = static_cast<u8>(prefix.ptr[i]);
-    for (u64 i = 0; i < len; i++)
-        dst[static_cast<i64>(prefix.len) + static_cast<i64>(i)] = payload[i];
+    u8* frame = out + cursor.index();
+    for (u32 i = 0; i < kHeaderLength; i++) frame[i] = hdr[i];
+    u8* dst = out + payload_start.index();
+    for (u32 i = 0; i < prefix.len; i++) dst[i] = byte_value(prefix.ptr[i]);
+    u8* const body = dst + range_int{prefix.len}.index();
+    for (u32 i = 0; i < payload_count.to<u32>(); i++) body[i] = payload[i];
+    const auto suffix_offset = range_int{prefix.len} + payload_count;
     for (u32 i = 0; i < suffix.len; i++)
-        dst[static_cast<i64>(prefix.len) + static_cast<i64>(len) + static_cast<i64>(i)] =
-            static_cast<u8>(suffix.ptr[i]);
+        dst[(suffix_offset + range_int{i}).index()] = byte_value(suffix.ptr[i]);
     if (masked) ws_unmask(dst, output_len, key);
-    *produced = static_cast<u32>(static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength) +
-                                 static_cast<i64>(output_len));
+    *produced = end.to<u32>();
     return true;
 }
 
@@ -435,34 +428,32 @@ bool emit_frame(u8* out,
 // Reuse the completed message buffer only after the result has been copied to
 // owned output. It is then safe compression scratch even for dynamic or JSON
 // replacements. Failed size attempts retain the original uncompressed frame.
-bool compress_emitted_message(WsInspector& st,
-                              u8* out,
-                              u32 out_cap,
-                              u32 begin,
-                              u32* produced,
-                              u8* scratch,
-                              u32 scratch_capacity) {
+[[nodiscard]] bool compress_emitted_message(WsInspector& st,
+                                            u8* out,
+                                            u32 out_cap,
+                                            u32 begin,
+                                            u32* produced,
+                                            u8* scratch,
+                                            u32 scratch_capacity) {
     if (!st.encoder || *produced == begin) return true;
+    u32 frame_len;
+    if (sub_overflow(*produced, begin, &frame_len)) return false;
     WsFrameHeader header{};
-    if (ws_parse_header(out + static_cast<i64>(begin),
-                        static_cast<u32>(static_cast<i64>(*produced) - static_cast<i64>(begin)),
-                        st.masked,
-                        &header) != ParseStatus::Complete ||
-        (header.opcode != WsOpcode::Text && header.opcode != WsOpcode::Binary) ||
-        static_cast<i64>(header.header_len) + static_cast<i64>(header.payload_len) !=
-            static_cast<i64>(*produced) - static_cast<i64>(begin))
+    if (ws_parse_header(out + range_int{begin}.index(), frame_len, st.masked, &header) !=
+            ParseStatus::Complete ||
+        (header.opcode != WsOpcode::Text && header.opcode != WsOpcode::Binary))
         return false;
-    u8* const kPayload = out + static_cast<i64>(begin) + static_cast<i64>(header.header_len);
-    if (st.masked) ws_unmask(kPayload, header.payload_len, header.mask_key);
+    u32 payload_length;
+    if (!(range_int{frame_len} - range_int{header.header_len}).to(&payload_length) ||
+        header.payload_len != payload_length)
+        return false;
+    u8* const kPayload = out + (range_int{begin} + range_int{header.header_len}).index();
+    if (st.masked) ws_unmask(kPayload, payload_length, header.mask_key);
     u32 length = 0;
-    const auto kStatus = ws_deflate_payload(*st.encoder,
-                                            kPayload,
-                                            static_cast<u32>(header.payload_len),
-                                            scratch,
-                                            scratch_capacity,
-                                            &length);
+    const auto kStatus = ws_deflate_payload(
+        *st.encoder, kPayload, payload_length, scratch, scratch_capacity, &length);
     if (kStatus == WsDeflateStatus::Error) return false;
-    if (kStatus == WsDeflateStatus::Ok && length < header.payload_len) {
+    if (kStatus == WsDeflateStatus::Ok && length < payload_length) {
         *produced = begin;
         return emit_frame(out,
                           out_cap,
@@ -476,7 +467,7 @@ bool compress_emitted_message(WsInspector& st,
                           {},
                           true);
     }
-    if (st.masked) ws_unmask(kPayload, header.payload_len, header.mask_key);
+    if (st.masked) ws_unmask(kPayload, payload_length, header.mask_key);
     return true;
 }
 #endif
@@ -486,9 +477,11 @@ bool decode_close_payload(const u8* payload, u32 len, u16& code, Str& reason) {
     code = 1005;
     reason = {};
     if (len == 0) return true;
-    code = static_cast<u16>((static_cast<u16>(payload[0]) << 8) | payload[1]);
-    reason = {reinterpret_cast<const char*>(payload + 2),
-              static_cast<u32>(static_cast<i64>(len) - 2)};
+    constexpr auto kCodeLength = range_int<2, 3>{};
+    u32 reason_length;
+    if (!(range_int{len} - kCodeLength).to(&reason_length)) return false;
+    code = (range_int{payload[0]}.scaled_by<256>() + range_int{payload[1]}).to<u16>();
+    reason = {reinterpret_cast<const char*>(payload + kCodeLength.index()), reason_length};
     return ws_valid_close_code(code) && ws_valid_close_reason(reason);
 }
 
@@ -504,13 +497,12 @@ bool emit_json_string_frame(u8* out,
                             bool masked,
                             u64& mask_rng) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool emitted = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::String) {
@@ -518,8 +510,7 @@ bool emit_json_string_frame(u8* out,
         if (document.string(kId, decoded) && decoded.ok &&
             ws_valid_text_payload({document.scratch, decoded.len})) {
             const u64 kOutputSize =
-                static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(decoded.len) +
-                                 static_cast<i64>(suffix.len));
+                (range_int{prefix.len} + range_int{decoded.len} + range_int{suffix.len}).to_u64();
             if (kOutputSize <= kWsMaxMessageCapacity &&
                 (max_size == 0 || kOutputSize <= max_size)) {
                 emitted = emit_frame(out,
@@ -552,20 +543,18 @@ bool emit_json_number_text_frame(u8* out,
                                  bool masked,
                                  u64& mask_rng) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool emitted = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
         const Str kLexeme = document.raw(kId);
         const u64 kOutputSize =
-            static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(kLexeme.len) +
-                             static_cast<i64>(suffix.len));
+            (range_int{prefix.len} + range_int{kLexeme.len} + range_int{suffix.len}).to_u64();
         if (kOutputSize <= kWsMaxMessageCapacity && (max_size == 0 || kOutputSize <= max_size)) {
             emitted = emit_frame(out,
                                  out_cap,
@@ -599,8 +588,7 @@ bool emit_json_stringify_frame(u8* out,
     u32 serialized_len = 0;
     if (!ws_json_stringify_to_workspace(document, payload, len, path, serialized_len)) return false;
     const u64 kOutputSize =
-        static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(serialized_len) +
-                         static_cast<i64>(suffix.len));
+        (range_int{prefix.len} + range_int{serialized_len} + range_int{suffix.len}).to_u64();
     if (kOutputSize > kWsMaxMessageCapacity || (max_size != 0 && kOutputSize > max_size))
         return false;
     return emit_frame(out,
@@ -625,8 +613,8 @@ bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     if (rewrite.source == WsTextSource::Dynamic)
         return !rewrite.prefix.ptr && !rewrite.prefix.len && !rewrite.suffix.ptr &&
                !rewrite.suffix.len && !rewrite.source_path.ptr && !rewrite.source_path.len;
-    const u64 literal_size = static_cast<u64>(static_cast<i64>(rewrite.prefix.len) +
-                                              static_cast<i64>(rewrite.suffix.len));
+    const u64 literal_size =
+        (range_int{rewrite.prefix.len} + range_int{rewrite.suffix.len}).to_u64();
     const bool kSourceValid =
         rewrite.source <= WsTextSource::MessageBytes &&
         (rewrite.source != WsTextSource::MessageBytes ||
@@ -651,14 +639,40 @@ bool ws_valid_close_reason(Str reason) {
 }
 
 bool WsClosePayload::assign(u16 status, Str text) {
+    u8 length;
     if ((!ws_valid_close_code(status) && status != 1005) || (status == 1005 && !text.empty()) ||
-        !ws_valid_close_reason(text))
+        !ws_valid_close_reason(text) || !range_int{text.len}.to(&length))
         return false;
     for (u32 i = 0; i < text.len; ++i) reason_storage[i] = text.ptr[i];
-    reason_len = static_cast<u8>(text.len);
+    reason_len = length;
     code = status;
     return true;
 }
+
+namespace {
+[[nodiscard]] bool ws_decoded_limit(u64 configured, u32 capacity, WsBufferedBytes* out) {
+    const u64 limit = configured != 0 && configured < capacity ? configured : capacity;
+    return WsBufferedBytes::try_from_u64(limit, out);
+}
+
+[[nodiscard]] bool ws_encode_close_body(u8 (&body)[kWsMaxControlPayload],
+                                        u16 code,
+                                        Str reason,
+                                        u32* size) {
+    using ReasonLength = range_int<0, i64{kWsMaxCloseReasonBytes} + 1>;
+    ReasonLength length;
+    if (!ws_valid_close_code(code) || !ReasonLength::try_from_u64(reason.len, &length) ||
+        !ws_valid_text_payload(reason))
+        return false;
+    constexpr auto kCodeSize = range_int<2, 3>{};
+    body[0] = range_int{code}.divided_by<256>().to<u8>();
+    body[1] = bounded_remainder<256>(code).to<u8>();
+    for (u32 i = 0; i < length.to<u32>(); ++i)
+        body[(kCodeSize + range_int{i}).index()] = byte_value(reason.ptr[i]);
+    *size = (kCodeSize + length).to<u32>();
+    return true;
+}
+}  // namespace
 
 WsInspectStatus ws_inspect(WsInspector& st,
                            const u8* in,
@@ -685,8 +699,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
         return WsInspectStatus::Error;
 
     for (;;) {
-        const u32 avail = static_cast<u32>(static_cast<i64>(in_len) - static_cast<i64>(*consumed));
-        const u8* p = in + static_cast<i64>(*consumed);
+        const auto cursor = range_int{*consumed};
+        u32 avail;
+        if (!(range_int{in_len} - cursor).to(&avail)) return WsInspectStatus::Error;
+        const u8* p = in + cursor.index();
 
         WsFrameHeader h;
         if (st.partial_data_frame) {
@@ -703,8 +719,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // buffering) the payload. The in-place re-frame can't size a message spanning reads,
         // and deferring the check past the whole-frame wait below lets a peer wedge the
         // tunnel by sending only a fragmented frame's header (FIN=0) and then stalling.
-        if (st.reject_fragmented && !ws_opcode_is_control(h.opcode) &&
-            (h.opcode == WsOpcode::Continuation || !h.fin)) {
+        const bool control = ws_opcode_is_control(h.opcode);
+        if (st.reject_fragmented && !control && (h.opcode == WsOpcode::Continuation || !h.fin)) {
             return WsInspectStatus::Error;
         }
 
@@ -713,101 +729,101 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // the bytes already accumulated for an in-progress fragmented message (0 for a
         // fresh one); the sum is also the exact msg_buf write bound below.
         const bool kCompressed =
-            !ws_opcode_is_control(h.opcode) &&
+            !control &&
             (st.partial_data_frame || h.opcode == WsOpcode::Continuation ? st.compressed_message
                                                                          : h.compressed);
-        const u32 kDecodedLimit = st.max_message_size && st.max_message_size < msg_cap
-                                      ? static_cast<u32>(st.max_message_size)
-                                      : msg_cap;
-        if (!ws_opcode_is_control(h.opcode)) {
+        WsBufferedBytes decoded_limit;
+        if (!ws_decoded_limit(st.max_message_size, msg_cap, &decoded_limit))
+            return WsInspectStatus::Error;
+        const u32 kDecodedLimit = decoded_limit.to<u32>();
+        WsBufferedBytes frame_payload;
+        if (!WsBufferedBytes::try_from_i64(h.payload_len, &frame_payload))
+            return WsInspectStatus::Error;
+        WsBufferedBytes message_total;
+        if (control) {
+            if (st.partial_data_frame || frame_payload.to_u64() > kWsMaxControlPayload)
+                return WsInspectStatus::Error;
+        } else {
             // The header alone proves an invalid fragment sequence. Reject it
             // before waiting for the advertised payload.
             if ((h.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented)
                 return WsInspectStatus::Error;
             if (kCompressed) {
-                const u64 kWireLimit = ws_deflate_wire_limit(kDecodedLimit);
-                if (!st.decoder || h.payload_len > kWireLimit ||
-                    st.assembler.accumulated_len >
-                        static_cast<u64>(static_cast<i64>(kWireLimit) -
-                                         static_cast<i64>(h.payload_len)))
+                const auto wire_limit = ws_deflate_wire_limit(kDecodedLimit);
+                WsDeflateWireBytes remaining_wire;
+                if (!st.decoder ||
+                    !WsDeflateWireBytes::try_from_i64((wire_limit - frame_payload).value(),
+                                                      &remaining_wire) ||
+                    st.assembler.accumulated_len > remaining_wire.to_u64())
                     return WsInspectStatus::Error;
             } else {
-                if (h.payload_len > msg_cap) return WsInspectStatus::Error;
-                const u32 payload_len = static_cast<u32>(h.payload_len);
-                if (static_cast<i64>(payload_len) >
-                    static_cast<i64>(UINT32_MAX) - static_cast<i64>(st.message_len))
-                    return WsInspectStatus::Error;
-                const u32 message_total = static_cast<u32>(static_cast<i64>(st.message_len) +
-                                                           static_cast<i64>(payload_len));
-                if (message_total > msg_cap) return WsInspectStatus::Error;
-                if (st.max_message_size != 0 &&
-                    static_cast<u64>(message_total) > st.max_message_size)
+                const auto total = st.message_len + frame_payload;
+                if (!decoded_limit.try_count(total.value(), &message_total))
                     return WsInspectStatus::Error;
             }
         }
 
         // Control payloads are small and processed whole; data payloads can span reads.
         const u32 header_len = st.partial_data_frame ? 0 : h.header_len;
-        const u64 frame_total =
-            static_cast<u64>(static_cast<i64>(header_len) + static_cast<i64>(h.payload_len) -
-                             static_cast<i64>(st.partial_payload_len));
-        if (ws_opcode_is_control(h.opcode) && avail < frame_total) break;
-        if (!ws_opcode_is_control(h.opcode) && avail < frame_total && *produced != 0) break;
+        u32 remain;
+        if (!(frame_payload - st.partial_payload_len).to(&remain)) return WsInspectStatus::Error;
+        const auto frame_size = range_int(header_len) + range_int(remain);
+        const i64 frame_total = frame_size.value();
+        if (avail < frame_total && (control || *produced != 0)) break;
         // A completed fragmented message can be larger than this input chunk. Flush
         // already-produced frames first when the next output might not fit; leave this
         // frame and the assembler state untouched for the next call.
         if (*produced != 0) {
-            u64 kOriginalSize = kDecodedLimit;
-            if (!kCompressed &&
-                __builtin_add_overflow(
-                    static_cast<u64>(st.message_len), h.payload_len, &kOriginalSize))
-                return WsInspectStatus::Error;
-            auto rewritten_size = [kOriginalSize, &st](const WsTextRewrite& rewrite) -> u64 {
-                if (rewrite.source == WsTextSource::Dynamic) {
-                    const u64 kCap =
-                        st.max_message_size ? st.max_message_size : kWsMaxMessageCapacity;
-                    return kCap > kWsMaxControlPayload ? kCap : kWsMaxControlPayload;
+            u32 available_output;
+            if (sub_overflow(out_cap, *produced, &available_output)) return WsInspectStatus::Error;
+            if (control) {
+                if (frame_total > available_output) break;
+            } else if (h.fin) {
+                const u32 kOriginalSize = kCompressed ? kDecodedLimit : message_total.to<u32>();
+                auto rewritten_size = [kOriginalSize, &st](const WsTextRewrite& rewrite) -> u64 {
+                    if (rewrite.source == WsTextSource::Dynamic) {
+                        const u64 kCap =
+                            st.max_message_size ? st.max_message_size : kWsMaxMessageCapacity;
+                        return kCap > kWsMaxControlPayload ? kCap : kWsMaxControlPayload;
+                    }
+                    const u32 kSourceSize = rewrite.source == WsTextSource::JsonStringify
+                                                ? json::kMaxBytes
+                                            : rewrite.source != WsTextSource::Literal &&
+                                                    rewrite.source != WsTextSource::LiteralBinary
+                                                ? kOriginalSize
+                                                : 0;
+                    return (range_int(rewrite.prefix.len) + range_int(rewrite.suffix.len) +
+                            range_int(kSourceSize))
+                        .to_u64();
+                };
+                u64 data_size = rewritten_size(st.forward_text);
+                if (kOriginalSize > data_size) data_size = kOriginalSize;
+                for (u32 i = 0; i < st.forward_text_count; i++) {
+                    const u64 size = rewritten_size(st.forward_texts[i]);
+                    if (size > data_size) data_size = size;
                 }
-                const u64 kSourceSize = rewrite.source == WsTextSource::JsonStringify
-                                            ? json::kMaxBytes
-                                        : rewrite.source != WsTextSource::Literal &&
-                                                rewrite.source != WsTextSource::LiteralBinary
-                                            ? kOriginalSize
-                                            : 0;
-                return static_cast<u64>(static_cast<i64>(rewrite.prefix.len) +
-                                        static_cast<i64>(rewrite.suffix.len) +
-                                        static_cast<i64>(kSourceSize));
-            };
-            u64 data_size = rewritten_size(st.forward_text);
-            if (kOriginalSize > data_size) data_size = kOriginalSize;
-            for (u32 i = 0; i < st.forward_text_count; i++) {
-                const u64 size = rewritten_size(st.forward_texts[i]);
-                if (size > data_size) data_size = size;
+                u32 reason_size = st.close_reason.len;
+                for (u32 i = 0; i < st.close_policy_count; i++)
+                    if (st.close_policies[i].reason.len > reason_size)
+                        reason_size = st.close_policies[i].reason.len;
+                const u64 close_size =
+                    (range_int<2, 3>::constant<2>() + range_int(reason_size)).to_u64();
+                if (reason_size != 0 && close_size > data_size) data_size = close_size;
+                u64 needed;
+                if (add_overflow(data_size, kWsMaxHeaderSize, &needed))
+                    return WsInspectStatus::Error;
+                if (needed > available_output) break;
             }
-            u32 reason_size = st.close_reason.len;
-            for (u32 i = 0; i < st.close_policy_count; i++)
-                if (st.close_policies[i].reason.len > reason_size)
-                    reason_size = st.close_policies[i].reason.len;
-            const u64 close_size =
-                static_cast<u64>(static_cast<i64>(2) + static_cast<i64>(reason_size));
-            if (reason_size != 0 && close_size > data_size) data_size = close_size;
-            const u64 needed = ws_opcode_is_control(h.opcode)
-                                   ? frame_total
-                                   : (h.fin ? static_cast<u64>(static_cast<i64>(data_size) +
-                                                               static_cast<i64>(kWsMaxHeaderSize))
-                                            : 0);
-            if (static_cast<i64>(needed) > static_cast<i64>(out_cap) - static_cast<i64>(*produced))
-                break;
         }
-        const u8* payload = p + static_cast<i64>(header_len);
+        const u8* payload = p + range_int{header_len}.index();
 
-        if (ws_opcode_is_control(h.opcode)) {
+        if (control) {
             // Copy + unmask the control payload (<=125 bytes) so we can validate it and
             // re-serialize it with our own framing — terminate mode owns the outbound
             // side, so it must not leak the client's mask key or relay a malformed body.
             u8 cbuf[kWsMaxControlPayload];
-            for (u64 i = 0; i < h.payload_len; i++) cbuf[i] = payload[i];
-            if (st.masked) ws_unmask(cbuf, h.payload_len, h.mask_key);
+            for (u32 i = 0; i < frame_payload.to<u32>(); i++) cbuf[i] = payload[i];
+            if (st.masked) ws_unmask(cbuf, frame_payload.to_u64(), h.mask_key);
 
             // §7.4/§5.5.1: a Close body, if present, is a 2-byte status code (which must be
             // a valid wire code) followed by a UTF-8 reason. Fail the tunnel otherwise.
@@ -815,7 +831,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             Str received_reason{};
             if (h.opcode == WsOpcode::Close &&
                 !decode_close_payload(
-                    cbuf, static_cast<u32>(h.payload_len), received_code, received_reason))
+                    cbuf, frame_payload.to<u32>(), received_code, received_reason))
                 return WsInspectStatus::Error;
 
             if (h.opcode == WsOpcode::Close) {
@@ -832,13 +848,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
                             produced,
                             h.opcode,
                             cbuf,
-                            h.payload_len,
+                            frame_payload.to_u64(),
                             st.masked,
                             st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
-            *consumed =
-                static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(frame_total));
+            if (!(range_int(*consumed) + frame_size).to(consumed)) return WsInspectStatus::Error;
             if (h.opcode == WsOpcode::Close) return WsInspectStatus::Close;
             continue;
         }
@@ -846,13 +861,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // Data frame (Text/Binary or continuation).
         // Accumulate the (unmasked) payload into the reassembly buffer (bound already
         // checked above), then ask the reassembler whether the message is complete.
-        u64 remain = 0;
-        if (__builtin_sub_overflow(
-                h.payload_len, static_cast<u64>(st.partial_payload_len), &remain))
+        u32 available_payload;
+        if (!(range_int{avail} - range_int{header_len}).to(&available_payload))
             return WsInspectStatus::Error;
-        const u32 available_payload =
-            static_cast<u32>(static_cast<i64>(avail) - static_cast<i64>(header_len));
-        const u32 chunk = remain < available_payload ? static_cast<u32>(remain) : available_payload;
+        const u32 chunk = remain < available_payload ? remain : available_payload;
         if (!st.partial_data_frame && h.opcode != WsOpcode::Continuation) {
             st.compressed_message = kCompressed;
 #if RUT_ENABLE_WEBSOCKET
@@ -871,48 +883,44 @@ WsInspectStatus ws_inspect(WsInspector& st,
                                  msg_cap,
                                  &decoded,
                                  st.masked ? h.mask_key : nullptr,
-                                 st.partial_payload_len) != WsDeflateStatus::Ok)
+                                 st.partial_payload_len.to_u64()) != WsDeflateStatus::Ok)
                 return WsInspectStatus::Error;
-            st.message_len = decoded;
+            st.message_len = range_int{decoded};
 #endif
         } else {
-            u8* dst = msg_buf + static_cast<i64>(st.message_len) +
-                      static_cast<i64>(st.partial_payload_len);
+            // The uncompressed cursor is the previous complete frames plus this
+            // frame's already buffered prefix.
+            u8* dst = msg_buf + (st.message_len + st.partial_payload_len).index();
             for (u32 i = 0; i < chunk; i++) dst[i] = payload[i];
-            if (st.masked) ws_unmask_chunk(dst, chunk, h.mask_key, st.partial_payload_len);
+            if (st.masked) ws_unmask_chunk(dst, chunk, h.mask_key, st.partial_payload_len.to_u64());
         }
-        st.partial_payload_len =
-            static_cast<u32>(static_cast<i64>(st.partial_payload_len) + static_cast<i64>(chunk));
-        *consumed = static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(header_len) +
-                                     static_cast<i64>(chunk));
-        if (st.partial_payload_len < h.payload_len) {
+        // The wire bound above caps this frame, and chunk is at most the remainder.
+        const auto received = st.partial_payload_len + range_int{chunk};
+        if (!frame_payload.try_count(received.value(), &st.partial_payload_len))
+            return WsInspectStatus::Error;
+        if (!(range_int(*consumed) + range_int(header_len) + range_int(chunk)).to(consumed))
+            return WsInspectStatus::Error;
+        if (st.partial_payload_len.value() < frame_payload.value()) {
             st.partial_data_frame = true;
             st.partial_header = h;
             break;
         }
         st.partial_data_frame = false;
-        st.partial_payload_len = 0;
+        st.partial_payload_len = {};
 
         WsOpcode msg_op;
         u64 total;
         const WsMessageStatus kMessageStatus = ws_message_feed(
             st.assembler,
             h,
-            kCompressed ? ws_deflate_wire_limit(kDecodedLimit) : st.max_message_size,
+            kCompressed ? ws_deflate_wire_limit(kDecodedLimit).to_u64() : st.max_message_size,
             &msg_op,
             &total);
         if (kMessageStatus == WsMessageStatus::Error) return WsInspectStatus::Error;
-        if (!kCompressed) {
-            if (h.payload_len > UINT32_MAX ||
-                static_cast<i64>(h.payload_len) >
-                    static_cast<i64>(UINT32_MAX) - static_cast<i64>(st.message_len))
-                return WsInspectStatus::Error;
-            st.message_len = static_cast<u32>(static_cast<i64>(st.message_len) +
-                                              static_cast<i64>(h.payload_len));
-        }
+        if (!kCompressed) st.message_len = message_total;
 
         if (kMessageStatus == WsMessageStatus::NeedMore) continue;  // awaiting more fragments
-        if (kCompressed) total = st.message_len;
+        if (kCompressed) total = st.message_len.to_u64();
 
         // §8.1: a complete Text message must be valid UTF-8, or the connection fails.
         if (msg_op == WsOpcode::Text && !utf8_valid(msg_buf, total)) {
@@ -930,25 +938,25 @@ WsInspectStatus ws_inspect(WsInspector& st,
             published = *st.dynamic_output;
         }
         if (st.dynamic_output) *st.dynamic_output = {};
-        const u8 action_value = static_cast<u8>(action);
-        const u8 first_policy = static_cast<u8>(WsFrameAction::ClosePolicy0);
-        const bool policy_close =
-            action_value >= first_policy &&
-            static_cast<i64>(action_value) <
-                static_cast<i64>(first_policy) + static_cast<i64>(kWsMaxClosePolicies);
-        if (policy_close && static_cast<i64>(action_value) - static_cast<i64>(first_policy) >=
-                                static_cast<i64>(st.close_policy_count))
+        const auto action_code = range_int{std::to_underlying(action)};
+        using ClosePolicyIndex = range_int<0, kWsMaxClosePolicies>;
+        using TextPolicyIndex = range_int<0, kWsMaxForwardTexts>;
+        ClosePolicyIndex close_index;
+        TextPolicyIndex text_index;
+        const bool policy_close = ClosePolicyIndex::try_from_i64(
+            (action_code - range_int{std::to_underlying(WsFrameAction::ClosePolicy0)}).value(),
+            &close_index);
+        if (policy_close && close_index.value() >= st.close_policy_count)
             return WsInspectStatus::Error;
-        const u8 first_text_policy = static_cast<u8>(WsFrameAction::ForwardTextPolicy0);
-        const bool policy_forward =
-            action_value >= first_text_policy &&
-            static_cast<i64>(action_value) <
-                static_cast<i64>(first_text_policy) + static_cast<i64>(kWsMaxForwardTexts);
-        if (policy_forward &&
-            static_cast<i64>(action_value) - static_cast<i64>(first_text_policy) >=
-                static_cast<i64>(st.forward_text_count))
+        const bool policy_forward = TextPolicyIndex::try_from_i64(
+            (action_code - range_int{std::to_underlying(WsFrameAction::ForwardTextPolicy0)})
+                .value(),
+            &text_index);
+        if (policy_forward && text_index.value() >= st.forward_text_count)
             return WsInspectStatus::Error;
+#if RUT_ENABLE_WEBSOCKET
         const u32 kOutputBegin = *produced;
+#endif
         if (action == WsFrameAction::Forward) {
             // Re-serialize the whole message as a single (unfragmented) frame.
             if (!emit_frame(
@@ -975,22 +983,20 @@ WsInspectStatus ws_inspect(WsInspector& st,
             // Input has already been reassembled and validated. Output owns a
             // separate slice, so replacement may grow without overwriting input.
             const WsTextRewrite& rewrite =
-                policy_forward
-                    ? st.forward_texts[static_cast<u8>(static_cast<i64>(action_value) -
-                                                       static_cast<i64>(first_text_policy))]
-                    : st.forward_text;
+                policy_forward ? st.forward_texts[text_index.index()] : st.forward_text;
             const u64 kPayloadSize = rewrite.source == WsTextSource::MessageText ||
                                              rewrite.source == WsTextSource::MessageBytes
                                          ? total
                                          : 0;
-            const u64 kOutputSize = static_cast<u64>(static_cast<i64>(kPayloadSize) +
-                                                     static_cast<i64>(rewrite.prefix.len) +
-                                                     static_cast<i64>(rewrite.suffix.len));
-            if (rewrite.source == WsTextSource::Dynamic ||
+            u32 output_size;
+            const auto decoration_len =
+                range_int(rewrite.prefix.len) + range_int(rewrite.suffix.len);
+            if (add_overflow(kPayloadSize, decoration_len.value(), &output_size) ||
+                rewrite.source == WsTextSource::Dynamic ||
                 !ws_valid_text_rewrite(rewrite, st.max_message_size) ||
                 (rewrite.source == WsTextSource::MessageText && !utf8_valid(msg_buf, total)) ||
-                kOutputSize > kWsMaxMessageCapacity ||
-                (st.max_message_size != 0 && kOutputSize > st.max_message_size))
+                output_size > kWsMaxMessageCapacity ||
+                (st.max_message_size != 0 && output_size > st.max_message_size))
                 return WsInspectStatus::Error;
             bool emitted = false;
             switch (rewrite.source) {
@@ -1060,23 +1066,17 @@ WsInspectStatus ws_inspect(WsInspector& st,
             const WsClosePolicy kSelected =
                 action == WsFrameAction::CloseDynamic
                     ? WsClosePolicy{published.close_code, published.payload}
-                : policy_close ? st.close_policies[static_cast<u8>(static_cast<i64>(action_value) -
-                                                                   static_cast<i64>(first_policy))]
+                : policy_close ? st.close_policies[close_index.index()]
                                : WsClosePolicy{st.close_code, st.close_reason};
-            if (!ws_valid_close_code(kSelected.code) || !ws_valid_close_reason(kSelected.reason))
-                return WsInspectStatus::Error;
             u8 cc[kWsMaxControlPayload];
-            cc[0] = static_cast<u8>(kSelected.code >> 8);
-            cc[1] = static_cast<u8>(kSelected.code);
-            for (u32 i = 0; i < kSelected.reason.len; i++)
-                cc[static_cast<i64>(i) + 2] = static_cast<u8>(kSelected.reason.ptr[i]);
-            const u32 hdr = static_cast<u32>(static_cast<i64>(2) + (st.masked ? 4 : 0));
-            u32 body =
-                static_cast<u32>(static_cast<i64>(2) + static_cast<i64>(kSelected.reason.len));
+            u32 body;
+            if (!ws_encode_close_body(cc, kSelected.code, kSelected.reason, &body))
+                return WsInspectStatus::Error;
+            const u8 header_size = st.masked ? 6 : 2;
             // Preserve the legacy empty-status fallback only for code-only closes.
             // A configured reason must fit whole; never truncate UTF-8 or silently discard it.
-            if (static_cast<i64>(*produced) + static_cast<i64>(hdr) + static_cast<i64>(body) >
-                static_cast<i64>(out_cap)) {
+            if ((range_int{*produced} + range_int{header_size} + range_int{body}).value() >
+                out_cap) {
                 if (kSelected.reason.len != 0) return WsInspectStatus::Error;
                 body = 0;
             }
@@ -1086,7 +1086,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             if (!st.set_echo_close_reason(kSelected.reason)) return WsInspectStatus::Error;
             st.echo_close_code = kSelected.code;
             st.received_close = false;
-            st.message_len = 0;
+            st.message_len = {};
             return WsInspectStatus::Close;
         } else if (action != WsFrameAction::Drop) {
             return WsInspectStatus::Error;
@@ -1094,11 +1094,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
 #if RUT_ENABLE_WEBSOCKET
         if (!compress_emitted_message(st, out, out_cap, kOutputBegin, produced, msg_buf, msg_cap))
             return WsInspectStatus::Error;
-#else
-        (void)kOutputBegin;
 #endif
         // Drop: emit nothing. All continuing verdicts reset for the next message.
-        st.message_len = 0;
+        st.message_len = {};
         st.compressed_message = false;
     }
 
@@ -1106,21 +1104,11 @@ WsInspectStatus ws_inspect(WsInspector& st,
 }
 
 u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code, Str reason) {
-    if (!ws_valid_close_code(code) || !ws_valid_close_reason(reason)) return 0;
     u8 body[kWsMaxControlPayload];
-    body[0] = static_cast<u8>(code >> 8);
-    body[1] = static_cast<u8>(code);
-    for (u32 i = 0; i < reason.len; i++)
-        body[static_cast<i64>(i) + 2] = static_cast<u8>(reason.ptr[i]);
+    u32 size;
+    if (!ws_encode_close_body(body, code, reason, &size)) return 0;
     u32 produced = 0;
-    if (!emit_frame(out,
-                    out_cap,
-                    &produced,
-                    WsOpcode::Close,
-                    body,
-                    static_cast<u32>(static_cast<i64>(2) + static_cast<i64>(reason.len)),
-                    masked,
-                    mask_rng))
+    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, body, size, masked, mask_rng))
         return 0;
     return produced;
 }
@@ -1134,9 +1122,10 @@ WsClosingRead ws_read_closing(
 #endif
     if (st.received_close) return WsClosingRead::Close;
     while (*consumed < in_len) {
-        const u8* p = in + static_cast<i64>(*consumed);
-        const u32 kAvailable =
-            static_cast<u32>(static_cast<i64>(in_len) - static_cast<i64>(*consumed));
+        const auto cursor = range_int{*consumed};
+        const u8* p = in + cursor.index();
+        u32 kAvailable;
+        if (!(range_int{in_len} - cursor).to(&kAvailable)) return WsClosingRead::Error;
         WsFrameHeader header;
         if (st.partial_data_frame) {
             header = st.partial_header;
@@ -1147,32 +1136,32 @@ WsClosingRead ws_read_closing(
             if (kStatus == ParseStatus::Error) return WsClosingRead::Error;
         }
         if (ws_opcode_is_control(header.opcode)) {
-            if (st.partial_data_frame || header.payload_len > kWsMaxControlPayload)
+            using ControlPayload = range_int<0, i64{kWsMaxControlPayload} + 1>;
+            ControlPayload count;
+            if (st.partial_data_frame || !ControlPayload::try_from_i64(header.payload_len, &count))
                 return WsClosingRead::Error;
-            const u32 kPayloadLen = static_cast<u32>(header.payload_len);
-            const u32 kTotal = static_cast<u32>(static_cast<i64>(header.header_len) +
-                                                static_cast<i64>(kPayloadLen));
-            if (kAvailable < kTotal) return WsClosingRead::NeedMore;
+            const u32 kPayloadLen = count.to<u32>();
+            const auto header_size = range_int{header.header_len};
+            const auto total = header_size + count;
+            if (kAvailable < total.value()) return WsClosingRead::NeedMore;
+            const auto next = cursor + total;
             u8 body[kWsMaxControlPayload];
-            memcpy(body, p + static_cast<i64>(header.header_len), kPayloadLen);
-            if (header.masked) ws_unmask(body, header.payload_len, header.mask_key);
+            memcpy(body, p + header_size.index(), kPayloadLen);
+            if (header.masked) ws_unmask(body, kPayloadLen, header.mask_key);
             if (header.opcode == WsOpcode::Close) {
                 u16 code = 1005;
                 Str reason{};
-                if (!decode_close_payload(
-                        body, static_cast<u32>(header.payload_len), code, reason) ||
-                    !st.set_echo_close_reason(reason))
+                if (!decode_close_payload(body, kPayloadLen, code, reason) ||
+                    !st.set_echo_close_reason(reason) || !next.to(consumed))
                     return WsClosingRead::Error;
                 st.echo_close_code = code;
                 st.received_close = true;
-                *consumed =
-                    static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(kTotal));
                 return WsClosingRead::Close;
             }
-            *consumed = static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(kTotal));
+            if (!next.to(consumed)) return WsClosingRead::Error;
             if (header.opcode == WsOpcode::Ping) {
                 memcpy(ping_payload, body, kPayloadLen);
-                *ping_len = static_cast<u32>(header.payload_len);
+                *ping_len = kPayloadLen;
                 return WsClosingRead::Ping;
             }
             continue;  // unsolicited Pong has no reply
@@ -1180,40 +1169,46 @@ WsClosingRead ws_read_closing(
         const bool kCompressed = st.partial_data_frame || header.opcode == WsOpcode::Continuation
                                      ? st.compressed_message
                                      : header.compressed;
-        const u32 kDecodedLimit = st.max_message_size && st.max_message_size < kWsMaxMessageCapacity
-                                      ? static_cast<u32>(st.max_message_size)
-                                      : kWsMaxMessageCapacity;
-        const u64 kLimit = kCompressed ? ws_deflate_wire_limit(kDecodedLimit) : kDecodedLimit;
+        WsBufferedBytes decoded_limit;
+        if (!ws_decoded_limit(st.max_message_size, kWsMaxMessageCapacity, &decoded_limit))
+            return WsClosingRead::Error;
+        const u32 kDecodedLimit = decoded_limit.to<u32>();
+        const WsDeflateWireBytes limit =
+            kCompressed ? WsDeflateWireBytes{ws_deflate_wire_limit(kDecodedLimit)}
+                        : WsDeflateWireBytes{decoded_limit};
+        WsBufferedBytes frame_payload;
+        WsDeflateWireBytes remaining_wire;
         if ((header.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented ||
-            header.payload_len > kLimit ||
-            st.assembler.accumulated_len >
-                static_cast<u64>(static_cast<i64>(kLimit) - static_cast<i64>(header.payload_len)))
+            !WsBufferedBytes::try_from_i64(header.payload_len, &frame_payload) ||
+            !WsDeflateWireBytes::try_from_i64((limit - frame_payload).value(), &remaining_wire) ||
+            st.assembler.accumulated_len > remaining_wire.to_u64())
             return WsClosingRead::Error;
         st.compressed_message = kCompressed;
         const u32 kHeaderLen = st.partial_data_frame ? 0 : header.header_len;
-        const u64 kRemaining = static_cast<u64>(static_cast<i64>(header.payload_len) -
-                                                static_cast<i64>(st.partial_payload_len));
-        const u32 kAvailablePayload =
-            static_cast<u32>(static_cast<i64>(kAvailable) - static_cast<i64>(kHeaderLen));
-        const u32 kTake =
-            kRemaining < kAvailablePayload ? static_cast<u32>(kRemaining) : kAvailablePayload;
-        st.partial_payload_len =
-            static_cast<u32>(static_cast<i64>(st.partial_payload_len) + static_cast<i64>(kTake));
-        *consumed = static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(kHeaderLen) +
-                                     static_cast<i64>(kTake));
-        if (st.partial_payload_len != header.payload_len) {
+        u32 remaining;
+        if (!(frame_payload - st.partial_payload_len).to(&remaining)) return WsClosingRead::Error;
+        u32 kAvailablePayload;
+        if (!(range_int{kAvailable} - range_int{kHeaderLen}).to(&kAvailablePayload))
+            return WsClosingRead::Error;
+        const u32 kTake = remaining < kAvailablePayload ? remaining : kAvailablePayload;
+        const auto received = st.partial_payload_len + range_int{kTake};
+        if (!frame_payload.try_count(received.value(), &st.partial_payload_len))
+            return WsClosingRead::Error;
+        if (!(range_int(*consumed) + range_int(kHeaderLen) + range_int(kTake)).to(consumed))
+            return WsClosingRead::Error;
+        if (st.partial_payload_len.value() != frame_payload.value()) {
             st.partial_header = header;
             st.partial_data_frame = true;
             return WsClosingRead::NeedMore;
         }
         st.partial_data_frame = false;
-        st.partial_payload_len = 0;
+        st.partial_payload_len = {};
         WsOpcode opcode;
         u64 total = 0;
-        if (ws_message_feed(st.assembler, header, kLimit, &opcode, &total) ==
+        if (ws_message_feed(st.assembler, header, limit.to_u64(), &opcode, &total) ==
             WsMessageStatus::Error)
             return WsClosingRead::Error;
-        st.message_len = 0;  // ignored application bytes never enter reassembly storage
+        st.message_len = {};  // ignored application bytes never enter reassembly storage
         if (header.fin) st.compressed_message = false;
     }
     return WsClosingRead::NeedMore;

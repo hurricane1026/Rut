@@ -644,8 +644,8 @@ static const char* const kInvalidRequestStrs[] = {
     "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
     // Content-Length not a number
     "POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n",
-    // Content-Length overflow u32
-    "POST / HTTP/1.1\r\nContent-Length: 99999999999\r\n\r\n",
+    // Content-Length overflow i64
+    "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n",
     // Missing URI (double space)
     "GET  HTTP/1.1\r\n\r\n",
     // Truncated version string
@@ -1041,7 +1041,7 @@ TEST(HeaderValue, ExtendedChars) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_EQ(req.header_count, 1u);
 }
 
@@ -1057,7 +1057,7 @@ TEST(HeaderValue, Byte0xFF) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_EQ(req.header_count, 2u);
 }
 
@@ -1071,7 +1071,7 @@ TEST(HeaderValue, TabInValue) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"value", 5}));
 }
 
@@ -1085,7 +1085,7 @@ TEST(HeaderValue, EmptyValue) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"", 0}));
 }
 
@@ -1099,7 +1099,7 @@ TEST(HeaderValue, LeadingTrailingOWS) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"example.com", 11}));
 }
 
@@ -1114,7 +1114,7 @@ TEST(HeaderValue, PlusChars) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"++++++++++", 10}));
 }
 
@@ -1127,7 +1127,7 @@ TEST(ContentLength, WithLeadingZeroes) {
     ParsedRequest req;
 
     auto s = parse_one("PUT /url HTTP/1.1\r\nContent-Length: 003\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_EQ(req.content_length, 3u);
 }
 
@@ -1136,7 +1136,7 @@ TEST(ContentLength, Zero) {
     ParsedRequest req;
 
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.has_content_length);
     CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 0u);
@@ -1148,7 +1148,7 @@ TEST(ContentLength, AbsentHasNeutralFieldIdentity) {
     ParsedRequest req;
 
     const auto s = parse_one("POST / HTTP/1.1\r\nHost: x\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_FALSE(req.has_content_length);
     CHECK_EQ(req.content_length_count, 0u);
     CHECK_EQ(req.content_length, 0u);
@@ -1158,6 +1158,7 @@ TEST(ContentLength, AbsentHasNeutralFieldIdentity) {
     CHECK_FALSE(request_content_length_identity_is_valid(false, 0, 1));
     CHECK_FALSE(request_content_length_identity_is_valid(true, 0, 0));
     CHECK_FALSE(request_content_length_identity_is_valid(true, kMaxHeaders + 1, 0));
+    CHECK_FALSE(request_content_length_identity_is_valid(true, 1, -1));
     CHECK(request_content_length_identity_is_valid(true, 1, 0));
     CHECK(request_content_length_identity_is_valid(true, 2, 5));
 }
@@ -1177,31 +1178,45 @@ TEST(ContentLength, Overflow) {
 
     auto s = parse_one(
         "PUT /url HTTP/1.1\r\nContent-Length: 1000000000000000000000\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    CHECK_EQ(s, ParseStatus::Error);
 }
 
 TEST(ContentLength, MaxU32PlusOne) {
     HttpParser parser;
     ParsedRequest req;
-    // 4294967296 = UINT32_MAX + 1 — must overflow
+    // 4294967296 = UINT32_MAX + 1 — valid in the logical length domain.
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 4294967296\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    CHECK_EQ(s, ParseStatus::Complete);
+    CHECK_EQ(req.content_length, i64{UINT32_MAX} + 1);
 }
 
 TEST(ContentLength, MaxU32PlusFive) {
     HttpParser parser;
     ParsedRequest req;
-    // 4294967300 — overflows u32
+    // 4294967300 — valid in the logical length domain.
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 4294967300\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    CHECK_EQ(s, ParseStatus::Complete);
+    CHECK_EQ(req.content_length, i64{UINT32_MAX} + 5);
 }
 
 TEST(ContentLength, ElevenDigits) {
     HttpParser parser;
     ParsedRequest req;
-    // 42949672950 — 11 digits, overflows
+    // 42949672950 — 11 digits, valid in the logical length domain.
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 42949672950\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    CHECK_EQ(s, ParseStatus::Complete);
+    CHECK_EQ(req.content_length, i64{42949672950});
+}
+
+TEST(ContentLength, Int64MaxAndOverflow) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s =
+        parse_one("POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n", &req, &parser);
+    CHECK_EQ(s, ParseStatus::Complete);
+    CHECK_EQ(req.content_length, i64{INT64_MAX});
+    s = parse_one("POST / HTTP/1.1\r\nContent-Length: 9223372036854775808\r\n\r\n", &req, &parser);
+    CHECK_EQ(s, ParseStatus::Error);
 }
 
 TEST(ContentLength, MaxU32MinusOne) {
@@ -4292,7 +4307,7 @@ TEST(http_parser, request_body_override_bounds_intermediate_header_expansion) {
     const char* raw = "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length:3\r\n\r\nabc";
     const u32 raw_len = static_cast<u32>(strlen(raw));
     char buffer[128];
-    for (u32 i = 0; i < static_cast<u32>(sizeof(buffer)); i++) buffer[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < u32{sizeof(buffer)}; i++) buffer[i] = char{0x5a};
     memcpy(buffer, raw, raw_len);
     u32 total = raw_len;
     u32 header_end = request_header_end(buffer);

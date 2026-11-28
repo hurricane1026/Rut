@@ -1,5 +1,7 @@
 #include "rut/runtime/access_log_live_producer.h"
 
+#include "rut/common/checked_arithmetic.h"
+
 #include <errno.h>
 
 namespace rut {
@@ -108,8 +110,7 @@ SourceLiveAccessLogPublishResult SourceLiveAccessLogProducer::publish_host(
 
     const u64 position = ring_->published_pos.load(std::memory_order_relaxed);
     const u64 committed = ring_->committed_pos.load(std::memory_order_acquire);
-    u64 pending = 0;
-    (void)__builtin_sub_overflow(position, committed, &pending);
+    const u64 pending = wrapping_sub(position, committed);
     if (pending > LiveAccessLogRing::kCapacity) {
         session_->report_producer_fatal(
             SourceLiveAccessLogFatalKind::Protocol, ring_index_, EPROTO);

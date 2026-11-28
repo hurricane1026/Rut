@@ -165,7 +165,7 @@ int run_and_wait(const std::vector<std::string>& argv, int timeout_ms) {
         _exit(127);
     }
     const int64_t deadline_ms =
-        static_cast<int64_t>(timeout_ms) +
+        int64_t{timeout_ms} +
         static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count());
@@ -232,7 +232,7 @@ bool run_and_capture(const std::vector<std::string>& argv,
     close(pipe_fds[1]);
     output->clear();
     const int64_t deadline_ms =
-        static_cast<int64_t>(timeout_ms) +
+        int64_t{timeout_ms} +
         static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count());
@@ -1566,7 +1566,7 @@ private:
         // 0 in production, so this is a no-op there.
         if (test_accept_loop_hold_ms_ > 0) {
             struct timespec ts{test_accept_loop_hold_ms_ / 1000,
-                               static_cast<long>(test_accept_loop_hold_ms_ % 1000) * 1'000'000};
+                               long{test_accept_loop_hold_ms_ % 1000} * 1'000'000};
             nanosleep(&ts, nullptr);
         }
         while (!stopping_.load()) {
@@ -2466,7 +2466,7 @@ bool wait_ready_and_confirm_ownership(uint16_t port,
     if (!wait_ready(port, envoy, timeout_ms, error)) return false;
 
     // Cheap first step: a child that already exited never owned `port`.
-    struct timespec grace{grace_ms / 1000, static_cast<long>(grace_ms % 1000) * 1'000'000};
+    struct timespec grace{grace_ms / 1000, long{grace_ms % 1000} * 1'000'000};
     nanosleep(&grace, nullptr);
     if (envoy.pid > 0) {
         int status = 0;
@@ -3869,7 +3869,7 @@ bool rfc1123_http_date_is_current(const std::string& value, time_t now, int tole
     parsed.tm_min = static_cast<int>(two_digits(20));
     parsed.tm_sec = static_cast<int>(two_digits(23));
     const time_t parsed_time = timegm(&parsed);
-    if (parsed_time == static_cast<time_t>(-1)) return false;
+    if (parsed_time == time_t{-1}) return false;
     const long long diff = static_cast<long long>(parsed_time) - static_cast<long long>(now);
     return diff >= -tolerance_seconds && diff <= tolerance_seconds;
 }
@@ -6347,7 +6347,7 @@ bool self_test_wait_idle_fails_on_relentless_arrivals() {
     int hook_calls = 0;
     upstream.set_test_before_quiet_window_poll_hook([port, &hook_calls] {
         hook_calls++;
-        struct timespec delay{0, static_cast<long>(kInjectionSleepMs) * 1'000'000};
+        struct timespec delay{0, long{kInjectionSleepMs} * 1'000'000};
         nanosleep(&delay, nullptr);
         const int fd = connect_with_timeout(port, kClientTimeoutMs);
         if (fd >= 0) close(fd);
@@ -10025,7 +10025,7 @@ bool make_orphan_sentinel(pid_t* sentinel_pid) {
         }
         if (grand > 0) {
             ssize_t written = 0;
-            while (written < static_cast<ssize_t>(sizeof(grand))) {
+            while (written < ssize_t{sizeof(grand)}) {
                 const ssize_t n = write(fds[1],
                                         reinterpret_cast<const char*>(&grand) + written,
                                         sizeof(grand) - written);
@@ -10039,7 +10039,7 @@ bool make_orphan_sentinel(pid_t* sentinel_pid) {
     close(fds[1]);
     pid_t grand = -1;
     ssize_t total_read = 0;
-    while (total_read < static_cast<ssize_t>(sizeof(grand))) {
+    while (total_read < ssize_t{sizeof(grand)}) {
         const ssize_t n =
             read(fds[0], reinterpret_cast<char*>(&grand) + total_read, sizeof(grand) - total_read);
         if (n <= 0) break;
@@ -10049,7 +10049,7 @@ bool make_orphan_sentinel(pid_t* sentinel_pid) {
     int status = 0;
     while (waitpid(mid, &status, 0) < 0 && errno == EINTR) {
     }
-    if (total_read != static_cast<ssize_t>(sizeof(grand)) || grand <= 0) return false;
+    if (total_read != ssize_t{sizeof(grand)} || grand <= 0) return false;
     *sentinel_pid = grand;
     return true;
 }

@@ -1,10 +1,23 @@
 #include "rut/nginx/parser.h"
 
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/range_int.h"
 #include "rut/common/strict_local_response.h"
 
 namespace rut::nginx {
 namespace {
+
+constexpr auto kOne = range_int<1, 2>{};
+
+constexpr auto append_decimal_digit(u16 value, char digit) {
+    const auto kDigit = range_int(static_cast<u8>(digit)) - range_int<'0', '1'>{};
+    return range_int(value).scaled_by<10>() + kDigit;
+}
+
+auto oversized_source() {
+    return frontend_error(
+        FrontendError::TooManyItems, {}, lit_str("source position exceeds 32 bits"));
+}
 
 enum class TokenKind : u8 { Word, LBrace, RBrace, Semicolon, End };
 
@@ -76,13 +89,19 @@ private:
     }
 
     void advance() {
+        // Every call consumes an existing byte, and the entry points leave
+        // room for one-based line and column positions at end of input.
         if (source_.ptr[pos_] == '\n') {
-            line_++;
+            line_ = (range_int(line_) + kOne)
+                        .min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{})
+                        .to<u32>();
             col_ = 1;
         } else {
-            col_++;
+            col_ = (range_int(col_) + kOne)
+                       .min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{})
+                       .to<u32>();
         }
-        pos_++;
+        pos_ = (range_int(pos_) + kOne).min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}).to<u32>();
     }
 
     void skip_space_and_comments() {
@@ -120,15 +139,16 @@ bool parse_canonical_ipv4_endpoint(Str endpoint, u32* ipv4_host, Str* port) {
     u32 address = 0u;
     for (u32 octet = 0u; octet < 4u; octet++) {
         const u32 start = pos;
-        u32 value = 0u;
+        u8 value = 0;
         while (pos < endpoint.len && endpoint.ptr[pos] >= '0' && endpoint.ptr[pos] <= '9') {
-            if (pos - start == 3u) return false;
-            value = value * 10u + static_cast<u32>(endpoint.ptr[pos] - '0');
-            if (value > 255u) return false;
+            if ((range_int(pos) - range_int(start)).value() == 3) return false;
+            const auto kNext = append_decimal_digit(value, endpoint.ptr[pos]);
+            if (!kNext.to(&value)) return false;
             pos++;
         }
-        const u32 digits = pos - start;
-        if (digits == 0u || (digits > 1u && endpoint.ptr[start] == '0')) return false;
+        const auto kDigits = range_int(pos) - range_int(start);
+        if (kDigits.value() == 0 || (kDigits.value() > 1 && endpoint.ptr[start] == '0'))
+            return false;
         const char delimiter = octet == 3u ? ':' : '.';
         if (pos >= endpoint.len || endpoint.ptr[pos] != delimiter) return false;
         address = (address << 8u) | value;
@@ -407,20 +427,20 @@ public:
                 diagnostic.span.start > diagnostic.span.end || diagnostic.span.line == 0 ||
                 diagnostic.span.col == 0)
                 return invalid(http_origin, lit_str("http diagnostic span is out of bounds"));
-            if (http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.start ||
-                http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.end)
+            if (http_origin.start > (~u32{0}) - diagnostic.span.start ||
+                http_origin.start > (~u32{0}) - diagnostic.span.end)
                 return invalid(http_origin, lit_str("http diagnostic offset overflow"));
             diagnostic.span.start += http_origin.start;
             diagnostic.span.end += http_origin.start;
             if (diagnostic.span.line == 1) {
                 if (http_origin.line == 0 || http_origin.col == 0 ||
-                    http_origin.col > (~static_cast<u32>(0)) - (diagnostic.span.col - 1u))
+                    http_origin.col > (~u32{0}) - (diagnostic.span.col - 1u))
                     return invalid(http_origin, lit_str("http diagnostic column overflow"));
                 diagnostic.span.line = http_origin.line;
                 diagnostic.span.col += http_origin.col - 1u;
             } else {
                 if (http_origin.line == 0 ||
-                    http_origin.line > (~static_cast<u32>(0)) - (diagnostic.span.line - 1u))
+                    http_origin.line > (~u32{0}) - (diagnostic.span.line - 1u))
                     return invalid(http_origin, lit_str("http diagnostic line overflow"));
                 diagnostic.span.line += http_origin.line - 1u;
             }
@@ -429,8 +449,7 @@ public:
 
         const HttpProfile http = parsed.value();
         if (http.span.start > http_source.len || http.span.end > http_source.len ||
-            http.span.start > http.span.end ||
-            http_origin.start > (~static_cast<u32>(0)) - http.span.end)
+            http.span.start > http.span.end || http_origin.start > (~u32{0}) - http.span.end)
             return invalid(http_origin, lit_str("http span is out of bounds"));
         const u32 http_end = http_origin.start + http.span.end;
         NginxHttpConfig result{};
@@ -1166,15 +1185,14 @@ private:
 
     static bool parse_port(Str text, u16* out) {
         if (text.len == 0) return false;
-        u32 value = 0;
+        u16 value = 0;
         for (u32 i = 0; i < text.len; i++) {
             if (text.ptr[i] < '0' || text.ptr[i] > '9') return false;
-            const u32 digit = static_cast<u32>(text.ptr[i] - '0');
-            if (value > (65535u - digit) / 10u) return false;
-            value = value * 10u + digit;
+            const auto kNext = append_decimal_digit(value, text.ptr[i]);
+            if (!kNext.to(&value)) return false;
         }
         if (value == 0) return false;
-        *out = static_cast<u16>(value);
+        *out = value;
         return true;
     }
 
@@ -1190,15 +1208,17 @@ private:
 
         u32 pos = 0;
         while (pos < text.len && text.ptr[pos] >= '0' && text.ptr[pos] <= '9') pos++;
-        if (pos + 1 == text.len && text.ptr[pos] == 's') {
+        if ((range_int(pos) + kOne).value() == text.len && text.ptr[pos] == 's') {
             if (text.ptr[0] == '0' && pos > 1) return TimeoutParseStatus::Unsupported;
             if (pos > 2) {
                 *out = 64;
                 return TimeoutParseStatus::Ok;
             }
-            u32 seconds = 0;
+            u8 seconds = 0;
+            // At most two decimal digits reach this loop.
             for (u32 i = 0; i < pos; i++)
-                seconds = seconds * 10u + static_cast<u32>(text.ptr[i] - '0');
+                if (!append_decimal_digit(seconds, text.ptr[i]).to(&seconds))
+                    return TimeoutParseStatus::Invalid;
             *out = seconds;
             return TimeoutParseStatus::Ok;
         }
@@ -1225,14 +1245,16 @@ private:
         if (text.ptr[pos] < '0' || text.ptr[pos] > '9') return UrlParseStatus::Unsupported;
         for (u32 octet = 0; octet < 4; octet++) {
             if (pos >= text.len) return UrlParseStatus::InvalidInteger;
-            u32 value = 0;
-            u32 digits = 0;
+            u8 value = 0;
+            u8 digits = 0;
             while (pos < text.len && text.ptr[pos] >= '0' && text.ptr[pos] <= '9') {
-                value = value * 10u + static_cast<u32>(text.ptr[pos++] - '0');
-                if (++digits > 3 || value > 255u) return UrlParseStatus::InvalidInteger;
+                if (digits == 3) return UrlParseStatus::InvalidInteger;
+                const auto kNext = append_decimal_digit(value, text.ptr[pos++]);
+                if (!kNext.to(&value)) return UrlParseStatus::InvalidInteger;
+                digits = (range_int(digits) + kOne).min(range_int<3, 4>{}).to<u8>();
             }
             if (digits == 0) return UrlParseStatus::InvalidInteger;
-            out.address[octet] = static_cast<u8>(value);
+            out.address[octet] = value;
             if (octet < 3) {
                 if (pos >= text.len) return UrlParseStatus::InvalidInteger;
                 const char separator = text.ptr[pos++];
@@ -1250,7 +1272,10 @@ private:
         if (pos == text.len) return UrlParseStatus::Ok;
         if (text.ptr[pos] != '/') return UrlParseStatus::InvalidInteger;
         out.uri = text.slice(pos, text.len);
-        out.uri_span = Span{span.start + pos, span.end, span.line, span.col + pos};
+        out.uri_span = Span{0, span.end, span.line, 0};
+        if (!(range_int(span.start) + range_int(pos)).to(&out.uri_span.start) ||
+            !(range_int(span.col) + range_int(pos)).to(&out.uri_span.col))
+            return UrlParseStatus::InvalidInteger;
         if (!parser_proxy_pass_replacement_uri_is_modeled(out.uri))
             return UrlParseStatus::InvalidUri;
         out.has_uri = true;
@@ -1277,14 +1302,17 @@ bool proxy_pass_replacement_uri_is_clean(Str uri) {
 }
 
 FrontendResult<Server> parse(Str source) {
+    if (source.len == UINT32_MAX) return oversized_source();
     return Parser(source).run();
 }
 
 FrontendResult<HttpProfile> parse_http_profile(Str source) {
+    if (source.len == UINT32_MAX) return oversized_source();
     return Parser(source).run_http_profile();
 }
 
 FrontendResult<NginxHttpConfig> parse_nginx_http_config(Str source) {
+    if (source.len == UINT32_MAX) return oversized_source();
     return Parser(source).run_nginx_http_config();
 }
 

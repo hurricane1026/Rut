@@ -9,6 +9,7 @@
 // against regressions; see bench_http_parser for the HTTP/1 comparison pattern.
 
 #include "bench.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 
@@ -158,7 +159,7 @@ int main() {
                 ssize_t rv = nghttp2_hd_inflate_hd2(inf, &nv, &flags, in, inlen, 1);
                 if (rv < 0) break;
                 in += rv;
-                inlen -= static_cast<size_t>(rv);
+                inlen -= range_int(i64{rv}).max(range_int<0, 1>{}).to_u64();
                 bench::do_not_optimize(&nv);
                 if (flags & NGHTTP2_HD_INFLATE_FINAL) break;
                 if (rv == 0 && inlen == 0) break;
@@ -238,10 +239,12 @@ int main() {
         u8 fh[kFrameHeaderSize];
         Http2FrameHeader h;
         h.length = 16384;
-        h.type = static_cast<u8>(Http2FrameType::Data);
+        constexpr u8 kDataFrame = 0;
+        static_assert(Http2FrameType{kDataFrame} == Http2FrameType::Data);
+        h.type = kDataFrame;
         h.flags = http2_flag::kEndStream;
         h.stream_id = 5;
-        write_frame_header(fh, h);
+        if (write_frame_header(fh, h) != sizeof(fh)) return 1;
         b.run("parse_frame_header", [&] {
             Http2FrameHeader out;
             ParseStatus s = parse_frame_header(fh, kFrameHeaderSize, &out);

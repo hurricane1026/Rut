@@ -1,5 +1,7 @@
 #include "rut/runtime/response_body_chain.h"
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 #include <stdint.h>
@@ -134,15 +136,14 @@ consteval bool direct_write_extent_contract() {
             u32 node_dirty = 6;
             u64 kOffset = 0;
             const bool kValid =
-                kAddress >= kBegin && !__builtin_sub_overflow(kAddress, kBegin, &kOffset) &&
+                kAddress >= kBegin && !sub_overflow(kAddress, kBegin, &kOffset) &&
                 kOffset <= kCapacity &&
-                static_cast<i64>(kCount) <= static_cast<i64>(kCapacity) - static_cast<i64>(kOffset);
+                kCount <= (range_int(kCapacity) - range_int(static_cast<u32>(kOffset))).value();
             if (detail::record_direct_write_extent(
                     kBegin, kAddress, kCapacity, kCount, tail_dirty, node_dirty) != kValid)
                 return false;
             u64 kEnd = 0;
-            if (kValid && __builtin_add_overflow(kOffset, static_cast<u64>(kCount), &kEnd))
-                return false;
+            if (kValid && add_overflow(kOffset, static_cast<u64>(kCount), &kEnd)) return false;
             if (tail_dirty != (kEnd > 2 ? kEnd : 2) || node_dirty != (kEnd > 6 ? kEnd : 6))
                 return false;
         }
@@ -162,13 +163,10 @@ consteval bool buffered_length_contract() {
             for (const u32 kNew : kSizes)
                 for (const u32 kReceived : kSizes)
                     for (const u32 kCompleted : kSizes) {
-                        const bool kMatches =
-                            kBuffered >= kHeader && kCompleted <= kReceived &&
-                            static_cast<i64>(kBuffered) - static_cast<i64>(kHeader) >=
-                                static_cast<i64>(kNew) &&
-                            static_cast<i64>(kBuffered) - static_cast<i64>(kHeader) -
-                                    static_cast<i64>(kNew) ==
-                                static_cast<i64>(kReceived) - static_cast<i64>(kCompleted);
+                        const bool kMatches = kBuffered >= kHeader && kCompleted <= kReceived &&
+                                              i64{kBuffered} - i64{kHeader} >= i64{kNew} &&
+                                              i64{kBuffered} - i64{kHeader} - i64{kNew} ==
+                                                  i64{kReceived} - i64{kCompleted};
                         if (ResponseBodyChain::matches_buffered_length(
                                 kBuffered, kHeader, kReceived, kCompleted, kNew) != kMatches)
                             return false;
@@ -181,18 +179,12 @@ static_assert(buffered_length_contract(), "Buffered response violates retained b
 // Use a widened total as the reference for the production remaining-room check.
 consteval bool direct_receive_body_bounds_contract() {
     constexpr u32 kCap = ResponseBodyChain::kMaxBody;
-    constexpr u32 kLengths[] = {0,
-                                1,
-                                2,
-                                static_cast<u32>(static_cast<i64>(kCap) - 1),
-                                kCap,
-                                static_cast<u32>(static_cast<i64>(kCap) + 1),
-                                UINT32_MAX};
-    constexpr i32 kResults[] = {INT32_MIN, -1, 0, 1, 2, static_cast<i32>(kCap), INT32_MAX};
+    constexpr u32 kLengths[] = {0, 1, 2, u32{i64{kCap} - 1}, kCap, u32{i64{kCap} + 1}, UINT32_MAX};
+    constexpr i32 kResults[] = {INT32_MIN, -1, 0, 1, 2, i32{kCap}, INT32_MAX};
     for (const u32 kReceived : kLengths)
         for (const u32 kDeclared : kLengths)
             for (const i32 kResult : kResults) {
-                const i64 kTotal = static_cast<i64>(kReceived) + static_cast<i64>(kResult);
+                const i64 kTotal = i64{kReceived} + i64{kResult};
                 const bool kFits = kResult > 0 && kTotal <= kDeclared && kTotal <= kCap;
                 if (ResponseBodyChain::direct_receive_fits_body(kReceived, kDeclared, kResult) !=
                     kFits)
@@ -210,10 +202,10 @@ consteval bool direct_receive_room_contract() {
     constexpr u32 kCounts[] = {0,
                                1,
                                kCap / 2,
-                               static_cast<u32>(static_cast<i64>(kCap) - 1),
+                               u32{i64{kCap} - 1},
                                kCap,
-                               static_cast<u32>(static_cast<i64>(kCap) + 1),
-                               static_cast<u32>(static_cast<i64>(kCap) + 2),
+                               u32{i64{kCap} + 1},
+                               u32{i64{kCap} + 2},
                                UINT32_MAX};
     for (const u32 kReceived : kCounts) {
         const u32 kRoom = ResponseBodyChain::direct_receive_room(kReceived);
@@ -221,9 +213,7 @@ consteval bool direct_receive_room_contract() {
             if (kRoom != 0) return false;
             continue;
         }
-        if (static_cast<i64>(kReceived) + static_cast<i64>(kRoom) != static_cast<i64>(kCap) + 1 ||
-            kRoom > INT32_MAX)
-            return false;
+        if (i64{kReceived} + i64{kRoom} != i64{kCap} + 1 || kRoom > INT32_MAX) return false;
         const i32 kProbe = static_cast<i32>(kRoom);
         if (ResponseBodyChain::direct_receive_fits_body(kReceived, UINT32_MAX, kProbe))
             return false;

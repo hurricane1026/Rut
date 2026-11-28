@@ -1,5 +1,7 @@
 #include "rut/harness/handler_execution.h"
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/jit/runtime_helpers.h"
 
 namespace rut::harness {
@@ -127,11 +129,26 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             return out;
         }
     }
-    environment.now_us = driver.initial_virtual_time_us;
+    constexpr u64 kMaxHandlerTimeUs = u64{INT64_MAX};
+    range_int<0> initial_time;
+    if (!decltype(initial_time)::try_from_u64(driver.initial_virtual_time_us, &initial_time)) {
+        out.harness.outcome = Outcome::Invalid;
+        copy_detail(out.harness.detail,
+                    sizeof(out.harness.detail),
+                    "initial virtual time exceeds the signed handler clock");
+        return out;
+    }
+    environment.now_us = initial_time.to_u64();
+    u64 requested_deadline;
+    if (add_overflow(environment.now_us, harness.limits.max_virtual_time_us, &requested_deadline)) {
+        out.harness.outcome = Outcome::Invalid;
+        copy_detail(out.harness.detail,
+                    sizeof(out.harness.detail),
+                    "virtual deadline overflows the handler clock");
+        return out;
+    }
     const u64 virtual_deadline_us =
-        harness.limits.max_virtual_time_us > ~u64{0} - driver.initial_virtual_time_us
-            ? ~u64{0}
-            : driver.initial_virtual_time_us + harness.limits.max_virtual_time_us;
+        requested_deadline > kMaxHandlerTimeUs ? kMaxHandlerTimeUs : requested_deadline;
     const u64* previous_virtual_clock = rut_helper_time_set_virtual_clock(&environment.now_us);
     struct VirtualClockRestore {
         const u64* previous;
@@ -165,7 +182,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         CompletionStatus completion = CompletionStatus::Ready;
         if (result.yield_kind == jit::YieldKind::Timer ||
             (result.yield_kind == jit::YieldKind::Any && result.yield_payload_u32() != 0)) {
-            const u64 delay_us = static_cast<u64>(result.yield_payload_u32()) * 1000u;
+            const u64 delay_us = u64{result.yield_payload_u32()} * 1000u;
             if (delay_us > virtual_deadline_us - environment.now_us)
                 completion = CompletionStatus::TimeLimit;
             else

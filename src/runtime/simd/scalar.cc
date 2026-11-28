@@ -16,7 +16,7 @@ u32 find_header_end(const u8* buf, u32 len, u32 from) {
 u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
     while (pos < end) {
         if (buf[pos] == '\r') return pos;
-        if (!kHeaderValueTable[buf[pos]]) return static_cast<u32>(-1);
+        if (!kHeaderValueTable[buf[pos]]) return UINT32_MAX;
         pos++;
     }
     return end;
@@ -30,7 +30,7 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
             *canon_end_out = (canon_end != end) ? canon_end : pos;
             return pos;
         }
-        if (!kUriTable[b]) return static_cast<u32>(-1);
+        if (!kUriTable[b]) return UINT32_MAX;
         if ((b == '?' || b == '#') && canon_end == end) canon_end = pos;
         pos++;
     }
@@ -41,10 +41,10 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
 u32 scan_header_name(const u8* buf, u32 pos, u32 end) {
     while (pos < end) {
         if (buf[pos] == ':') return pos;
-        if (!kTokenTable[buf[pos]]) return static_cast<u32>(-1);
+        if (!kTokenTable[buf[pos]]) return UINT32_MAX;
         pos++;
     }
-    return static_cast<u32>(-1);
+    return UINT32_MAX;
 }
 
 }  // namespace rut::simd

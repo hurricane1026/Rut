@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include <atomic>
 
@@ -54,7 +55,7 @@ struct CacheTable {
     // Provisioning headroom (e.g. 2× the expected key count) is the
     // declarer's job — the table never grows.
     // Zero means the rounded power of two is not representable in u32.
-    static constexpr u32 round_capacity(u32 requested) {
+    [[nodiscard]] static constexpr u32 round_capacity(u32 requested) {
         u32 c = requested < kWays ? kWays : requested;
         c--;
         c |= c >> 1;
@@ -62,8 +63,9 @@ struct CacheTable {
         c |= c >> 4;
         c |= c >> 8;
         c |= c >> 16;
-        // The low 32 bits of the unrepresentable capacity 2^32 give the zero sentinel.
-        return static_cast<u32>(static_cast<u64>(c) + 1u);
+        u32 rounded;
+        if (!(range_int{c} + range_int<1, 2>{}).to(&rounded)) return 0;
+        return rounded;
     }
 
     bool init(u32 requested_capacity, u64 mix_seed) {
@@ -71,7 +73,7 @@ struct CacheTable {
         const u32 count = round_capacity(requested_capacity);
         if (count == 0) return false;
         void* mem = ::mmap(nullptr,
-                           static_cast<u64>(count) * sizeof(Slot),
+                           range_int{count}.scaled_by<sizeof(Slot)>().to_u64(),
                            PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS,
                            -1,
@@ -85,7 +87,8 @@ struct CacheTable {
     }
 
     void destroy() {
-        if (slots != nullptr) ::munmap(slots, static_cast<u64>(slot_count) * sizeof(Slot));
+        if (slots != nullptr)
+            ::munmap(slots, range_int{slot_count}.scaled_by<sizeof(Slot)>().to_u64());
         slots = nullptr;
         slot_count = 0;
         set_count = 0;
@@ -94,7 +97,7 @@ struct CacheTable {
     // Seeded multiply-mix (splitmix64 finalizer shape). Forced non-zero so
     // 0 stays the empty-slot sentinel.
     static u64 mix(u32 key, u64 mix_seed) {
-        u64 h = (static_cast<u64>(key) ^ mix_seed) * 0x9E3779B97F4A7C15ull;
+        u64 h = (range_int{key}.to_u64() ^ mix_seed) * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
         h *= 0xBF58476D1CE4E5B9ull;
         h ^= h >> 32;
@@ -103,12 +106,15 @@ struct CacheTable {
 
     KeyHash hash_key(u32 key) const { return KeyHash{mix(key, seed)}; }
 
-    u32 set_index(KeyHash hash) const { return static_cast<u32>(hash.value & (set_count - 1)); }
+    [[nodiscard]] u32 set_index(KeyHash hash) const {
+        // The u32 mask selects only the low bits of the hash.
+        return bounded_remainder<(u64{1} << 32)>(hash.value).to<u32>() & (set_count - 1u);
+    }
 
     bool get(u32 key, i64* out) const {
         if (slots == nullptr) return false;
         const KeyHash hash = hash_key(key);
-        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
+        Slot* set = slots + range_int{set_index(hash)}.scaled_by<kWays>().index();
         for (u32 w = 0; w < kWays; w++) {
             if (set[w].key_hash == hash) {
                 *out = set[w].value;
@@ -121,7 +127,7 @@ struct CacheTable {
     void set(u32 key, i64 value) {
         if (slots == nullptr) return;
         const KeyHash hash = hash_key(key);
-        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
+        Slot* set = slots + range_int{set_index(hash)}.scaled_by<kWays>().index();
         u32 victim = 0;
         for (u32 w = 0; w < kWays; w++) {
             if (set[w].key_hash == hash) {  // match → update in place
@@ -192,7 +198,7 @@ inline CacheRegistry& cache_registry() {
 inline u64 cache_instance_identity(const char* name, u32 name_len) {
     u64 h = 0xCBF29CE484222325ull;
     for (u32 i = 0; i < name_len; i++) {
-        h ^= static_cast<u8>(name[i]);
+        h ^= byte_value(name[i]);
         h *= 0x100000001B3ull;
     }
     return h == 0 ? 1 : h;
@@ -229,16 +235,21 @@ inline void cache_registry_publish_locked(CacheRegistry& reg,
 #ifdef __APPLE__
             arc4random_buf(&s, sizeof(s));
 #else
-            if (::getrandom(&s, sizeof(s), 0) != static_cast<long>(sizeof(s))) s = 0;
+            constexpr auto kSeedSize = range_int<sizeof(s), sizeof(s) + 1>{};
+            if (::getrandom(&s, sizeof(s), 0) != kSeedSize.to<i64>()) s = 0;
 #endif
         }
         if (s == 0) {
             struct timespec ts{};
-            clock_gettime(CLOCK_MONOTONIC, &ts);
+            range_int<0, 1'000'000'000> nanoseconds;
+            u64 clock_seed = 0;
+            if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0 &&
+                decltype(nanoseconds)::try_from_i64(ts.tv_nsec, &nanoseconds))
+                clock_seed = nanoseconds.to_u64() * 0x9E3779B97F4A7C15ull;
             const u64 a = reinterpret_cast<u64>(&reg);
             const u64 b = reinterpret_cast<u64>(&reg.seed);
-            s = CacheTable::mix(static_cast<u32>(a ^ (a >> 32)),
-                                b ^ (static_cast<u64>(ts.tv_nsec) * 0x9E3779B97F4A7C15ull));
+            const auto folded = bounded_remainder<(u64{1} << 32)>(a ^ (a >> 32));
+            s = CacheTable::mix(folded.to<u32>(), b ^ clock_seed);
         }
         reg.seed.store(s, std::memory_order_relaxed);
     }

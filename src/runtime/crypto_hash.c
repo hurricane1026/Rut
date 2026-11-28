@@ -175,12 +175,11 @@ uint32_t rut_crypto_digest_parts_v1(uint32_t algorithm,
     if (algorithm > RUT_CRYPTO_SHA512_V1 || keyed > 1 || count > 16 || (!parts && count) ||
         key_len > 4096 || (!key && key_len))
         return 0;
-    uint32_t total = 0;
+    int64_t total = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        if ((!parts[i].data && parts[i].len) ||
-            (int64_t)parts[i].len > (int64_t)(1024u * 1024u + 4096u) - (int64_t)total)
-            return 0;
-        total = (uint32_t)((int64_t)total + (int64_t)parts[i].len);
+        const int64_t part_size = parts[i].len;
+        total += part_size;
+        if ((!parts[i].data && part_size) || total > 1024 * 1024 + 4096) return 0;
     }
     return rut_crypto_digest_unbounded_internal(
         algorithm, parts, count, key, key_len, keyed, output, capacity, output_len);

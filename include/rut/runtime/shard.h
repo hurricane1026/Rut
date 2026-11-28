@@ -107,11 +107,12 @@ struct Shard {
 
     // Initialize shard: mmap EventLoop, init backend + arena.
     // listen_fd must already be created with SO_REUSEPORT.
-    core::Expected<void, Error> init(u32 shard_id,
-                                     i32 lfd,
-                                     u32 pool_prealloc = 0,
-                                     u32 capacity = kDefaultConnectionCapacity,
-                                     u32 upstream_pool_capacity = UpstreamPool::kMaxConns) {
+    [[nodiscard]] core::Expected<void, Error> init(
+        u32 shard_id,
+        i32 lfd,
+        u32 pool_prealloc = 0,
+        u32 capacity = kDefaultConnectionCapacity,
+        u32 upstream_pool_capacity = UpstreamPool::kMaxConns) {
         last_init_failure_detail = IoUringInitFailureDetail::None;
         if (!validate_connection_capacity(capacity))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
@@ -379,7 +380,7 @@ struct Shard {
 
     // Spawn the shard's thread. Optionally pin to CPU core.
     // pin_cpu: -1 = no pinning, >=0 = pin to that core.
-    core::Expected<void, Error> spawn(i32 pin_cpu = -1) {
+    [[nodiscard]] core::Expected<void, Error> spawn([[maybe_unused]] i32 pin_cpu = -1) {
         if (!loop) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
         if (live_log_ring && !live_log_producer.initialized())
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
@@ -431,8 +432,6 @@ struct Shard {
             }
             // If CPU not in allowed set or getaffinity failed, spawn unpinned
         }
-#else
-        (void)pin_cpu;  // macOS development shards run without CPU affinity.
 #endif
 
         const bool kStartedPasswordNow =

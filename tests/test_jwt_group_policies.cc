@@ -347,7 +347,7 @@ struct TempSource {
     TempSource() {
         const char* dir = getenv("TMPDIR");
         if (snprintf(path, sizeof(path), "%s/rut-jwt-groups-XXXXXX", dir ? dir : "/tmp") >=
-            static_cast<int>(sizeof(path)))
+            int{sizeof(path)})
             return;
         fd = mkstemp(path);
     }

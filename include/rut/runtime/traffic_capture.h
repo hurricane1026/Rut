@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"  // realtime_us()
 #include <atomic>
@@ -77,7 +78,7 @@ bool capture_file_header_valid(const CaptureFileHeader* hdr);
 
 struct CaptureRing {
     static constexpr u32 kCapacity = 256;
-    static constexpr u32 kMask = static_cast<u32>(static_cast<i64>(kCapacity) - 1);
+    static constexpr u32 kMask = u32{i64{kCapacity} - 1};
 
     alignas(64) std::atomic<u32> write_pos;
     alignas(64) std::atomic<u32> read_pos;
@@ -93,8 +94,7 @@ struct CaptureRing {
     bool begin_push(CaptureEntry** out, u32* expected_wp) {
         const u32 wp = write_pos.load(std::memory_order_relaxed);
         const u32 rp = read_pos.load(std::memory_order_acquire);
-        u32 distance = 0;
-        (void)__builtin_sub_overflow(wp, rp, &distance);
+        const u32 distance = wrapping_sub(wp, rp);
         if (distance >= kCapacity) {
             return false;  // full
         }
@@ -109,9 +109,7 @@ struct CaptureRing {
 
     // Producer: complete a reservation started by begin_push().
     void commit_push(u32 expected_wp) {
-        u32 next = 0;
-        (void)__builtin_add_overflow(expected_wp, u32{1}, &next);
-        write_pos.store(next, std::memory_order_release);
+        write_pos.store(wrapping_add(expected_wp, u32{1}), std::memory_order_release);
     }
 
     // Producer: write an entry. Returns false if full (entry dropped).
@@ -134,18 +132,14 @@ struct CaptureRing {
         if (rp == wp) return false;
 
         out = entries[rp & kMask];
-        u32 next = 0;
-        (void)__builtin_add_overflow(rp, u32{1}, &next);
-        read_pos.store(next, std::memory_order_release);
+        read_pos.store(wrapping_add(rp, u32{1}), std::memory_order_release);
         return true;
     }
 
     u32 available() const {
         u32 wp = write_pos.load(std::memory_order_acquire);
         u32 rp = read_pos.load(std::memory_order_relaxed);
-        u32 distance = 0;
-        (void)__builtin_sub_overflow(wp, rp, &distance);
-        return distance;
+        return wrapping_sub(wp, rp);
     }
 };
 

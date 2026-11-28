@@ -18,6 +18,35 @@ TEST(byte_span, checks_pool_boundaries) {
     CHECK(byte_span_within(pool, u16{8}, pool + 7, u16{1}));
 }
 
+TEST(byte_span, publishes_only_contained_offsets) {
+    const char bytes[10]{};
+    const char* buffer = bytes + 1;
+    u32 offset = UINT32_MAX;
+    CHECK(byte_span_offset_within(buffer, 8u, buffer + 1, 7u, &offset));
+    CHECK_EQ(offset, 1u);
+    CHECK_FALSE(byte_span_offset_within(buffer, 8u, buffer + 1, u32{UINT32_MAX}, &offset));
+    CHECK_FALSE(byte_span_offset_within(buffer, 8u, bytes, 1u, &offset));
+    CHECK_EQ(offset, 1u);
+    CHECK(byte_span_offset_within(buffer, 8u, buffer + 8, 0u, &offset));
+    CHECK_EQ(offset, 8u);
+}
+
+#if UINTPTR_MAX > UINT32_MAX
+TEST(byte_span, publishes_offsets_above_four_gibibytes) {
+    // Model a wide address interval without allocating or reading memory.
+    constexpr uintptr_t kBase = 4096;
+    constexpr size_t kOffset = (u64{1} << 32) + 1;
+    const auto* buffer = reinterpret_cast<const void*>(kBase);
+    const auto* data = reinterpret_cast<const void*>(kBase + kOffset);
+    size_t offset = 0;
+    CHECK(byte_span_offset_within(buffer, kOffset + 1, data, size_t{1}, &offset));
+    CHECK_EQ(offset, kOffset);
+    CHECK_FALSE(byte_span_offset_within(buffer, kOffset, data, size_t{1}, &offset));
+    CHECK_FALSE(byte_span_offset_within(buffer, size_t{SIZE_MAX}, data, size_t{SIZE_MAX}, &offset));
+    CHECK_EQ(offset, kOffset);
+}
+#endif
+
 TEST(byte_span, checks_64_bit_length_arithmetic) {
     const char pool[3]{};
     constexpr u64 kLimit32 = u64{1} << 32;
@@ -32,6 +61,23 @@ TEST(byte_span, checks_64_bit_length_arithmetic) {
     CHECK_FALSE(byte_span_within(pool + 1, kLargest, pool, u64{0}));
     CHECK(byte_span_within(pool, size_t{3}, pool + 2, size_t{1}));
 }
+
+#if UINTPTR_MAX == UINT64_MAX
+TEST(byte_span, compares_full_width_integer_offsets) {
+    // Model numeric addresses without allocating or dereferencing memory.
+    const auto* base = reinterpret_cast<const char*>(uintptr_t{1});
+    const auto* data = reinterpret_cast<const char*>(UINTPTR_MAX);
+    constexpr u64 kCapacity = UINT64_MAX;
+    CHECK(byte_span_within(base, kCapacity, data, u64{1}));
+    CHECK_FALSE(byte_span_within(base, kCapacity, data, u64{2}));
+
+    u64 offset = 0;
+    CHECK(byte_span_offset_within(base, kCapacity, data, u64{1}, &offset));
+    CHECK_EQ(offset, kCapacity - 1);
+    CHECK_FALSE(byte_span_offset_within(base, kCapacity, data, u64{2}, &offset));
+    CHECK_EQ(offset, kCapacity - 1);
+}
+#endif
 
 // === Str ===
 

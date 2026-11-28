@@ -19,13 +19,13 @@ bool failure_leaves_output_unchanged(Str raw,
                                      ExactPathNormalizationResult expected,
                                      u32 capacity = kMaxExactPathViewLen) {
     char output[kMaxExactPathViewLen];
-    for (u32 i = 0; i < sizeof(output); i++) output[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < sizeof(output); i++) output[i] = char{0x5a};
     u32 output_len = 31337;
     if (normalize_exact_path_slashes(raw, output, capacity, &output_len) != expected ||
         output_len != 31337u)
         return false;
     for (u32 i = 0; i < sizeof(output); i++)
-        if (output[i] != static_cast<char>(0x5a)) return false;
+        if (output[i] != char{0x5a}) return false;
     return true;
 }
 
@@ -138,7 +138,7 @@ TEST(exact_path_view, invalid_destination_arguments_do_not_read_or_write) {
 
 TEST(exact_path_view, rejects_overflowing_raw_range_before_dereference) {
     char output[kMaxExactPathViewLen];
-    for (u32 i = 0; i < sizeof(output); i++) output[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < sizeof(output); i++) output[i] = char{0x5a};
     u32 output_len = 0x12345678u;
     const Str overflowing_raw{reinterpret_cast<const char*>(UINTPTR_MAX - uintptr_t{1}), 3};
 
@@ -153,7 +153,7 @@ TEST(exact_path_view, zero_output_capacity_is_transactional) {
     char raw_before[sizeof(raw)];
     for (u32 i = 0; i < sizeof(raw); i++) raw_before[i] = raw[i];
     char output[kMaxExactPathViewLen];
-    for (u32 i = 0; i < sizeof(output); i++) output[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < sizeof(output); i++) output[i] = char{0x5a};
     u32 output_len = 0x12345678u;
 
     CHECK(normalize_exact_path_slashes({raw, sizeof(raw) - 1u}, output, 0, &output_len) ==
@@ -165,13 +165,13 @@ TEST(exact_path_view, zero_output_capacity_is_transactional) {
 
 TEST(exact_path_view, rejects_output_length_overlapping_raw_transactionally) {
     alignas(u32) char storage[16];
-    for (u32 i = 0; i < sizeof(storage); i++) storage[i] = static_cast<char>(0x33);
+    for (u32 i = 0; i < sizeof(storage); i++) storage[i] = char{0x33};
     constexpr char kRaw[] = "/a//b///";
     for (u32 i = 0; i < sizeof(kRaw) - 1u; i++) storage[i + 2u] = kRaw[i];
     char storage_before[sizeof(storage)];
     for (u32 i = 0; i < sizeof(storage); i++) storage_before[i] = storage[i];
     char output[kMaxExactPathViewLen];
-    for (u32 i = 0; i < sizeof(output); i++) output[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < sizeof(output); i++) output[i] = char{0x5a};
     // The length object's address precedes raw, but its full four-byte range
     // overlaps raw by two bytes.
     auto* const aliased_len = reinterpret_cast<u32*>(storage);
@@ -188,7 +188,7 @@ TEST(exact_path_view, rejects_output_length_overlapping_output_transactionally) 
     char raw_before[sizeof(raw)];
     for (u32 i = 0; i < sizeof(raw); i++) raw_before[i] = raw[i];
     alignas(u32) char storage[kMaxExactPathViewLen + 2u];
-    for (u32 i = 0; i < sizeof(storage); i++) storage[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < sizeof(storage); i++) storage[i] = char{0x5a};
     char output_before[sizeof(storage)];
     for (u32 i = 0; i < sizeof(storage); i++) output_before[i] = storage[i];
     // The length object's address precedes output, but its full four-byte range
@@ -208,7 +208,7 @@ TEST(exact_path_view, rejects_overflowing_output_length_range_before_write) {
     char raw_before[sizeof(raw)];
     for (u32 i = 0; i < sizeof(raw); i++) raw_before[i] = raw[i];
     char output[kMaxExactPathViewLen];
-    for (u32 i = 0; i < sizeof(output); i++) output[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < sizeof(output); i++) output[i] = char{0x5a};
     auto* const overflowing_len = reinterpret_cast<u32*>(UINTPTR_MAX - uintptr_t{1});
 
     CHECK(normalize_exact_path_slashes(

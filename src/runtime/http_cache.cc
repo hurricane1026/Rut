@@ -1,6 +1,9 @@
 #include "rut/runtime/http_cache.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_parser.h"
 
 #include <time.h>
@@ -8,42 +11,59 @@
 namespace rut {
 namespace {
 
-bool valid_name(Str name) {
+constexpr i64 kMaxBufferedResponse =
+    (range_int<HttpCachePolicy::kMaxResponse, i64{HttpCachePolicy::kMaxResponse} + 1>{} -
+     range_int<256, 257>{})
+        .to<i64>();
+
+[[nodiscard]] u8 ascii_lower(char byte) {
+    const u8 c = byte_value(byte);
+    using Uppercase = range_int<'A', 'Z' + 1>;
+    Uppercase upper;
+    if (!Uppercase::try_from_u64(c, &upper)) return c;
+    return (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>();
+}
+
+[[nodiscard]] bool valid_name(Str name) {
     if (!name.len) return false;
     for (u32 i = 0; i < name.len; ++i)
-        if (!is_http_tchar(static_cast<u8>(name.ptr[i]))) return false;
+        if (!is_http_tchar(byte_value(name.ptr[i]))) return false;
     return true;
 }
-bool eq(Str value, const char* text, u32 length) {
+[[nodiscard]] bool eq(Str value, const char* text, u32 length) {
     return http_header_name_eq_ci(value.ptr, value.len, text, length);
 }
-Str trim(Str text) {
+[[nodiscard]] Str trim(Str text) {
     while (text.len && (*text.ptr == ' ' || *text.ptr == '\t')) {
-        text.ptr += static_cast<i64>(1);
-        text.len = static_cast<u32>(static_cast<i64>(text.len) - 1);
+        ++text.ptr;
+        --text.len;
     }
-    while (text.len && (text.ptr[static_cast<u32>(static_cast<i64>(text.len) - 1)] == ' ' ||
-                        text.ptr[static_cast<u32>(static_cast<i64>(text.len) - 1)] == '\t'))
-        text.len = static_cast<u32>(static_cast<i64>(text.len) - 1);
+    while (text.len) {
+        const char last = *(text.ptr + range_int{text.len}.index() - 1);
+        if (last != ' ' && last != '\t') break;
+        --text.len;
+    }
     return text;
 }
-bool decimal(Str text, u32& value) {
+[[nodiscard]] bool decimal(Str text, u32* value) {
     text = trim(text);
     if (text.len >= 2 && text.ptr[0] == '"' &&
-        text.ptr[static_cast<u32>(static_cast<i64>(text.len) - 1)] == '"')
-        text = {text.ptr + static_cast<i64>(1),
-                static_cast<u32>(static_cast<i64>(text.len) - static_cast<i64>(2))};
-    if (!text.len) return false;
-    i64 result = 0;
-    for (u32 i = 0; i < text.len; ++i) {
-        if (text.ptr[i] < '0' || text.ptr[i] > '9') return false;
-        const i64 digit = static_cast<i64>(text.ptr[i]) - static_cast<i64>('0');
-        if (result > (static_cast<i64>(UINT32_MAX) - digit) / 10)
-            result = 0xffffffffu;
-        else
-            result = result * 10 + digit;
+        *(text.ptr + range_int{text.len}.index() - 1) == '"') {
+        ++text.ptr;
+        --text.len;
+        --text.len;
     }
-    value = static_cast<u32>(result);
+    if (!text.len) return false;
+    u32 result = 0;
+    constexpr range_int<UINT32_MAX, UINT32_MAX + 1LL> kMax{};
+    for (u32 i = 0; i < text.len; ++i) {
+        const char byte = text.ptr[i];
+        if (byte < '0' || byte > '9') return false;
+        static_assert('0' == 0x30 && '9' == 0x39);
+        const auto digit = bounded_remainder<16>(byte_value(byte));
+        result = (range_int(result).scaled_by<10>() + digit).min(kMax).to<u32>();
+    }
+    *value = result;
     return true;
 }
 struct Controls {
@@ -56,7 +76,7 @@ struct Controls {
     u32 shared_age = 0xffffffffu;
     u32 min_fresh = 0;
 };
-bool controls(Str text, Controls& out, bool response) {
+[[nodiscard]] bool controls(Str text, Controls& out, bool response) {
     u32 begin = 0;
     while (begin < text.len) {
         u32 end = begin;
@@ -67,18 +87,15 @@ bool controls(Str text, Controls& out, bool response) {
             if (text.ptr[end] == '\\') return false;  // conservative on escaped extension values
         }
         if (quoted) return false;
-        Str item = trim({text.ptr + static_cast<i64>(begin),
-                         static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(begin))});
+        const Str item = trim(text.slice(begin, end));
         if (!item.len) return false;
         u32 separator = 0;
         while (separator < item.len && item.ptr[separator] != '=') ++separator;
         const Str name = trim({item.ptr, separator});
         if (!valid_name(name)) return false;
         const bool valued = separator < item.len;
-        const Str value = valued ? trim({item.ptr + static_cast<i64>(separator) + 1,
-                                         static_cast<u32>(static_cast<i64>(item.len) -
-                                                          static_cast<i64>(separator) - 1)})
-                                 : Str{};
+        if (valued) ++separator;
+        const Str value = valued ? trim(item.slice(separator, item.len)) : Str{};
         if (eq(name, "no-store", 8) || eq(name, "no-cache", 8) ||
             (response && eq(name, "private", 7)))
             out.blocked = true;
@@ -99,11 +116,12 @@ bool controls(Str text, Controls& out, bool response) {
             seen = &out.min_seen;
         }
         if (target) {
-            if (!valued || *seen || !decimal(value, *target)) return false;
+            if (!valued || *seen || !decimal(value, target)) return false;
             *seen = true;
         }
         if (end == text.len) break;
-        begin = static_cast<u32>(static_cast<i64>(end) + 1);
+        begin = end;
+        ++begin;
         if (begin == text.len) return false;
     }
     return true;
@@ -117,20 +135,20 @@ bool hop_header(Str name) {
            eq(name, "keep-alive", 10) || eq(name, "transfer-encoding", 17) || eq(name, "te", 2) ||
            eq(name, "trailer", 7) || eq(name, "upgrade", 7);
 }
-bool token_list(Str text, bool vary) {
+[[nodiscard]] bool token_list(Str text, bool vary) {
     u32 begin = 0;
     while (begin < text.len) {
         u32 end = begin;
         while (end < text.len && text.ptr[end] != ',') ++end;
-        const Str name = trim({text.ptr + static_cast<i64>(begin),
-                               static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(begin))});
+        const Str name = trim(text.slice(begin, end));
         if (!valid_name(name)) return false;
         if (vary) {
             if (eq(name, "*", 1) || ignored_key_header(name) || hop_header(name)) return false;
         } else if (!eq(name, "close", 5) && !eq(name, "keep-alive", 10))
             return false;
         if (end == text.len) return true;
-        begin = static_cast<u32>(static_cast<i64>(end) + 1);
+        begin = end;
+        ++begin;
     }
     return false;
 }
@@ -139,71 +157,83 @@ u64 hash_bytes(u64 hash, const void* bytes, u32 size) {
     for (u32 i = 0; i < size; ++i) hash = (hash ^ data[i]) * 1099511628211ull;
     return hash;
 }
-bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
-    if (static_cast<i64>(size) >
-        static_cast<i64>(HttpCachePolicy::kMaxKey) - static_cast<i64>(key.len))
-        return false;
-    __builtin_memcpy(key.bytes + static_cast<i64>(key.len), bytes, size);
-    key.len = static_cast<u32>(static_cast<i64>(key.len) + static_cast<i64>(size));
+[[nodiscard]] bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
+    const auto start = range_int(key.len);
+    using KeyLength = range_int<0, i64{HttpCachePolicy::kMaxKey} + 1>;
+    KeyLength end;
+    if (!KeyLength::try_from_i64((start + range_int{size}).value(), &end)) return false;
+    __builtin_memcpy(key.bytes + start.index(), bytes, size);
+    key.len = end.to<u32>();
     return true;
 }
+using HttpDateSeconds = range_int<0, 1LL << 40>;
+
+[[nodiscard]] bool date_pair(const char* text, range_int<0, 100>* out) {
+    using Digit = range_int<0, 10>;
+    constexpr auto kZeroByte = range_int<'0', '0' + 1>{};
+    Digit first, second;
+    if (!Digit::try_from_i64((range_int{byte_value(text[0])} - kZeroByte).value(), &first) ||
+        !Digit::try_from_i64((range_int{byte_value(text[1])} - kZeroByte).value(), &second))
+        return false;
+    *out = first.scaled_by<10>() + second;
+    return true;
+}
+
 // IMF-fixdate only. Unsupported/invalid date syntax is a cache bypass, never a
 // guess at freshness. No locale, timezone configuration or wall-clock mutation.
-bool http_date(Str value, u64& seconds) {
+[[nodiscard]] bool http_date(Str value, HttpDateSeconds* seconds) {
     if (value.len != 29 || value.ptr[3] != ',' || value.ptr[4] != ' ' || value.ptr[7] != ' ' ||
         value.ptr[11] != ' ' || value.ptr[16] != ' ' || value.ptr[19] != ':' ||
         value.ptr[22] != ':' || value.ptr[25] != ' ' || !Str{value.ptr + 26, 3}.eq(lit_str("GMT")))
         return false;
     const char* p = value.ptr;
-    auto number = [&](u32 start, u32 count, u32& result) {
-        result = 0;
-        for (u32 i = 0; i < count; ++i) {
-            const char c = p[static_cast<u32>(static_cast<i64>(start) + static_cast<i64>(i))];
-            if (c < '0' || c > '9') return false;
-            result = static_cast<u32>(static_cast<i64>(result) * 10 + static_cast<i64>(c) -
-                                      static_cast<i64>('0'));
-        }
-        return true;
-    };
-    u32 day, year, hour, minute, second;
-    if (!number(5, 2, day) || !number(12, 4, year) || !number(17, 2, hour) ||
-        !number(20, 2, minute) || !number(23, 2, second) || year < 1970 || hour > 23 ||
-        minute > 59 || second > 59)
+    range_int<0, 100> day, century, year_suffix, hour, minute, second;
+    if (!date_pair(p + 5, &day) || !date_pair(p + 12, &century) ||
+        !date_pair(p + 14, &year_suffix) || !date_pair(p + 17, &hour) ||
+        !date_pair(p + 20, &minute) || !date_pair(p + 23, &second) || hour.value() > 23 ||
+        minute.value() > 59 || second.value() > 59)
         return false;
+    const auto year = century.scaled_by<100>() + year_suffix;
+    if (year.value() < 1970) return false;
+
     constexpr char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    constexpr u32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    constexpr i32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    constexpr u16 kDaysBeforeMonth[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
     u32 month = 0;
-    while (month < 12 &&
-           !Str{p + static_cast<i64>(8), 3}.eq({kMonths + static_cast<i64>(month) * 3, 3}))
+    while (month < 12 && !Str{p + 8, 3}.eq({kMonths + range_int{month}.scaled_by<3>().index(), 3}))
         ++month;
     if (month == 12) return false;
-    const bool kLeap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if (day == 0 || static_cast<i64>(day) > static_cast<i64>(kDays[month]) +
-                                                static_cast<i64>(month == 1 && kLeap ? 1u : 0u))
+    const bool kLeap =
+        year.value() % 4 == 0 && (year.value() % 100 != 0 || year.value() % 400 == 0);
+    if (day.value() == 0 || day.value() > range_int{kDays[month]}.to<i64>() + (month == 1 && kLeap))
         return false;
-    auto leap_years = [](u32 y) -> u64 {
-        return static_cast<u64>(static_cast<i64>(y / 4) - static_cast<i64>(y / 100) +
-                                static_cast<i64>(y / 400));
+
+    constexpr range_int<0, 1> kZero{};
+    constexpr range_int<1, 2> kOne{};
+    constexpr range_int<1970, 1971> kEpochYear{};
+    auto leap_years = [](auto y) {
+        return y.template divided_by<4>() - y.template divided_by<100>() +
+               y.template divided_by<400>();
     };
-    i64 days = (static_cast<i64>(year) - 1970) * 365 +
-               static_cast<i64>(leap_years(static_cast<u32>(static_cast<i64>(year) - 1))) -
-               static_cast<i64>(leap_years(1969));
-    for (u32 i = 0; i < month; ++i)
-        days += static_cast<i64>(kDays[i]) + static_cast<i64>(i == 1 && kLeap ? 1u : 0u);
-    days += static_cast<i64>(day) - 1;
+    const auto year_days = (year - kEpochYear).max(kZero).scaled_by<365>();
+    const auto leap_days =
+        leap_years((year - kOne).max(kZero)) - leap_years(range_int<1969, 1970>{});
+    const auto month_days =
+        range_int(kDaysBeforeMonth[month]) + range_int(u8{month > 1 && kLeap}) + day - kOne;
+    const auto days = (year_days + leap_days + month_days).max(kZero);
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
-    if (!Str{p, 3}.eq({kWeekdays + static_cast<i64>((days + 4) % 7) * 3, 3})) return false;
-    seconds = static_cast<u64>(days * 86400 + static_cast<i64>(hour) * 3600 +
-                               static_cast<i64>(minute) * 60 + static_cast<i64>(second));
+    if (!Str{p, 3}.eq({kWeekdays + ((days.value() + 4) % 7) * 3, 3})) return false;
+    *seconds = days.scaled_by<86400>() + hour.scaled_by<3600>() + minute.scaled_by<60>() + second;
     return true;
 }
 struct ResponseInfo {
     ParsedResponse parsed;
     u32 header_end = 0;
-    u32 ttl = 0;
+    u64 remaining_us = 0;
     u64 age_us = 0;
 };
-bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, ResponseInfo& info) {
+[[nodiscard]] bool response_info(
+    const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, ResponseInfo& info) {
     HttpResponseParser parser;
     parser.reset();
     info.parsed.reset();
@@ -211,22 +241,20 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     if (parser.parse(wire, length, &response) != ParseStatus::Complete ||
         response.status_code != 200 || response.headers_truncated || response.chunked ||
         !response.has_content_length || response.content_length_count != 1 ||
-        static_cast<i64>(response.content_length) >
-            static_cast<i64>(HttpCachePolicy::kMaxResponse) - 256 ||
-        static_cast<i64>(parser.header_end) > static_cast<i64>(HttpCachePolicy::kMaxResponse) -
-                                                  256 - static_cast<i64>(response.content_length))
+        response.content_length < 0 ||
+        response.content_length > i64{kMaxBufferedResponse} - i64{parser.header_end})
         return false;
     info.header_end = parser.header_end;
     Controls policy;
     u32 age = 0;
     bool age_seen = false, date_seen = false, expires_seen = false;
-    u64 date = 0, expires = 0;
+    HttpDateSeconds date, expires;
     for (u32 i = 0; i < response.header_count; ++i) {
         const auto& header = response.headers[i];
         const Str name = header.name;
         if (!valid_name(name)) return false;
         for (u32 j = 0; j < header.value.len; ++j) {
-            const u8 c = static_cast<u8>(header.value.ptr[j]);
+            const u8 c = byte_value(header.value.ptr[j]);
             if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
         }
         if (eq(name, "cache-control", 13)) {
@@ -236,13 +264,13 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
         } else if (eq(name, "connection", 10)) {
             if (!token_list(header.value, false)) return false;
         } else if (eq(name, "age", 3)) {
-            if (age_seen || !decimal(header.value, age)) return false;
+            if (age_seen || !decimal(header.value, &age)) return false;
             age_seen = true;
         } else if (eq(name, "date", 4)) {
-            if (date_seen || !http_date(header.value, date)) return false;
+            if (date_seen || !http_date(header.value, &date)) return false;
             date_seen = true;
         } else if (eq(name, "expires", 7)) {
-            if (expires_seen || !http_date(header.value, expires)) return false;
+            if (expires_seen || !http_date(header.value, &expires)) return false;
             expires_seen = true;
         } else if (eq(name, "set-cookie", 10) || eq(name, "set-cookie2", 11) ||
                    eq(name, "content-range", 13) || eq(name, "trailer", 7) ||
@@ -253,38 +281,37 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     // origin metadata. Date-less responses continue through the ordinary proxy.
     if (policy.blocked || !date_seen || wall == 0 || cap == 0 || cap > HttpCachePolicy::kMaxTtl)
         return false;
-    u64 lifetime = cap;
+    i64 lifetime = cap;
     if (policy.shared_seen)
         lifetime = policy.shared_age;
     else if (policy.max_seen)
         lifetime = policy.max_age;
     else if (expires_seen)
-        lifetime = expires > date
-                       ? static_cast<u64>(static_cast<i64>(expires) - static_cast<i64>(date))
-                       : 0;
-    if (lifetime > cap) lifetime = cap;
-    const u64 kDateUs = static_cast<u64>(static_cast<i64>(date) * 1000000);
+        lifetime = (expires - date).value();
+    const auto ttl = range_int(lifetime).max(range_int<0, 1>{}).min(range_int(cap));
+    const u64 kLifetimeUs = ttl.scaled_by<1'000'000>().to_u64();
+    const u64 kDateUs = date.scaled_by<1'000'000>().to_u64();
     u64 kApparent = 0;
-    if (wall > kDateUs && __builtin_sub_overflow(wall, kDateUs, &kApparent)) return false;
-    const u64 age_us = static_cast<u64>(age) * 1000000;
+    if (wall > kDateUs && sub_overflow(wall, kDateUs, &kApparent)) return false;
+    const u64 age_us = range_int(age).scaled_by<1'000'000>().to_u64();
     u64 max_delay = 0;
-    if (__builtin_sub_overflow(~u64{0}, age_us, &max_delay) || delay > max_delay) return false;
+    if (sub_overflow(~u64{0}, age_us, &max_delay) || delay > max_delay) return false;
     u64 kAge = 0;
-    if (__builtin_add_overflow(age_us, delay, &kAge)) return false;
+    if (add_overflow(age_us, delay, &kAge)) return false;
     const u64 kInitial = kApparent > kAge ? kApparent : kAge;
-    if (kInitial >= static_cast<u64>(static_cast<i64>(lifetime) * 1000000)) return false;
-    info.ttl = static_cast<u32>(lifetime);
+    if (sub_overflow(kLifetimeUs, kInitial, &info.remaining_us) || info.remaining_us == 0)
+        return false;
     info.age_us = kInitial;
     return true;
 }
-bool copy_response(const HttpCacheStorage::Record& entry,
-                   u64 now,
-                   bool keep_alive,
-                   bool http10,
-                   u8* out,
-                   u32 capacity,
-                   u32& written) {
-    written = 0;
+[[nodiscard]] bool copy_response(const HttpCacheStorage::Record& entry,
+                                 u64 now,
+                                 bool keep_alive,
+                                 bool http10,
+                                 u8* out,
+                                 u32 capacity,
+                                 u32* written) {
+    *written = 0;
     if (!entry.response || entry.response_len > HttpCacheStorage::kMaxResponse) return false;
     HttpResponseParser parser;
     ParsedResponse response;
@@ -294,14 +321,16 @@ bool copy_response(const HttpCacheStorage::Record& entry,
         response.status_code != 200 || response.headers_truncated || response.chunked ||
         !response.has_content_length || response.content_length_count != 1 ||
         parser.header_end > entry.response_len ||
-        response.content_length != static_cast<u32>(static_cast<i64>(entry.response_len) -
-                                                    static_cast<i64>(parser.header_end)))
+        response.content_length !=
+            (range_int(entry.response_len) - range_int(parser.header_end)).value())
         return false;
+    const auto limit = range_int{capacity};
     auto add = [&](const void* p, u32 n) {
-        if (static_cast<i64>(n) > static_cast<i64>(capacity) - static_cast<i64>(written))
-            return false;
-        __builtin_memcpy(out + static_cast<i64>(written), p, n);
-        written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(n));
+        const auto start = range_int(*written);
+        auto end = range_int{u32{0}};
+        if (!limit.try_count((start + range_int{n}).value(), &end)) return false;
+        __builtin_memcpy(out + start.index(), p, n);
+        *written = end.to<u32>();
         return true;
     };
     if (!add(http10 ? "HTTP/1.0 200 OK\r\n" : "HTTP/1.1 200 OK\r\n", 17)) return false;
@@ -313,25 +342,26 @@ bool copy_response(const HttpCacheStorage::Record& entry,
             return false;
     }
     u64 elapsed = 0;
-    if (now >= entry.stored_us && __builtin_sub_overflow(now, entry.stored_us, &elapsed))
-        return false;
+    if (now >= entry.stored_us && sub_overflow(now, entry.stored_us, &elapsed)) return false;
     u64 age_total = 0;
-    if (__builtin_add_overflow(entry.initial_age_us, elapsed, &age_total)) return false;
+    if (add_overflow(entry.initial_age_us, elapsed, &age_total)) return false;
     const u64 kAge = age_total / 1000000;
     char digits[20];
     u32 count = 0;
     u64 value = kAge;
     do {
-        digits[count++] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(value % 10));
+        digits[count++] = last_decimal_digit(value);
         value /= 10;
     } while (value);
     if (!add("Age: ", 5)) return false;
-    for (u32 i = count; i > 0; --i)
-        if (!add(digits + static_cast<i64>(i) - 1, 1)) return false;
+    while (count > 0) {
+        --count;
+        if (!add(digits + range_int{count}.index(), 1)) return false;
+    }
     const Str connection = keep_alive ? lit_str("\r\nConnection: keep-alive\r\n\r\n")
                                       : lit_str("\r\nConnection: close\r\n\r\n");
     return add(connection.ptr, connection.len) &&
-           add(entry.response + static_cast<i64>(parser.header_end), response.content_length);
+           add(entry.response + range_int(parser.header_end).index(), response.content_length);
 }
 }  // namespace
 
@@ -375,9 +405,7 @@ bool HttpCachePolicy::make_key(
     if (hosts != 1 || host.len == 0 || req.path.len == 0 || req.path.ptr[0] != '/') return false;
     u64 host_hash = hash_bytes(1469598103934665603ull, &tls, sizeof(tls));
     for (u32 i = 0; i < host.len; ++i) {
-        u8 c = static_cast<u8>(host.ptr[i]);
-        if (c >= 'A' && c <= 'Z')
-            c = static_cast<u8>(static_cast<i64>(c) + static_cast<i64>('a' - 'A'));
+        const u8 c = ascii_lower(host.ptr[i]);
         host_hash = hash_bytes(host_hash, &c, 1);
     }
     key.host = host_hash;
@@ -390,9 +418,7 @@ bool HttpCachePolicy::make_key(
         const auto& header = req.headers[i];
         if (ignored_key_header(header.name)) continue;
         for (u32 j = 0; j < header.name.len; ++j) {
-            u8 c = static_cast<u8>(header.name.ptr[j]);
-            if (c >= 'A' && c <= 'Z')
-                c = static_cast<u8>(static_cast<i64>(c) + static_cast<i64>('a' - 'A'));
+            const u8 c = ascii_lower(header.name.ptr[j]);
             if (!append(key, &c, 1)) return true;
         }
         if (!append(key, ":", 1) || !append(key, header.value.ptr, header.value.len) ||
@@ -404,28 +430,27 @@ bool HttpCachePolicy::make_key(
     return true;
 }
 
-bool HttpCachePolicy::read_response(const Key& key,
-                                    const Record& record,
-                                    u64 now_us,
-                                    bool keep_alive,
-                                    u8* output,
-                                    u32 capacity,
-                                    u32& written) {
+[[nodiscard]] bool HttpCachePolicy::read_response(const Key& key,
+                                                  const Record& record,
+                                                  u64 now_us,
+                                                  bool keep_alive,
+                                                  u8* output,
+                                                  u32 capacity,
+                                                  u32* written) {
     u64 kElapsed = ~u64{0};
-    if (now_us >= record.stored_us && __builtin_sub_overflow(now_us, record.stored_us, &kElapsed))
+    if (now_us >= record.stored_us && sub_overflow(now_us, record.stored_us, &kElapsed))
         return false;
     u64 kAgeUs = ~u64{0};
     u64 max_age = 0;
-    if (__builtin_sub_overflow(~u64{0}, record.initial_age_us, &max_age)) return false;
-    if (kElapsed <= max_age && __builtin_add_overflow(kElapsed, record.initial_age_us, &kAgeUs))
-        return false;
+    if (sub_overflow(~u64{0}, record.initial_age_us, &max_age)) return false;
+    if (kElapsed <= max_age && add_overflow(kElapsed, record.initial_age_us, &kAgeUs)) return false;
     const bool kFresh =
         now_us < record.expires_us && now_us >= record.stored_us &&
-        kAgeUs <= static_cast<u64>(static_cast<i64>(key.max_age) * 1000000) &&
+        kAgeUs <= range_int(key.max_age).scaled_by<1'000'000>().to_u64() &&
         key.min_fresh <= kMaxTtl &&
-        static_cast<u64>(static_cast<i64>(key.min_fresh) * 1000000) < ([&] {
+        range_int(key.min_fresh).scaled_by<1'000'000>().to_u64() < ([&] {
             u64 remaining = 0;
-            return __builtin_sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
+            return sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
         }());
     return kFresh &&
            copy_response(record, now_us, keep_alive, key.http10, output, capacity, written);
@@ -438,32 +463,36 @@ bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& t
     info.parsed.reset();
     if (parser.parse(response, length, &info.parsed) != ParseStatus::Complete ||
         info.parsed.status_code != 200 || info.parsed.headers_truncated || info.parsed.chunked ||
-        !info.parsed.has_content_length || info.parsed.content_length_count != 1 ||
-        static_cast<i64>(info.parsed.content_length) > static_cast<i64>(kMaxResponse) - 256 ||
-        static_cast<i64>(parser.header_end) >
-            static_cast<i64>(kMaxResponse) - 256 - static_cast<i64>(info.parsed.content_length))
+        !info.parsed.has_content_length || info.parsed.content_length_count != 1)
         return false;
-    total = static_cast<u32>(static_cast<i64>(parser.header_end) +
-                             static_cast<i64>(info.parsed.content_length));
+    if (info.parsed.content_length < 0 ||
+        info.parsed.content_length > i64{kMaxBufferedResponse} - i64{parser.header_end})
+        return false;
+    const u32 response_size = range_int(i64{parser.header_end} + info.parsed.content_length)
+                                  .max(range_int(u32{0}))
+                                  .min(range_int(UINT32_MAX))
+                                  .to<u32>();
+    using BufferedLength = range_int<0, kMaxBufferedResponse + 1>;
+    BufferedLength checked;
+    if (!BufferedLength::try_from_i64(i64{response_size}, &checked)) return false;
+    total = checked.to<u32>();
     return true;
 }
 bool HttpCachePolicy::prepare_record(
     const Fill& fill, const u8* response, u32 length, u64 now_us, u64 wall_us, Record& record) {
     if (!response || length > kMaxResponse || now_us < fill.started_us) return false;
     u64 kElapsed = 0;
-    if (__builtin_sub_overflow(now_us, fill.started_us, &kElapsed)) return false;
+    if (sub_overflow(now_us, fill.started_us, &kElapsed)) return false;
     ResponseInfo info;
     if (!response_info(response, length, fill.ttl, wall_us, kElapsed, info) ||
-        length != static_cast<u32>(static_cast<i64>(info.header_end) +
-                                   static_cast<i64>(info.parsed.content_length)))
+        info.parsed.content_length < 0 || info.header_end > length ||
+        info.parsed.content_length != i64{length} - i64{info.header_end})
         return false;
-    const u64 kRemainingUs =
-        static_cast<u64>(static_cast<i64>(info.ttl) * 1000000 - static_cast<i64>(info.age_us));
+    const u64 kRemainingUs = info.remaining_us;
     u64 max_remaining = 0;
-    if (__builtin_sub_overflow(~u64{0}, kRemainingUs, &max_remaining) || now_us > max_remaining)
-        return false;
+    if (sub_overflow(~u64{0}, kRemainingUs, &max_remaining) || now_us > max_remaining) return false;
     u64 expires_us = 0;
-    if (__builtin_add_overflow(now_us, kRemainingUs, &expires_us)) return false;
+    if (add_overflow(now_us, kRemainingUs, &expires_us)) return false;
     record = {response, length, now_us, expires_us, info.age_us};
     return true;
 }
@@ -475,19 +504,20 @@ u64 http_cache_config_identity() {
     static u64 next = 0;
     return __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED);
 }
-u64 http_cache_wall_us() {
-    struct timespec now{};
-    return clock_gettime(CLOCK_REALTIME, &now) == 0 && now.tv_sec > 0 && now.tv_nsec >= 0 &&
-                   now.tv_nsec < 1000000000 && static_cast<u64>(now.tv_sec) <= ~u64{0} / 1000000
-               ? ([&] {
-                     u64 whole = 0;
-                     u64 fractional = static_cast<u64>(now.tv_nsec) / 1000;
-                     if (__builtin_mul_overflow(
-                             static_cast<u64>(now.tv_sec), u64{1000000}, &whole) ||
-                         __builtin_add_overflow(whole, fractional, &whole))
-                         return u64{0};
-                     return whole;
-                 }())
-               : 0;
+[[nodiscard]] u64 http_cache_wall_us() {
+    timespec now{};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
+    constexpr u64 kMicrosPerSecond = 1'000'000;
+    constexpr i64 kMaxWholeSeconds = UINT64_MAX / kMicrosPerSecond;
+    range_int<1, kMaxWholeSeconds + 1> seconds;
+    range_int<0, 1'000'000'000> nanos;
+    if (!decltype(seconds)::try_from_i64(now.tv_sec, &seconds) ||
+        !decltype(nanos)::try_from_i64(now.tv_nsec, &nanos))
+        return 0;
+    const u64 whole = seconds.to_u64() * kMicrosPerSecond;
+    const u64 fractional = nanos.divided_by<1000>().to_u64();
+    u64 result;
+    if (add_overflow(whole, fractional, &result)) return 0;
+    return result;
 }
 }  // namespace rut

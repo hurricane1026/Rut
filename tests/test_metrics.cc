@@ -352,8 +352,7 @@ TEST_F(MetricsLoopF, requests_active_decremented_after_partial_send_completes) {
     const u32 send_len = self.c->send_buf.len();
     REQUIRE(send_len > 1u);
     const u32 partial_len = 1u;
-    self.loop.inject_and_dispatch(
-        make_ev(self.cid, IoEventType::Send, static_cast<i32>(partial_len)));
+    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, i32{partial_len}));
     CHECK_EQ(self.m.requests_active, 1u);
     self.loop.inject_and_dispatch(
         make_ev(self.cid, IoEventType::Send, static_cast<i32>(send_len - partial_len)));
@@ -508,7 +507,7 @@ TEST_F(MetricsLoopF, 502_response_records_correct_status) {
 TEST(prometheus, counters_and_histogram) {
     ShardMetrics m;
     m.init();
-    m.requests_total = 5;
+    m.requests_total = UINT64_MAX;
     m.connections_active = 3;
     m.rate_limit_attempts_total = 8;
     m.rate_limit_rejected_total = 2;
@@ -526,7 +525,7 @@ TEST(prometheus, counters_and_histogram) {
     const u32 n = format_prometheus(m, buf, sizeof(buf));
     REQUIRE(n > 0);
     CHECK(prom_contains(buf, n, "# TYPE rut_requests_total counter\n"));
-    CHECK(prom_contains(buf, n, "rut_requests_total 5\n"));
+    CHECK(prom_contains(buf, n, "rut_requests_total 18446744073709551615\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_attempts_total 8\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_rejected_reason_total{reason=\"budget\"} 1\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_rules_evaluated_total{scope=\"shard\"} 3\n"));

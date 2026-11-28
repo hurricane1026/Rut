@@ -327,7 +327,7 @@ static std::vector<unsigned char> dropped_header() {
     put32(kDroppedMagic);
     put16(kDroppedVersion);
     put16(static_cast<u16>(Role::Dropped));
-    put16(static_cast<u16>(kDroppedFdCount));
+    put16(u16{kDroppedFdCount});
     put16(0);
     put32(0);
     return wire;

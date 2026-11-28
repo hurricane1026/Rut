@@ -31,7 +31,7 @@ struct CollectedValues {
                 if (offsets[i] < offsets[j] + sizeof(Str) && offsets[j] < offsets[i] + sizeof(Str))
                     return nullptr;
         }
-        const u32 kBytes = static_cast<u32>(sizeof(CollectedValues)) + width * capacity;
+        const u32 kBytes = u32{sizeof(CollectedValues)} + width * capacity;
         if (arena->space_used() > kArenaBudget - kBytes ||
             (!arena->current && !arena->init(arena->backend.pool)))
             return nullptr;
@@ -48,7 +48,7 @@ struct CollectedValues {
 
     bool append(const void* item, u32 size) {
         if (!item || !arena || size != width || count >= capacity) return false;
-        auto* destination = reinterpret_cast<u8*>(this + 1) + static_cast<u64>(count) * width;
+        auto* destination = reinterpret_cast<u8*>(this + 1) + u64{count} * width;
         __builtin_memcpy(destination, item, width);
         // A returned record must not retain an input/scratch view. Copy string
         // leaves before publishing count; failure never publishes half a record.

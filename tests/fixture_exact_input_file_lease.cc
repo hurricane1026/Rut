@@ -22,25 +22,24 @@ constexpr unsigned kNameAttempts = 32u;
 constexpr unsigned kInterruptedAttempts = 64u;
 
 Identity make_identity(const struct stat& value) {
-    return {static_cast<std::uint64_t>(value.st_dev),
-            static_cast<std::uint64_t>(value.st_ino),
-            static_cast<std::uint64_t>(value.st_mode),
-            static_cast<std::uint64_t>(value.st_uid),
-            static_cast<std::uint64_t>(value.st_gid),
+    return {std::uint64_t{value.st_dev},
+            std::uint64_t{value.st_ino},
+            std::uint64_t{value.st_mode},
+            std::uint64_t{value.st_uid},
+            std::uint64_t{value.st_gid},
             value.st_size < 0 ? 0u : static_cast<std::uint64_t>(value.st_size),
-            static_cast<std::uint64_t>(value.st_nlink)};
+            std::uint64_t{value.st_nlink}};
 }
 
 bool same_inode(const struct stat& value, const Identity& expected) {
-    return S_ISREG(value.st_mode) && static_cast<std::uint64_t>(value.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(value.st_ino) == expected.inode;
+    return S_ISREG(value.st_mode) && std::uint64_t{value.st_dev} == expected.device &&
+           std::uint64_t{value.st_ino} == expected.inode;
 }
 
 bool same_linked_file(const struct stat& value, const Identity& expected, bool linked) {
-    return same_inode(value, expected) &&
-           static_cast<std::uint64_t>(value.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(value.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(value.st_gid) == expected.gid && value.st_size >= 0 &&
+    return same_inode(value, expected) && std::uint64_t{value.st_mode} == expected.mode &&
+           std::uint64_t{value.st_uid} == expected.uid &&
+           std::uint64_t{value.st_gid} == expected.gid && value.st_size >= 0 &&
            static_cast<std::uint64_t>(value.st_size) == expected.size &&
            value.st_nlink == (linked ? 1u : 0u) && (value.st_mode & 0777) == 0600;
 }
@@ -58,12 +57,11 @@ int ordinary_kcmp(int first, int second) {
 
 bool same_directory(const struct stat& value,
                     const fixture_private_directory_lease::Identity& expected) {
-    return S_ISDIR(value.st_mode) && static_cast<std::uint64_t>(value.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(value.st_ino) == expected.inode &&
-           static_cast<std::uint64_t>(value.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(value.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(value.st_gid) == expected.gid &&
-           (value.st_mode & 0777) == 0700;
+    return S_ISDIR(value.st_mode) && std::uint64_t{value.st_dev} == expected.device &&
+           std::uint64_t{value.st_ino} == expected.inode &&
+           std::uint64_t{value.st_mode} == expected.mode &&
+           std::uint64_t{value.st_uid} == expected.uid &&
+           std::uint64_t{value.st_gid} == expected.gid && (value.st_mode & 0777) == 0700;
 }
 
 bool descriptor_flags(int descriptor, int access_mode, bool directory) {

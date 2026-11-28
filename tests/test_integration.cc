@@ -714,7 +714,7 @@ static bool test_mtls_client_rejected(u16 port,
                 "GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
             errno = 0;
             const i32 write_rc = SSL_write(ssl, kRequest, sizeof(kRequest) - 1);
-            if (write_rc == static_cast<i32>(sizeof(kRequest) - 1)) {
+            if (write_rc == i32{sizeof(kRequest) - 1}) {
                 char response[256]{};
                 errno = 0;
                 const i32 read_rc = SSL_read(ssl, response, sizeof(response));
@@ -1761,10 +1761,10 @@ TEST(timer_dsl, timer_before_routes_does_not_consume_http_capacity) {
 
 TEST(timer_dsl, accepts_millisecond_intervals) {
     using namespace rut;
-    const char* source =
+    constexpr char source[] =
         "timer fast, every: 500ms { }\n"
         "timer slow, every: 1500ms { }\n";
-    auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+    auto lexed = lex(lit_str(source));
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
@@ -2073,7 +2073,7 @@ static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc
         &thread,
         nullptr,
         [](void* data) -> void* {
-            static_cast<Loop*>(data)->run();
+            reinterpret_cast<Loop*>(data)->run();
             return nullptr;
         },
         loop.get());
@@ -2867,7 +2867,7 @@ struct HealthProbeServer {
             int n = snprintf(resp,
                              sizeof(resp),
                              "HTTP/1.1 %u %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                             static_cast<unsigned>(code),
+                             unsigned{code},
                              reason);
             if (n > 0) (void)send_all(client, resp, static_cast<u32>(n));
             close(client);
@@ -3617,7 +3617,7 @@ TEST(active_health, route_config_rejects_invalid_probe_config) {
 
     const char with_space[] = "/health check";
     const char with_control[] = {'/', 'h', '\t', 'x'};
-    const char with_del[] = {'/', 'h', static_cast<char>(0x7f), 'x'};
+    const char with_del[] = {'/', 'h', char{0x7f}, 'x'};
 
     CHECK(!cfg.set_upstream_health_check(
         uid, with_space, sizeof(with_space) - 1, /*interval_ms=*/1000, /*status=*/200));
@@ -4397,8 +4397,7 @@ TEST(partial_send, real_epollout_completion) {
     if (backend.pending_count > 0) {
         u32 n = backend.wait(events, 16, &conn, 1);
         for (u32 i = 0; i < n; i++) {
-            if (events[i].type == IoEventType::Send &&
-                events[i].result == static_cast<i32>(kExpectedSendLen)) {
+            if (events[i].type == IoEventType::Send && events[i].result == i32{kExpectedSendLen}) {
                 got_full_send = true;
             }
         }
@@ -5558,7 +5557,7 @@ TEST(uring, return_buffer_no_crash) {
     // Return buffer 0 — should not crash
     backend.return_buffer(0);
     // Return buffer at boundary
-    backend.return_buffer(static_cast<u16>(kProvidedBufCount - 1));
+    backend.return_buffer(u16{kProvidedBufCount - 1});
     backend.shutdown();
     close(lfd);
 }
@@ -5649,8 +5648,8 @@ TEST(uring, precise_response_read_timer_expires_with_exact_transport_identity) {
     CHECK_EQ(event.copy_begin, 0u);
     CHECK_EQ(event.copy_end, 0u);
 
-    const i64 elapsed_ns = static_cast<i64>(after.tv_sec - before.tv_sec) * 1'000'000'000LL +
-                           static_cast<i64>(after.tv_nsec - before.tv_nsec);
+    const i64 elapsed_ns =
+        i64{after.tv_sec - before.tv_sec} * 1'000'000'000LL + i64{after.tv_nsec - before.tv_nsec};
     const u64 elapsed_ms = static_cast<u64>((elapsed_ns + 999'999) / 1'000'000);
     CHECK_GE(elapsed_ms, 30u);
     CHECK_LT(elapsed_ms, 500u);
@@ -5743,9 +5742,8 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
     constexpr u16 kBufId = 11;
     const u32 malformed_flags[] = {
         IORING_CQE_F_MORE,
-        IORING_CQE_F_BUFFER | (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT),
-        IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-            (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT),
+        IORING_CQE_F_BUFFER | (u32{kBufId} << IORING_CQE_BUFFER_SHIFT),
+        IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{kBufId} << IORING_CQE_BUFFER_SHIFT),
     };
     for (const u32 flags : malformed_flags) {
         // Feed a userspace ring snapshot to the real wait() path. A real init
@@ -5804,7 +5802,7 @@ TEST(uring, malformed_response_read_timer_flags_fail_before_buffer_handling) {
         u8 buffer_expected[4];
         __builtin_memset(buffer_expected, 0xC3, sizeof(buffer_expected));
         tc.conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
-        __builtin_memset(backend.buf_base + static_cast<u64>(kBufId) * kProvidedBufSize, 0xC3, 4);
+        __builtin_memset(backend.buf_base + u64{kBufId} * kProvidedBufSize, 0xC3, 4);
         const u16 buffer_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
         const u32 head_before = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
         const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -6766,8 +6764,8 @@ TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
 // where the first untouched page is the first one past slot `used - 1`.
 static u32 resident_conn_pages_past(IoUringEventLoop& loop, u32 used) {
     const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
-    const u64 bytes = static_cast<u64>(loop.connection_capacity) * sizeof(Connection);
-    const u64 first = (static_cast<u64>(used) * sizeof(Connection) - 1) / page + 1;
+    const u64 bytes = u64{loop.connection_capacity} * sizeof(Connection);
+    const u64 first = (u64{used} * sizeof(Connection) - 1) / page + 1;
     const u64 pages = (bytes + page - 1) / page;
     if (first >= pages) return 0;
     auto* vec = static_cast<unsigned char*>(
@@ -6775,7 +6773,7 @@ static u32 resident_conn_pages_past(IoUringEventLoop& loop, u32 used) {
     if (vec == MAP_FAILED) return ~0u;
     u32 resident = 0;
     auto* base = reinterpret_cast<u8*>(loop.conns.data());
-    if (mincore(base + first * page, static_cast<size_t>((pages - first) * page), vec) != 0) {
+    if (mincore(base + first * page, size_t{(pages - first) * page}, vec) != 0) {
         munmap(vec, pages);
         return ~0u;
     }
@@ -6790,7 +6788,7 @@ static u32 resident_conn_pages_past(IoUringEventLoop& loop, u32 used) {
 // ~511 neighbouring pages resident, which says nothing about the code under
 // test. Opt the array out before any slot is touched. Call right after init.
 static void disable_conn_hugepages(IoUringEventLoop& loop) {
-    const u64 bytes = static_cast<u64>(loop.connection_capacity) * sizeof(Connection);
+    const u64 bytes = u64{loop.connection_capacity} * sizeof(Connection);
     (void)madvise(loop.conns.data(), static_cast<size_t>(bytes), MADV_NOHUGEPAGE);
 }
 
@@ -9169,7 +9167,7 @@ void tls_key_update_plaintext_probe(void* lp, Connection& conn, IoEvent ev) {
     diagnostic.app_callback_calls++;
     diagnostic.app_plaintext_len = ev.result > 0 ? static_cast<u32>(ev.result) : 0;
     diagnostic.app_plaintext_matches =
-        ev.result == static_cast<i32>(sizeof(kTlsKeyUpdateRequest) - 1u) &&
+        ev.result == i32{sizeof(kTlsKeyUpdateRequest) - 1u} &&
         conn.recv_buf.len() == sizeof(kTlsKeyUpdateRequest) - 1u &&
         memcmp(conn.recv_buf.data(), kTlsKeyUpdateRequest, sizeof(kTlsKeyUpdateRequest) - 1u) == 0;
     diagnostic.callback_entry_raw_inflight = conn.tls_out_inflight;
@@ -9784,8 +9782,7 @@ void run_buffered_recv_before_raw_send_completion(rut::test::TestCase* test_case
     } else {
         REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1u) ==
                 static_cast<int>(sizeof(kNextRequest) - 1u));
-        input_cipher_len =
-            BIO_read(cl.wbio, peer_ciphertext, static_cast<int>(sizeof(peer_ciphertext)));
+        input_cipher_len = BIO_read(cl.wbio, peer_ciphertext, int{sizeof(peer_ciphertext)});
         REQUIRE_GT(input_cipher_len, 0);
     }
     const u32 first_input_len = test_case_kind == BufferedRecvBeforeRawDrainCase::PartialRecord
@@ -10165,7 +10162,7 @@ TEST(tls_engine, encrypt_continuation_large_payload) {
         tls_engine_set_output(eng, outbuf, sizeof(outbuf));
         TlsOp st = TlsOp::Ok;
         while (off < sizeof(pt)) {
-            const i32 w = tls_engine_write(eng, pt + off, static_cast<u32>(sizeof(pt)) - off, st);
+            const i32 w = tls_engine_write(eng, pt + off, u32{sizeof(pt)} - off, st);
             if (w > 0) {
                 off += static_cast<u32>(w);
                 continue;
@@ -10254,7 +10251,7 @@ TEST(tls_engine, decrypt_partial_record_byte_feed) {
     REQUIRE(tls_engine_handshake_loopback(eng, cl));
 
     const char kMsg[] = "the quick brown fox jumps over the lazy dog";
-    const u32 kMsgLen = static_cast<u32>(sizeof(kMsg) - 1);
+    const u32 kMsgLen = u32{sizeof(kMsg) - 1};
     REQUIRE(SSL_write(cl.ssl, kMsg, static_cast<int>(kMsgLen)) == static_cast<int>(kMsgLen));
     static u8 cipher[4096];
     const int cipher_len = BIO_read(cl.wbio, cipher, sizeof(cipher));
@@ -12449,8 +12446,8 @@ static int format_keepalive_bench_failure(const KeepaliveBenchFailure& failure,
                     failure.response_body_bytes,
                     static_cast<double>(failure.request_elapsed_ns) / 1e6,
                     static_cast<double>(failure.overall_elapsed_ns) / 1e6,
-                    static_cast<u32>(kKeepaliveBenchRequestDeadlineNs / 1'000'000u),
-                    static_cast<u32>(kKeepaliveBenchOverallDeadlineNs / 1'000'000u),
+                    u32{kKeepaliveBenchRequestDeadlineNs / 1'000'000u},
+                    u32{kKeepaliveBenchOverallDeadlineNs / 1'000'000u},
                     failure.upstream_accepts,
                     failure.upstream_closed);
 }
@@ -15528,8 +15525,8 @@ TEST(route, wait_ms_precision_sub_second) {
     // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
     // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
     // handle it.
-    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
-                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ns =
+        i64{t1.tv_sec - t0.tv_sec} * 1'000'000'000LL + (i64{t1.tv_nsec} - i64{t0.tv_nsec});
     i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
@@ -15616,8 +15613,8 @@ TEST(route, let_across_wait_drives_return_real_socket) {
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
-                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ns =
+        i64{t1.tv_sec - t0.tv_sec} * 1'000'000'000LL + (i64{t1.tv_nsec} - i64{t0.tv_nsec});
     i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
@@ -15709,8 +15706,8 @@ TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
     // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
     // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
     // handle it.
-    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
-                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ns =
+        i64{t1.tv_sec - t0.tv_sec} * 1'000'000'000LL + (i64{t1.tv_nsec} - i64{t0.tv_nsec});
     i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
@@ -16406,7 +16403,7 @@ TEST(route, jit_handler_custom_body_real_socket) {
     char buf[2048];
     i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
     REQUIRE_GT(n, 0);
-    buf[n < static_cast<i32>(sizeof(buf)) ? n : static_cast<i32>(sizeof(buf)) - 1] = '\0';
+    buf[n < i32{sizeof(buf)} ? n : i32{sizeof(buf)} - 1] = '\0';
 
     // Response must contain "200", "Content-Length: 12", default
     // Content-Type, and the body bytes literal.
@@ -17011,7 +17008,7 @@ void emit_settlement_trace_if_nonzero(FILE* output,
                 e.generation_episode_or_aux,
                 static_cast<unsigned long long>(e.reconstructed_token),
                 static_cast<u32>(e.has_buf),
-                static_cast<u32>(e.buf_id));
+                u32{e.buf_id});
     }
     fflush(output);
 }
@@ -17271,7 +17268,9 @@ TEST(proxy_reuse, configurable_idle_capacity_controls_reuse) {
         RouteConfig cfg{};
         auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
         REQUIRE(uid.has_value());
-        REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+        u16 upstream_id;
+        REQUIRE(range_int{uid.value()}.to(&upstream_id));
+        REQUIRE(cfg.add_proxy("/api", 0, upstream_id));
         const RouteConfig* active = &cfg;
         ScopedProxyLoop proxy;
         REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, nullptr, nullptr, capacity));
@@ -17381,7 +17380,7 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
             if (fscanf(fp, "%d", &somaxconn) != 1) somaxconn = 0;
             fclose(fp);
         }
-        if (somaxconn < static_cast<i32>(kClients + 1)) SKIP("net.core.somaxconn too small");
+        if (somaxconn < i32{kClients + 1}) SKIP("net.core.somaxconn too small");
     }
 
     RouteConfig cfg{};
@@ -20675,14 +20674,14 @@ struct WsFrameEchoServer {
                     if (rut::ws_parse_header(acc + off, have - off, true, &h) !=
                         rut::ParseStatus::Complete)
                         break;
-                    const rut::u64 ftotal = h.header_len + h.payload_len;
+                    const rut::u64 ftotal = h.header_len + static_cast<u64>(h.payload_len);
                     if (have - off < ftotal) break;
                     rut::u8 pl[8192];
-                    for (rut::u64 i = 0; i < h.payload_len; i++)
+                    for (rut::i64 i = 0; i < h.payload_len; i++)
                         pl[i] = acc[off + h.header_len + i];
                     rut::ws_unmask(pl, h.payload_len, h.mask_key);
                     if (h.opcode == rut::WsOpcode::Close &&
-                        h.payload_len <= sizeof(s->close_payload)) {
+                        static_cast<u64>(h.payload_len) <= sizeof(s->close_payload)) {
                         for (u32 i = 0; i < h.payload_len; i++) s->close_payload[i] = pl[i];
                         s->close_length.store(static_cast<u32>(h.payload_len),
                                               std::memory_order_release);
@@ -20691,7 +20690,7 @@ struct WsFrameEchoServer {
                     rut::u8 key[4] = {0, 0, 0, 0};
                     rut::u32 hl =
                         rut::ws_write_header(out, h.opcode, true, false, key, h.payload_len);
-                    for (rut::u64 i = 0; i < h.payload_len; i++) out[hl + i] = pl[i];
+                    for (rut::i64 i = 0; i < h.payload_len; i++) out[hl + i] = pl[i];
                     if (s->echo_delay_us != 0) usleep(s->echo_delay_us);
                     (void)send_all(client,
                                    reinterpret_cast<char*>(out),
@@ -21001,7 +21000,7 @@ static rut::i32 ws_sweep_open_and_send_seg1(rut::u16 port,
         // 0 with an orderly close = gateway hung up before responding.
         ev->step = n == 0 ? "recv-101-nothing" : "recv-101-not-101";
         ev->err = errno;
-        ev->resp_len = n < sizeof(ev->resp) ? n : static_cast<u32>(sizeof(ev->resp));
+        ev->resp_len = n < sizeof(ev->resp) ? n : u32{sizeof(ev->resp)};
         memcpy(ev->resp, buf, ev->resp_len);
         close(c);
         return -1;
@@ -21116,7 +21115,7 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
         for (int tries = 0; tries < 40 && !got; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
                 got = h.payload_len == 4 && memcmp(racc + h.header_len, "PONG", 4) == 0;
                 break;
             }
@@ -21225,7 +21224,7 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
         for (int tries = 0; tries < 60 && got_frames < 2; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
                 const char* want = got_frames == 0 ? "PING" : "PONG";
                 ok = ok && h.payload_len == 4 && memcmp(racc + h.header_len, want, 4) == 0;
                 const u32 ftotal = h.header_len + static_cast<u32>(h.payload_len);
@@ -21323,8 +21322,8 @@ TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
         for (int tries = 0; tries < 50; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
-                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
+                for (i64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
                 *outlen = static_cast<u32>(h.payload_len);
                 const u32 total = h.header_len + static_cast<u32>(h.payload_len);
                 for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];
@@ -21407,8 +21406,8 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
         for (int tries = 0; tries < 50; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
-                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
+                for (i64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
                 *outlen = static_cast<u32>(h.payload_len);
                 const u32 total = h.header_len + static_cast<u32>(h.payload_len);
                 for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover
@@ -21566,7 +21565,7 @@ static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc, bool bran
         WsFrameHeader h;
         for (;;) {
             if (ws_parse_header(output, have, false, &h) == ParseStatus::Complete &&
-                have >= h.header_len + h.payload_len)
+                have >= h.header_len + static_cast<u64>(h.payload_len))
                 break;
             REQUIRE(have < sizeof(output));
             const i32 n = recv_timeout(
@@ -21714,7 +21713,7 @@ static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc,
             WsFrameHeader h{};
             for (;;) {
                 if (ws_parse_header(received, have, false, &h) == ParseStatus::Complete &&
-                    have >= h.header_len + h.payload_len)
+                    have >= h.header_len + static_cast<u64>(h.payload_len))
                     break;
                 const i32 n = recv_timeout(client,
                                            reinterpret_cast<char*>(received + have),
@@ -21855,12 +21854,12 @@ TEST(websocket_e2e, terminate_forwards_fragmented) {
         REQUIRE(nread > 0);
         have += static_cast<u32>(nread);
         if (ws_parse_header(received, have, false, &h) == ParseStatus::Complete &&
-            have >= h.header_len + h.payload_len)
+            have >= h.header_len + static_cast<u64>(h.payload_len))
             break;
     }
     CHECK(h.opcode == WsOpcode::Text);
     REQUIRE_EQ(h.payload_len, 5u);
-    REQUIRE(have >= h.header_len + h.payload_len);
+    REQUIRE(have >= h.header_len + static_cast<u64>(h.payload_len));
     CHECK(memcmp(received + h.header_len, "HELLO", 5) == 0);
 
     close(c);
@@ -21923,8 +21922,8 @@ TEST(websocket_e2e, terminate_iouring) {
         for (int tries = 0; tries < 50; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
-                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
+                for (i64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
                 *outlen = static_cast<u32>(h.payload_len);
                 const u32 total = h.header_len + static_cast<u32>(h.payload_len);
                 for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover
@@ -23755,7 +23754,7 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     // "HTTP/1.1 502" assertion below robust against split-recv.
     char buf[1024];
     i32 total = 0;
-    while (total < static_cast<i32>(sizeof(buf))) {
+    while (total < i32{sizeof(buf)}) {
         i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
         if (n <= 0) break;
         total += n;
@@ -23837,7 +23836,7 @@ TEST(route, dsl_return_websocket_enters_proxy_state) {
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[1024];
     i32 total = 0;
-    while (total < static_cast<i32>(sizeof(buf))) {
+    while (total < i32{sizeof(buf)}) {
         i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
         if (n <= 0) break;
         total += n;
@@ -28079,9 +28078,9 @@ struct RecordingUpstream {
     bool setup(u16 requested_port = 0) {
         thread_alive.store(false, std::memory_order_release);
         listener_failed.store(false, std::memory_order_release);
-        const u32 first_response_modes = static_cast<u32>(gate_first_response_close) +
-                                         static_cast<u32>(wait_first_response_for_peer_close) +
-                                         static_cast<u32>(stall_first_response_for_peer_close);
+        const u32 first_response_modes = u32{gate_first_response_close} +
+                                         u32{wait_first_response_for_peer_close} +
+                                         u32{stall_first_response_for_peer_close};
         if (first_response_modes > 1) return false;
         auto lfd = create_listen_socket(requested_port);
         if (!lfd.has_value()) return false;
@@ -33200,7 +33199,7 @@ static bool static_query_transform_request_is_exact(const char* actual,
                                       "X-Test: one\r\n\r\n",
                                       target,
                                       backend_port);
-    return expected_len > 0 && expected_len < static_cast<int>(sizeof(expected)) &&
+    return expected_len > 0 && expected_len < int{sizeof(expected)} &&
            actual_len == static_cast<u32>(expected_len) &&
            memcmp(actual, expected, static_cast<u32>(expected_len)) == 0;
 }
@@ -33283,7 +33282,7 @@ static bool static_query_transform_validator_self_checks() {
                                  "X-Test: one\r\n\r\n",
                                  upstream_targets[i],
                                  kPort);
-        if (len <= 0 || len >= static_cast<int>(sizeof(valid.requests[i]))) return false;
+        if (len <= 0 || len >= int{sizeof(valid.requests[i])}) return false;
         valid.request_lengths[i] = static_cast<u32>(len);
         valid.request_header_lengths[i] = static_cast<u32>(len);
         valid.response_write_counts[i] = 1u;
@@ -33314,7 +33313,7 @@ static bool static_query_transform_validator_self_checks() {
                                  "X-Test: one\r\n\r\n",
                                  target,
                                  kPort);
-        if (len <= 0 || len >= static_cast<int>(sizeof(mutation.requests[index])))
+        if (len <= 0 || len >= int{sizeof(mutation.requests[index])})
             mutation.request_lengths[index] = 0u;
         else
             mutation.request_lengths[index] = mutation.request_header_lengths[index] =
@@ -34311,25 +34310,25 @@ TEST(route, forward_request_policy_preserve_host_lowercase_h11_wire) {
     };
 
     send_case(kEnvoyOracle_get_smoke_client,
-              static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_client) - 1),
+              u32{sizeof(kEnvoyOracle_get_smoke_client) - 1},
               0,
               kEnvoyOracle_get_smoke_upstream,
-              static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_upstream) - 1));
+              u32{sizeof(kEnvoyOracle_get_smoke_upstream) - 1});
     send_case(kEnvoyOracle_get_hop_by_hop_client,
-              static_cast<u32>(sizeof(kEnvoyOracle_get_hop_by_hop_client) - 1),
+              u32{sizeof(kEnvoyOracle_get_hop_by_hop_client) - 1},
               1,
               kEnvoyOracle_get_hop_by_hop_upstream,
-              static_cast<u32>(sizeof(kEnvoyOracle_get_hop_by_hop_upstream) - 1));
+              u32{sizeof(kEnvoyOracle_get_hop_by_hop_upstream) - 1});
     send_case(kEnvoyOracle_post_fixed_client,
-              static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1),
+              u32{sizeof(kEnvoyOracle_post_fixed_client) - 1},
               2,
               kEnvoyOracle_post_fixed_upstream,
-              static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+              u32{sizeof(kEnvoyOracle_post_fixed_upstream) - 1});
     send_case(kEnvoyOracle_head_smoke_client,
-              static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_client) - 1),
+              u32{sizeof(kEnvoyOracle_head_smoke_client) - 1},
               3,
               kEnvoyOracle_head_smoke_upstream,
-              static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_upstream) - 1));
+              u32{sizeof(kEnvoyOracle_head_smoke_upstream) - 1});
 
     // Missing/duplicate Host each fail closed: no additional upstream
     // connection is opened, and the downstream sees 400.
@@ -34537,7 +34536,7 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_with_respo
     static constexpr char kUploadUpstreamReply[] =
         "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
     upstream.response = kUploadUpstreamReply;
-    upstream.response_len = static_cast<u32>(sizeof(kUploadUpstreamReply) - 1);
+    upstream.response_len = u32{sizeof(kUploadUpstreamReply) - 1};
 
     i32 client = connect_to(proxy.port);
     REQUIRE_GE(client, 0);
@@ -34647,11 +34646,11 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_never_reus
     static constexpr char kUploadUpstreamReply[] =
         "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
     upstream.response = kWarmUpstreamReply;
-    upstream.response_len = static_cast<u32>(sizeof(kWarmUpstreamReply) - 1);
+    upstream.response_len = u32{sizeof(kWarmUpstreamReply) - 1};
     // Accepted connection 2 onward (the ID4 upload) gets the 201 reply; only
     // accepted connection 1 (the warm-up) sees the 200 above.
     upstream.response_after_first = kUploadUpstreamReply;
-    upstream.response_after_first_len = static_cast<u32>(sizeof(kUploadUpstreamReply) - 1);
+    upstream.response_after_first_len = u32{sizeof(kUploadUpstreamReply) - 1};
 
     // 1. Warm the idle pool: a plain, policy-free GET that leaves a live
     // keep-alive upstream socket parked for this same upstream_id/backend_idx.
@@ -34881,15 +34880,15 @@ TEST(route, forward_response_policy_upstream_order_wire) {
         "hello";
     run_case(smoke_backend,
              kEnvoyOracle_get_smoke_client,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_client) - 1),
+             u32{sizeof(kEnvoyOracle_get_smoke_client) - 1},
              kSmokeUpstream,
-             static_cast<u32>(sizeof(kSmokeUpstream) - 1),
+             u32{sizeof(kSmokeUpstream) - 1},
              kEnvoyOracle_get_smoke_downstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_downstream) - 1),
+             u32{sizeof(kEnvoyOracle_get_smoke_downstream) - 1},
              /*mask_date=*/true,
              /*expect_downstream_close=*/false,
              kEnvoyOracle_get_smoke_upstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_upstream) - 1));
+             u32{sizeof(kEnvoyOracle_get_smoke_upstream) - 1});
 
     // get_upstream_date_server: upstream's own `date` is preserved byte for
     // byte in place; its `server` value is replaced in place by "envoy".
@@ -34903,44 +34902,44 @@ TEST(route, forward_response_policy_upstream_order_wire) {
         "ok";
     run_case(date_backend,
              kEnvoyOracle_get_upstream_date_server_client,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_upstream_date_server_client) - 1),
+             u32{sizeof(kEnvoyOracle_get_upstream_date_server_client) - 1},
              kDateServerUpstream,
-             static_cast<u32>(sizeof(kDateServerUpstream) - 1),
+             u32{sizeof(kDateServerUpstream) - 1},
              kEnvoyOracle_get_upstream_date_server_downstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_upstream_date_server_downstream) - 1),
+             u32{sizeof(kEnvoyOracle_get_upstream_date_server_downstream) - 1},
              /*mask_date=*/false,
              /*expect_downstream_close=*/false,
              kEnvoyOracle_get_upstream_date_server_upstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_upstream_date_server_upstream) - 1));
+             u32{sizeof(kEnvoyOracle_get_upstream_date_server_upstream) - 1});
 
     // get_client_close: the client's `Connection: close` closes the
     // downstream connection, so `connection: close` is appended last.
     run_case(close_backend,
              kEnvoyOracle_get_client_close_client,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_client_close_client) - 1),
+             u32{sizeof(kEnvoyOracle_get_client_close_client) - 1},
              kSmokeUpstream,
-             static_cast<u32>(sizeof(kSmokeUpstream) - 1),
+             u32{sizeof(kSmokeUpstream) - 1},
              kEnvoyOracle_get_client_close_downstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_client_close_downstream) - 1),
+             u32{sizeof(kEnvoyOracle_get_client_close_downstream) - 1},
              /*mask_date=*/true,
              /*expect_downstream_close=*/true,
              kEnvoyOracle_get_client_close_upstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_get_client_close_upstream) - 1));
+             u32{sizeof(kEnvoyOracle_get_client_close_upstream) - 1});
 
     // head_smoke: `head_mode: .suppressBody` commits headers only; the
     // upstream's declared Content-Length: 5 is kept but no body is sent.
     static constexpr char kHeadUpstream[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
     run_case(head_backend,
              kEnvoyOracle_head_smoke_client,
-             static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_client) - 1),
+             u32{sizeof(kEnvoyOracle_head_smoke_client) - 1},
              kHeadUpstream,
-             static_cast<u32>(sizeof(kHeadUpstream) - 1),
+             u32{sizeof(kHeadUpstream) - 1},
              kEnvoyOracle_head_smoke_downstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_downstream) - 1),
+             u32{sizeof(kEnvoyOracle_head_smoke_downstream) - 1},
              /*mask_date=*/true,
              /*expect_downstream_close=*/false,
              kEnvoyOracle_head_smoke_upstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_upstream) - 1));
+             u32{sizeof(kEnvoyOracle_head_smoke_upstream) - 1});
 
     // post_fixed: 201 Created, Content-Length: 0, no content-type. Request
     // policy 4 end to end -- both the forwarded upstream request and the
@@ -34948,15 +34947,15 @@ TEST(route, forward_response_policy_upstream_order_wire) {
     static constexpr char kUploadUpstream[] = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
     run_case(upload_backend,
              kEnvoyOracle_post_fixed_client,
-             static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1),
+             u32{sizeof(kEnvoyOracle_post_fixed_client) - 1},
              kUploadUpstream,
-             static_cast<u32>(sizeof(kUploadUpstream) - 1),
+             u32{sizeof(kUploadUpstream) - 1},
              kEnvoyOracle_post_fixed_downstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_downstream) - 1),
+             u32{sizeof(kEnvoyOracle_post_fixed_downstream) - 1},
              /*mask_date=*/true,
              /*expect_downstream_close=*/false,
              kEnvoyOracle_post_fixed_upstream,
-             static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+             u32{sizeof(kEnvoyOracle_post_fixed_upstream) - 1});
 
     // Last-Modified pass-through: not one of `build_strict_response_headers`'s
     // forbidden names, so the Upstream-order serializer must carry it through
@@ -34979,11 +34978,11 @@ TEST(route, forward_response_policy_upstream_order_wire) {
         "GET /lastmod HTTP/1.1\r\nHost: client.example\r\n\r\n";
     run_case(lastmod_backend,
              kLastModClient,
-             static_cast<u32>(sizeof(kLastModClient) - 1),
+             u32{sizeof(kLastModClient) - 1},
              kLastModUpstream,
-             static_cast<u32>(sizeof(kLastModUpstream) - 1),
+             u32{sizeof(kLastModUpstream) - 1},
              kLastModExpected,
-             static_cast<u32>(sizeof(kLastModExpected) - 1),
+             u32{sizeof(kLastModExpected) - 1},
              /*mask_date=*/true,
              /*expect_downstream_close=*/false,
              nullptr,
@@ -35088,8 +35087,7 @@ TEST(route, envoy_milestone_s_local_replies_match_oracle) {
         char response[512];
         const u32 got = recv_all_until_idle(client, response, sizeof(response));
         close(client);
-        const u32 expected_len =
-            static_cast<u32>(sizeof(kEnvoyOracle_connect_failure_downstream) - 1);
+        const u32 expected_len = u32{sizeof(kEnvoyOracle_connect_failure_downstream) - 1};
         REQUIRE_EQ(got, expected_len);
         char expected[512];
         memcpy(expected, kEnvoyOracle_connect_failure_downstream, expected_len);
@@ -35128,7 +35126,7 @@ TEST(route, envoy_milestone_s_local_replies_match_oracle) {
         char response[256];
         const u32 got = recv_all_until_idle(client, response, sizeof(response));
         close(client);
-        const u32 expected_len = static_cast<u32>(sizeof(kEnvoyOracle_options_star_downstream) - 1);
+        const u32 expected_len = u32{sizeof(kEnvoyOracle_options_star_downstream) - 1};
         REQUIRE_EQ(got, expected_len);
         char expected[256];
         memcpy(expected, kEnvoyOracle_options_star_downstream, expected_len);
@@ -37252,7 +37250,7 @@ static bool run_set_header_case(const char* echo_header,
                                  ".roundRobin, set_header: %s) }\n",
                                  echo.port,
                                  set_header_dict);
-    if (src_len <= 0 || src_len >= static_cast<int>(sizeof(src_buf))) return false;
+    if (src_len <= 0 || src_len >= int{sizeof(src_buf)}) return false;
     auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
     if (!lexed) return false;
     auto ast = parse_file(lexed.value());
@@ -37495,7 +37493,7 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[1024];
     i32 total = 0;
-    while (total < static_cast<i32>(sizeof(buf))) {
+    while (total < i32{sizeof(buf)}) {
         i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
         if (n <= 0) break;
         total += n;
@@ -37973,7 +37971,7 @@ route "/api" {
                                          "Connection: close\r\n\r\n",
                                          target,
                                          host);
-        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (request_len <= 0 || request_len >= int{sizeof(request)}) return false;
         if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
         char response[1024]{};
         u32 response_len = 0;
@@ -38009,7 +38007,7 @@ route "/api" {
                                          "GET %s HTTP/1.1\r\nHost: client.example\r\n"
                                          "Connection: close\r\nX-Test: one\r\n\r\n",
                                          target);
-        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (request_len <= 0 || request_len >= int{sizeof(request)}) return false;
         if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
         char response[1024]{};
         u32 response_len = 0;
@@ -38045,7 +38043,7 @@ route "/api" {
                                          "GET %s HTTP/1.1\r\nHost: client.example\r\n"
                                          "Connection: close\r\n\r\n",
                                          target);
-        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (request_len <= 0 || request_len >= int{sizeof(request)}) return false;
         if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
         char response[256]{};
         u32 response_len = 0;
@@ -38077,7 +38075,7 @@ route "/api" {
                                           "X-Test: one\r\n\r\n",
                                           expected_target,
                                           backend.port);
-        if (expected_len <= 0 || expected_len >= static_cast<int>(sizeof(expected))) return false;
+        if (expected_len <= 0 || expected_len >= int{sizeof(expected)}) return false;
         CHECK_EQ(backend.request_history_len[history_slot], static_cast<u32>(expected_len));
         CHECK_EQ(backend.request_history_header_len[history_slot], static_cast<u32>(expected_len));
         CHECK(memcmp(backend.request_history[history_slot], expected, expected_len) == 0);
@@ -38392,7 +38390,7 @@ route GET "/" {
                                        "Connection: close\r\n\r\n",
                                        target,
                                        host);
-        if (formatted <= 0 || formatted >= static_cast<int>(sizeof(request))) return false;
+        if (formatted <= 0 || formatted >= int{sizeof(request)}) return false;
         if (!send_all(client.fd, request, static_cast<u32>(formatted))) return false;
         char response[512]{};
         u32 response_len = 0;
@@ -38475,7 +38473,7 @@ route GET "/" {
                                        "Connection: close\r\nX-Case: %s\r\n\r\n",
                                        target,
                                        marker);
-        if (formatted <= 0 || formatted >= static_cast<int>(sizeof(request))) return false;
+        if (formatted <= 0 || formatted >= int{sizeof(request)}) return false;
         if (!send_all(client.fd, request, static_cast<u32>(formatted))) return false;
         char response[512]{};
         u32 response_len = 0;
@@ -38765,7 +38763,7 @@ route GET "/" {
                                  target,
                                  host,
                                  marker);
-        if (len <= 0 || len >= static_cast<int>(sizeof(bytes)) ||
+        if (len <= 0 || len >= int{sizeof(bytes)} ||
             !send_all(client.fd, bytes, static_cast<u32>(len)))
             return false;
         char response[512]{};
@@ -39185,7 +39183,7 @@ route GET "/" {
                                        "Connection: close\r\n\r\n",
                                        target,
                                        host);
-        if (formatted <= 0 || formatted >= static_cast<int>(sizeof(request))) return false;
+        if (formatted <= 0 || formatted >= int{sizeof(request)}) return false;
         if (!send_all(client.fd, request, static_cast<u32>(formatted))) return false;
         char response[512]{};
         u32 response_len = 0;
@@ -39608,7 +39606,7 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
                                          "Connection: close\r\nX-Test: one\r\n\r\n",
                                          method,
                                          query);
-        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (request_len <= 0 || request_len >= int{sizeof(request)}) return false;
         if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
         char response[1024]{};
         u32 response_len = 0;
@@ -42579,7 +42577,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                 REQUIRE_LE(static_cast<u32>(cqe.res), kProvidedBufSize);
                 const u32 fragment_len = static_cast<u32>(cqe.res);
                 REQUIRE_LE(fragment_len, sizeof(kRequestTwo) - 1u - raw_request_len);
-                const u8* bytes = backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+                const u8* bytes = backend.buf_base + u64{buf_id} * kProvidedBufSize;
                 REQUIRE_EQ(memcmp(bytes, kRequestTwo + raw_request_len, fragment_len), 0);
                 memcpy(raw_request + raw_request_len, bytes, fragment_len);
                 raw_request_len += fragment_len;
@@ -43232,7 +43230,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
                 REQUIRE_LE(static_cast<u32>(cqe.res), kProvidedBufSize);
                 const u32 fragment_len = static_cast<u32>(cqe.res);
                 REQUIRE_LE(fragment_len, sizeof(kRequestTwo) - 1u - raw_request_len);
-                const u8* bytes = backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+                const u8* bytes = backend.buf_base + u64{buf_id} * kProvidedBufSize;
                 REQUIRE_EQ(memcmp(bytes, kRequestTwo + raw_request_len, fragment_len), 0);
                 memcpy(raw_request + raw_request_len, bytes, fragment_len);
                 raw_request_len += fragment_len;
@@ -44168,8 +44166,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
                                     sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd &&
                                     sqe.addr == reinterpret_cast<u64>(send.src);
                                 const bool direct_write_completion =
-                                    sqe.opcode == IORING_OP_NOP &&
-                                    static_cast<u32>(sqe.rw_flags) == (1u << 0);
+                                    sqe.opcode == IORING_OP_NOP && u32{sqe.rw_flags} == (1u << 0);
                                 const u64 user_data = sqe.user_data;
                                 const bool target_identity =
                                     static_cast<IoEventType>(user_data & 0xFFu) ==

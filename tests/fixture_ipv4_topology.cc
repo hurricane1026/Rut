@@ -142,7 +142,7 @@ static bool process_group_gone(pid_t pgid) {
 [[noreturn]] static void runner_fail_stop(pid_t pgid, const char* reason) {
     dprintf(STDERR_FILENO,
             "fatal topology command cleanup failure (pgid %ld): %s\n",
-            static_cast<long>(pgid),
+            long{pgid},
             reason);
     // This is deliberately the only unbounded path: returning here could
     // orphan a same-uid command group.  SIGKILL is not catchable; once the
@@ -210,14 +210,13 @@ static bool run_command_impl(const std::vector<std::string>& arguments,
     ++command_invocation_count;
     const std::int64_t invocation_now = exact_read_monotonic_ns();
     if (invocation_now <= 0 || timeout_ms <= 0 ||
-        invocation_now > std::numeric_limits<std::int64_t>::max() -
-                             static_cast<std::int64_t>(timeout_ms) * 1000000LL) {
+        invocation_now >
+            std::numeric_limits<std::int64_t>::max() - std::int64_t{timeout_ms} * 1000000LL) {
         result = {};
         result.timed_out = true;
         return false;
     }
-    const std::int64_t relative_deadline_ns =
-        invocation_now + static_cast<std::int64_t>(timeout_ms) * 1000000LL;
+    const std::int64_t relative_deadline_ns = invocation_now + std::int64_t{timeout_ms} * 1000000LL;
     const std::int64_t deadline_ns = command_deadline_cap_ns > 0
                                          ? std::min(relative_deadline_ns, command_deadline_cap_ns)
                                          : relative_deadline_ns;
@@ -613,7 +612,7 @@ static std::int64_t exact_read_monotonic_ns() {
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
     constexpr std::int64_t kBillion = 1000000000LL;
     if (now.tv_sec > std::numeric_limits<std::int64_t>::max() / kBillion) return -1;
-    return static_cast<std::int64_t>(now.tv_sec) * kBillion + now.tv_nsec;
+    return std::int64_t{now.tv_sec} * kBillion + now.tv_nsec;
 }
 
 static bool make_cloexec_pipe(int descriptors[2]) {
@@ -645,7 +644,7 @@ static bool exact_read_send_datagram(int fd, const void* bytes, size_t size) {
                                             kExactReadProtocolVersion,
                                             static_cast<std::uint8_t>(stage),
                                             {0u, 0u},
-                                            static_cast<std::int32_t>(error_number)};
+                                            std::int32_t{error_number}};
     (void)exact_read_send_datagram(status_fd, &record, sizeof(record));
     _exit(126);
 }
@@ -690,7 +689,7 @@ static bool pidfd_targets_exact_pid(int pidfd, pid_t pid) {
     char* end = nullptr;
     errno = 0;
     const long parsed = strtol(marker + 5, &end, 10);
-    return errno == 0 && end != marker + 5 && parsed == static_cast<long>(pid);
+    return errno == 0 && end != marker + 5 && parsed == long{pid};
 }
 
 static bool install_exact_read_subtree_confinement() {
@@ -853,7 +852,7 @@ static bool exact_read_recv_control(int fd, ExactReadControlRecord& record, bool
         eof = true;
         return false;
     }
-    if (count != static_cast<ssize_t>(sizeof(record)) || record.magic != kExactReadControlMagic ||
+    if (count != ssize_t{sizeof(record)} || record.magic != kExactReadControlMagic ||
         record.version != kExactReadProtocolVersion || record.reserved[0] != 0u ||
         record.reserved[1] != 0u) {
         errno = EPROTO;
@@ -867,7 +866,7 @@ static bool exact_read_recv_control(int fd, ExactReadControlRecord& record, bool
                                                          const char* reason) {
     dprintf(STDERR_FILENO,
             "fatal exact-read supervisor settlement failure for private group %ld at %lld: %s\n",
-            static_cast<long>(worker),
+            long{worker},
             static_cast<long long>(deadline_ns),
             reason);
     for (;;) {
@@ -1019,7 +1018,7 @@ static bool exact_read_send_receipt(int fd, const ExactReadSupervisorReceipt& re
                 recv(status_pair[0], &candidate, sizeof(candidate), MSG_DONTWAIT | MSG_TRUNC);
             if (count > 0) {
                 ++status_datagrams;
-                if (count != static_cast<ssize_t>(sizeof(candidate)) || status_datagrams != 1u ||
+                if (count != ssize_t{sizeof(candidate)} || status_datagrams != 1u ||
                     !exact_read_validate_exec_record(candidate)) {
                     status_protocol_failure = true;
                 } else {
@@ -1095,7 +1094,7 @@ static bool exact_read_send_receipt(int fd, const ExactReadSupervisorReceipt& re
         }
         if (count > 0) {
             ++status_datagrams;
-            if (count != static_cast<ssize_t>(sizeof(candidate)) || status_datagrams != 1u ||
+            if (count != ssize_t{sizeof(candidate)} || status_datagrams != 1u ||
                 !exact_read_validate_exec_record(candidate)) {
                 status_protocol_failure = true;
             } else {
@@ -1410,7 +1409,7 @@ static bool run_exact_read_command_until_impl(const std::vector<std::string>& ar
             const ssize_t count =
                 recv(report_pair[0], &receipt, sizeof(receipt), MSG_DONTWAIT | MSG_TRUNC);
             if (count > 0) {
-                if (count != static_cast<ssize_t>(sizeof(receipt))) {
+                if (count != ssize_t{sizeof(receipt)}) {
                     result.launch_failure_stage = ExactInputReadLaunchStage::ExecStatusProtocol;
                     result.launch_errno = EPROTO;
                     continue;
@@ -1562,11 +1561,8 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
         result = {};
         return false;
     }
-    return run_exact_read_command_until(arguments,
-                                        stdout_limit,
-                                        now_ns + static_cast<std::int64_t>(timeout_ms) * 1000000LL,
-                                        result,
-                                        fault);
+    return run_exact_read_command_until(
+        arguments, stdout_limit, now_ns + std::int64_t{timeout_ms} * 1000000LL, result, fault);
 }
 static ExactInputReadOutcome classify_exact_read(const ExactReadCommandResult& result,
                                                  const std::string& expected) {
@@ -1646,8 +1642,7 @@ static bool read_file(const std::string& path, std::string& output) {
 
 static bool high_entropy_token(std::string& token) {
     std::array<unsigned char, 24> bytes{};
-    if (getrandom(bytes.data(), bytes.size(), 0) != static_cast<ssize_t>(bytes.size()))
-        return false;
+    if (getrandom(bytes.data(), bytes.size(), 0) != ssize_t{bytes.size()}) return false;
     static constexpr char hex[] = "0123456789abcdef";
     token.clear();
     for (unsigned char byte : bytes) {
@@ -2071,7 +2066,7 @@ static bool parse_exact_pid(const std::string& text, pid_t& value) {
             static_cast<std::uintmax_t>(std::numeric_limits<pid_t>::max()))
         return false;
     value = static_cast<pid_t>(parsed);
-    return static_cast<long>(value) == parsed;
+    return long{value} == parsed;
 }
 
 static bool parse_sidecar_inspect_record(const std::string& record,
@@ -2092,12 +2087,12 @@ static bool parse_sidecar_inspect_record(const std::string& record,
     if (!decimal_pid || errno == ERANGE || end == fields[9].c_str() || *end != '\0' ||
         parsed_pid < 0 ||
         static_cast<std::uintmax_t>(parsed_pid) >
-            static_cast<std::uintmax_t>(std::numeric_limits<pid_t>::max())) {
+            std::uintmax_t{std::numeric_limits<pid_t>::max()}) {
         error = "sidecar inspection PID was malformed";
         return false;
     }
     const pid_t pid = static_cast<pid_t>(parsed_pid);
-    if (static_cast<long>(pid) != parsed_pid) {
+    if (long{pid} != parsed_pid) {
         error = "sidecar inspection PID was malformed";
         return false;
     }
@@ -2580,7 +2575,7 @@ static bool container_netns_inode(const std::string& holder, ino_t& inode) {
     const std::string value_text = text.substr(left + 1, right - left - 1);
     const unsigned long long value = strtoull(value_text.c_str(), &end, 10);
     if (end == value_text.c_str() || *end != '\0' || value == 0) return false;
-    inode = static_cast<ino_t>(value);
+    inode = ino_t{value};
     return true;
 }
 
@@ -6291,7 +6286,7 @@ static bool decimal_size(const std::string& text, size_t& value) {
     if (errno == ERANGE || end == text.c_str() || *end != '\0' ||
         parsed > std::numeric_limits<size_t>::max())
         return false;
-    value = static_cast<size_t>(parsed);
+    value = size_t{parsed};
     return true;
 }
 
@@ -8310,13 +8305,13 @@ static bool capture_write_refusal_bracket(ExactInputMountOwner& owner,
     }
     const auto& expected = owner.input.identity();
     const auto exact_stat = [&](const struct stat& value) {
-        return static_cast<std::uint64_t>(value.st_dev) == expected.device &&
-               static_cast<std::uint64_t>(value.st_ino) == expected.inode &&
-               static_cast<std::uint64_t>(value.st_mode) == expected.mode &&
-               static_cast<std::uint64_t>(value.st_uid) == expected.uid &&
-               static_cast<std::uint64_t>(value.st_gid) == expected.gid &&
+        return std::uint64_t{value.st_dev} == expected.device &&
+               std::uint64_t{value.st_ino} == expected.inode &&
+               std::uint64_t{value.st_mode} == expected.mode &&
+               std::uint64_t{value.st_uid} == expected.uid &&
+               std::uint64_t{value.st_gid} == expected.gid &&
                static_cast<std::uint64_t>(value.st_size) == expected.size &&
-               static_cast<std::uint64_t>(value.st_nlink) == expected.links;
+               std::uint64_t{value.st_nlink} == expected.links;
     };
     if (!exact_stat(descriptor_stat) || !exact_stat(path_stat) ||
         descriptor_stat.st_mtim.tv_sec != path_stat.st_mtim.tv_sec ||
@@ -10378,7 +10373,7 @@ bool exact_input_mount_test_read_runner_case(ExactInputReadRunnerTestCase test_c
 
 static std::int64_t exact_mount_thread_id() {
 #ifdef SYS_gettid
-    return static_cast<std::int64_t>(syscall(SYS_gettid));
+    return std::int64_t{syscall(SYS_gettid)};
 #else
     return static_cast<std::int64_t>(getpid());
 #endif
@@ -10453,10 +10448,9 @@ ExactInputMountHandle& ExactInputMountHandle::operator=(ExactInputMountHandle&& 
 
 ExactInputMountRecoveryController::ExactInputMountRecoveryController()
     : construction_thread_(exact_mount_thread_id()) {
-    if (getrandom(&cookie_, sizeof(cookie_), 0) != static_cast<ssize_t>(sizeof(cookie_)) ||
-        cookie_ == 0u)
+    if (getrandom(&cookie_, sizeof(cookie_), 0) != ssize_t{sizeof(cookie_)} || cookie_ == 0u)
         cookie_ =
-            static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(this)) ^
+            std::uint64_t{reinterpret_cast<std::uintptr_t>(this)} ^
             static_cast<std::uint64_t>(construction_thread_) ^
             static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
     if (cookie_ == 0u) cookie_ = 1u;
@@ -15062,8 +15056,8 @@ static bool capture_rotation_source(ExactInputMountOwner& owner,
         named.st_ino != owner.input.identity().inode ||
         named.st_uid != owner.input.identity().uid || named.st_gid != owner.input.identity().gid ||
         static_cast<std::uint64_t>(named.st_size) != owner.input.identity().size ||
-        static_cast<std::uint64_t>(named.st_nlink) != owner.input.identity().links ||
-        !S_ISREG(named.st_mode) || (named.st_mode & 07777) != 0600) {
+        std::uint64_t{named.st_nlink} != owner.input.identity().links || !S_ISREG(named.st_mode) ||
+        (named.st_mode & 07777) != 0600) {
         error = "canonical exact source lease revalidation failed";
         return false;
     }

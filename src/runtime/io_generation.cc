@@ -9,7 +9,7 @@ namespace {
 consteval bool allocation_matches(u32 initial, u32 maximum) {
     u32 counter = initial;
     u32 owner = 73;
-    const i64 kNext = static_cast<i64>(initial) + 1;
+    const i64 kNext = i64{initial} + 1;
     const bool kFits = kNext <= maximum;
     const bool kIssued = allocate_io_generation(counter, owner, maximum);
     return kIssued == kFits && counter == (kFits ? static_cast<u32>(kNext) : initial) &&
@@ -31,10 +31,8 @@ consteval bool allocation_contract(u32 maximum) {
     return true;
 }
 
-static_assert(kNonUpstreamSendGenerationMask ==
-                      static_cast<u32>(static_cast<i64>(kNonUpstreamSendCancelBit) - 1) &&
-                  kResponseReadTimerGenerationMask ==
-                      static_cast<u32>(static_cast<i64>(kResponseReadTimerCancelBit) - 1) &&
+static_assert(kNonUpstreamSendGenerationMask == u32{i64{kNonUpstreamSendCancelBit} - 1} &&
+                  kResponseReadTimerGenerationMask == u32{i64{kResponseReadTimerCancelBit} - 1} &&
                   kNonUpstreamSendCancelBit == (1u << 31) &&
                   kResponseReadTimerCancelBit == (1u << 31),
               "Cancellation marker must remain outside the generation range");

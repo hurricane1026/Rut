@@ -81,6 +81,18 @@ TEST(hpack_int, decode_truncated_is_error) {
     CHECK_EQ(hpack::decode_integer(buf, 1, 5, &v), 0u);
 }
 
+TEST(hpack_int, rejects_invalid_prefix_width_without_publishing) {
+    const u8 invalid_widths[] = {0, 9, 64, 255};
+    for (const u8 width : invalid_widths) {
+        u8 bytes[6] = {42};
+        u32 value = 123;
+        CHECK_EQ(hpack::decode_integer(bytes, sizeof(bytes), width, &value), 0u);
+        CHECK_EQ(value, 123u);
+        CHECK_EQ(hpack::encode_integer(bytes, 1, width, 0), 0u);
+        CHECK_EQ(bytes[0], 42);
+    }
+}
+
 TEST(hpack_int, decode_overflow_is_error) {
     // A continuation that pushes the value past 32 bits must fail.
     u8 buf[] = {0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10};
@@ -116,7 +128,7 @@ TEST(hpack_huffman, all_bytes_stream_roundtrips) {
 }
 
 TEST(hpack_huffman, bounded_header_block_length_uses_full_bit_count) {
-    constexpr i64 kMaxInput = static_cast<i64>(~u32{0});
+    constexpr i64 kMaxInput = i64{~u32{0}};
     constexpr i64 kMaxBits = kMaxInput * 30;
     static_assert(kMaxBits < 0x7fffffffffffffffLL);
     static_assert(hpack::huffman_encoded_bytes_from_bits(kMaxBits) > kMaxInput);
@@ -501,6 +513,19 @@ TEST(hpack_encoder, dynamic_indexing_roundtrip) {
     CHECK(hdr_is(out[0], "custom-key", "custom-value"));
 }
 
+TEST(hpack_encoder, rejects_inconsistent_eviction_counters) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    u8 block[256];
+    REQUIRE(enc.encode(block, cstr("custom-key"), cstr("custom-value")) > 0);
+    enc.dyn.byte_used = 0;
+
+    CHECK_FALSE(enc.set_table_size(0));
+    CHECK_EQ(enc.dyn.nent, 1u);
+    CHECK_EQ(enc.dyn.max_size, 4096u);
+    CHECK_EQ(enc.emit_pending_size_update(block), 0u);
+}
+
 // A shrink-then-grow between header blocks (e.g. peer SETTINGS 0 then 4096) must
 // signal the SMALLEST size first (RFC 7541 §4.2), so the decoder evicts in
 // lockstep — signalling only the final size would leave the decoder's entries in
@@ -522,9 +547,9 @@ TEST(hpack_encoder, shrink_then_grow_signals_minimum_size) {
     CHECK_EQ(dec.nent, 1u);
 
     // Peer shrinks the table to 0 then back to 4096 before the next block.
-    enc.set_table_size(0);
+    CHECK(enc.set_table_size(0));
     CHECK_EQ(enc.dyn.nent, 0u);  // encoder evicted at the shrink
-    enc.set_table_size(4096);
+    CHECK(enc.set_table_size(4096));
 
     // The next block leads with the size updates. A correct encoder signals 0
     // first (decoder evicts its entry) then 4096; signalling only 4096 would
@@ -549,12 +574,12 @@ TEST(hpack_encoder, honors_peer_table_size_with_size_update) {
     enc.init(4096);
     // Index a field so the table is non-empty before the shrink.
     u8 warm[256];
-    enc.encode(warm, cstr("custom-key"), cstr("custom-value"));
+    REQUIRE(enc.encode(warm, cstr("custom-key"), cstr("custom-value")) > 0);
     CHECK_EQ(enc.dyn.nent, 1u);
 
     // Peer shrinks the table to 0 → no dynamic entries may survive, and a size
     // update must be armed.
-    enc.set_table_size(0);
+    CHECK(enc.set_table_size(0));
     CHECK_EQ(enc.dyn.max_size, 0u);
     CHECK_EQ(enc.dyn.nent, 0u);  // everything evicted
     CHECK_EQ(enc.pending_size_update, 0);
@@ -577,7 +602,7 @@ TEST(hpack_encoder, honors_peer_table_size_with_size_update) {
     CHECK(hdr_is(out[0], ":status", "200"));
 
     // An unchanged advertisement arms nothing (no spurious updates per SETTINGS).
-    enc.set_table_size(0);
+    CHECK(enc.set_table_size(0));
     CHECK_EQ(enc.pending_size_update, -1);
 }
 

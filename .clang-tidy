@@ -5,6 +5,7 @@ Checks: >
   -bugprone-easily-swappable-parameters,
   -bugprone-exception-escape,
   clang-analyzer-*,
+  clang-diagnostic-unused-result,
   misc-*,
   -misc-non-private-member-variables-in-classes,
   -misc-no-recursion,
@@ -17,7 +18,7 @@ Checks: >
   modernize-use-auto,
   modernize-use-using,
 
-WarningsAsErrors: ''
+WarningsAsErrors: 'clang-diagnostic-unused-result'
 
 CheckOptions:
   - key: readability-identifier-naming.NamespaceCase

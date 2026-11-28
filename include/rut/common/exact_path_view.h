@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/byte_span.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -9,8 +10,8 @@ namespace rut {
 enum class ExactPathView : u8 { Raw = 0, SlashNormalized = 1 };
 
 static_assert(sizeof(ExactPathView) == sizeof(u8));
-static_assert(static_cast<u8>(ExactPathView::Raw) == 0);
-static_assert(static_cast<u8>(ExactPathView::SlashNormalized) == 1);
+static_assert(ExactPathView::Raw == ExactPathView{0});
+static_assert(ExactPathView::SlashNormalized == ExactPathView{1});
 
 // Shared bound for exact path selectors. The existing strict-local-response
 // bound aliases this value; normalized output is never truncated to fit it.
@@ -39,23 +40,23 @@ enum class ExactPathNormalizationResult : u8 {
 // coherence checks prevent address arithmetic from wrapping; they cannot prove
 // that arbitrary addresses refer to mapped storage, so callers still own valid
 // storage provenance for every supplied range.
-inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
-                                                                 char* output,
-                                                                 u32 output_capacity,
-                                                                 u32* output_len) {
+[[nodiscard]] inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
+                                                                               char* output,
+                                                                               u32 output_capacity,
+                                                                               u32* output_len) {
     if (raw.ptr == nullptr || raw.len == 0 || output == nullptr || output_len == nullptr)
         return ExactPathNormalizationResult::InvalidInput;
 
     const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(raw.ptr);
     uintptr_t raw_end = 0;
-    if (__builtin_add_overflow(raw_begin, static_cast<uintptr_t>(raw.len), &raw_end))
+    if (!raw_byte_span_address_end(raw.ptr, raw.len, &raw_end))
         return ExactPathNormalizationResult::InvalidInput;
 
     if (raw.ptr[0] != '/') return ExactPathNormalizationResult::InvalidInput;
 
     u32 path_end = 0;
     while (path_end < raw.len && raw.ptr[path_end] != '?') {
-        const u8 byte = static_cast<u8>(raw.ptr[path_end]);
+        const u8 byte = byte_value(raw.ptr[path_end]);
         if (raw.ptr[path_end] == '#' || byte < 0x20 || byte == 0x7f)
             return ExactPathNormalizationResult::InvalidInput;
         path_end++;
@@ -74,13 +75,14 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
 
     // Refuse aliased storage so the transactional input/output guarantees are
     // preserved even when a caller accidentally supplies an in-place range.
+    // The size bound does not constrain the uintptr_t value of either address.
     const uintptr_t output_begin = reinterpret_cast<uintptr_t>(output);
     const uintptr_t output_len_begin = reinterpret_cast<uintptr_t>(output_len);
     uintptr_t output_end = 0;
     uintptr_t output_len_end = 0;
-    if (__builtin_add_overflow(output_begin, static_cast<uintptr_t>(normalized_len), &output_end) ||
-        __builtin_add_overflow(
-            output_len_begin, static_cast<uintptr_t>(sizeof(*output_len)), &output_len_end))
+    if (!raw_byte_span_address_end(output, normalized_len, &output_end))
+        return ExactPathNormalizationResult::InvalidInput;
+    if (!raw_byte_span_address_end(output_len, sizeof(*output_len), &output_len_end))
         return ExactPathNormalizationResult::InvalidInput;
     const auto ranges_overlap = [](uintptr_t first_begin,
                                    uintptr_t first_end,

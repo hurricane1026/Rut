@@ -20,14 +20,19 @@ namespace rut {
 struct WsDeflateCodec;
 
 inline constexpr u32 kWsMaxCloseReasonBytes =
-    static_cast<u32>(static_cast<i64>(kWsMaxControlPayload) - 2);
+    (range_int<kWsMaxControlPayload, i64{kWsMaxControlPayload} + 1>{} - range_int<2, 3>{})
+        .to<u32>();
 
 // Default remains the ordinary-slice payload budget. Explicit larger limits
 // use existing bulk storage; reserve the worst-case masked frame header.
 inline constexpr u32 kWsTerminateMessageCapacity =
-    static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(kWsMaxHeaderSize));
-inline constexpr u32 kWsMaxMessageCapacity = static_cast<u32>(
-    static_cast<i64>(SlicePool::kBulkSliceSize) - static_cast<i64>(kWsMaxHeaderSize));
+    (range_int<SlicePool::kSliceSize, i64{SlicePool::kSliceSize} + 1>{} -
+     range_int<kWsMaxHeaderSize, i64{kWsMaxHeaderSize} + 1>{})
+        .to<u32>();
+inline constexpr u32 kWsMaxMessageCapacity =
+    (range_int<SlicePool::kBulkSliceSize, i64{SlicePool::kBulkSliceSize} + 1>{} -
+     range_int<kWsMaxHeaderSize, i64{kWsMaxHeaderSize} + 1>{})
+        .to<u32>();
 
 constexpr bool ws_valid_message_capacity(u32 size) {
     return size != 0 && size <= kWsMaxMessageCapacity;
@@ -181,6 +186,9 @@ struct WsHandlerOutput {
     bool ready = false;
 };
 
+// The message and frame-prefix buffers use u32 lengths at their I/O boundaries.
+using WsBufferedBytes = range_int<0, __int128_t{UINT32_MAX} + 1>;
+
 // Per-direction inspection state. One instance per tunnel direction; persists across
 // recv chunks because frames and messages span reads.
 //
@@ -231,20 +239,20 @@ struct WsInspector {
     // The tunnel supplies one and leaves this disabled.
     bool reject_fragmented = false;
     WsMessageAssembler assembler;  // fragmentation state across frames
-    u64 message_len = 0;           // bytes accumulated into the message buffer so far
+    WsBufferedBytes message_len;   // bytes accumulated into the message buffer so far
     bool partial_data_frame = false;
     WsFrameHeader partial_header{};
-    u64 partial_payload_len = 0;
+    WsBufferedBytes partial_payload_len;
 
     void reset() {
         echo_close_reason_len = 0;
         echo_close_code = 1000;
         received_close = false;
         assembler.reset();
-        message_len = 0;
+        message_len = {};
         compressed_message = false;
         partial_data_frame = false;
-        partial_payload_len = 0;
+        partial_payload_len = {};
     }
 };
 
@@ -266,17 +274,17 @@ struct WsInspector {
 // PRECONDITION: `msg_buf` (capacity `msg_cap` >= max_message_size) must be the SAME
 // stable buffer on every call for this `st` — a fragmented message accumulates into it
 // across calls, so a per-read scratch buffer would lose earlier fragments.
-WsInspectStatus ws_inspect(WsInspector& st,
-                           const u8* in,
-                           u32 in_len,
-                           u8* out,
-                           u32 out_cap,
-                           u8* msg_buf,
-                           u32 msg_cap,
-                           WsMessageHandlerFn handler,
-                           void* ctx,
-                           u32* consumed,
-                           u32* produced);
+[[nodiscard]] WsInspectStatus ws_inspect(WsInspector& st,
+                                         const u8* in,
+                                         u32 in_len,
+                                         u8* out,
+                                         u32 out_cap,
+                                         u8* msg_buf,
+                                         u32 msg_cap,
+                                         WsMessageHandlerFn handler,
+                                         void* ctx,
+                                         u32* consumed,
+                                         u32* produced);
 
 // Serialize a Close frame carrying RFC 6455 status `code` into out for the terminate close
 // handshake. `masked` true for the gateway→backend (client-role) leg, false for
@@ -290,7 +298,7 @@ u32 ws_emit_close_frame(
 // Close stores owned echo metadata and received_close in the inspector. Bytes
 // following the first Close are left unconsumed for the caller to discard.
 enum class WsClosingRead : u8 { NeedMore, Ping, Close, Error };
-WsClosingRead ws_read_closing(
+[[nodiscard]] WsClosingRead ws_read_closing(
     WsInspector& st, const u8* in, u32 in_len, u8* ping_payload, u32* ping_len, u32* consumed);
 u32 ws_emit_pong_frame(
     u8* out, u32 out_cap, bool masked, u64& mask_rng, const u8* payload, u32 len);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/load_balance.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/hash.h"
 
 #include <netinet/in.h>
@@ -12,7 +13,7 @@ inline bool consistent_hash_seed(Str text, u8 (&seed)[16]) {
     for (u32 i = 0; i < 16; ++i) {
         u8 value = 0;
         for (u32 j = 0; j < 2; ++j) {
-            const char c = text.ptr[static_cast<i64>(i) * 2 + static_cast<i64>(j)];
+            const char c = text.ptr[i64{i} * 2 + i64{j}];
             if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
             value = static_cast<u8>((value << 4) | (c <= '9' ? static_cast<i64>(c - '0')
                                                              : static_cast<i64>(c - 'a') + 10));
@@ -51,21 +52,25 @@ inline bool consistent_hash_digest(Str key, u8 type, Str seed_text, u8 (&digest)
 
 inline u64 consistent_hash_cost(u64 hash) {
     if (hash == 0) hash = 1;
-    const u32 n = static_cast<u32>(63 - static_cast<i64>(__builtin_clzll(hash)));
+    constexpr int kFractionBits = 32;
+    using LeadingZeros = range_int<0, 65>;
+    const auto leading_zeros = LeadingZeros::count_leading_zeros(hash);
     using Wide = unsigned __int128;
-    Wide x = static_cast<Wide>(hash)
-             << static_cast<u32>(static_cast<i64>(63) - static_cast<i64>(n));
-    u64 fraction = 0;
-    for (u32 j = 1; j <= 32; ++j) {
+    Wide x = Wide{hash} << leading_zeros.to_u64();
+    u32 fraction = 0;
+    // Visit each fractional bit exactly once, from most to least significant.
+    for (u32 bit = u32{1} << (kFractionBits - 1); bit != 0; bit >>= 1) {
         Wide y = (x * x) >> 63;
-        if (y >= (static_cast<Wide>(1) << 64)) {
+        if (y >= (Wide{1} << 64)) {
             y >>= 1;
-            fraction |= u64{1} << static_cast<u32>(static_cast<i64>(32) - static_cast<i64>(j));
+            fraction |= bit;
         }
         x = y;
     }
-    const i64 kWhole = static_cast<i64>(64) - static_cast<i64>(n);
-    return static_cast<u64>((kWhole << 32) - static_cast<i64>(fraction));
+    const auto whole = leading_zeros + range_int<1, 2>::constant<1>();
+    constexpr i64 kFractionScale = u64{1} << kFractionBits;
+    const auto cost = whole.scaled_by<kFractionScale>() - range_int(fraction);
+    return cost.to_u64();
 }
 
 inline bool consistent_hash_score(const u8 (&digest)[32], const sockaddr_in& address, u64& cost) {

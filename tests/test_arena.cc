@@ -4,6 +4,7 @@
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/response_body_chain.h"
+#include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
 
@@ -14,6 +15,7 @@ struct ShortArenaBackend {
     alignas(16) u8 storage[64];
     u32 acquire_count = 0;
     u32 release_count = 0;
+    u64 reported_size = 1;
 
     ShortArenaBackend() {
         for (u8& byte : storage) byte = 0xa5;
@@ -21,7 +23,7 @@ struct ShortArenaBackend {
 
     core::Expected<void, Error> init() { return {}; }
     u8* acquire(u64, u64* out_size) {
-        *out_size = 1;  // Deliberately shorter than Arena::Block::kHeaderSize.
+        *out_size = reported_size;
         ++acquire_count;
         return storage;
     }
@@ -50,6 +52,16 @@ TEST(block, short_backend_block_is_rejected_before_header_write) {
     Arena<ShortArenaBackend> arena;
     CHECK(!arena.init().has_value());
     CHECK_EQ(arena.backend.acquire_count, 1u);
+    CHECK_EQ(arena.backend.release_count, 1u);
+    CHECK_EQ(arena.current, nullptr);
+    CHECK_EQ(arena.total_allocated, 0u);
+    for (u8 byte : arena.backend.storage) CHECK_EQ(byte, 0xa5);
+}
+
+TEST(block, backend_block_outside_signed_offset_range_is_rejected) {
+    Arena<ShortArenaBackend> arena;
+    arena.backend.reported_size = u64{1} << 63;
+    CHECK(!arena.init().has_value());
     CHECK_EQ(arena.backend.release_count, 1u);
     CHECK_EQ(arena.current, nullptr);
     CHECK_EQ(arena.total_allocated, 0u);
@@ -90,7 +102,7 @@ TEST(block, capacity_equals_size_minus_header) {
     REQUIRE(a.init(4096).has_value());
     auto* b = a.current;
     u64 hdr = (sizeof(MmapArena::Block) + 15) & ~u64(15);
-    CHECK_EQ(b->capacity(), b->size - hdr);
+    CHECK_EQ(b->capacity(), b->size.to_u64() - hdr);
     a.destroy();
 }
 
@@ -168,7 +180,7 @@ TEST(arena, init_reports_mmap_failure) {
 TEST(arena, init_min_256) {
     MmapArena a;
     REQUIRE(a.init(1).has_value());
-    CHECK_GE(a.current->size, 256u);
+    CHECK_GE(a.current->size.to_u64(), 256u);
     a.destroy();
 }
 
@@ -243,6 +255,23 @@ TEST(arena, zero_size_alloc) {
 // Block overflow (from clapdb ArenaTest.NewBlockTest)
 // ============================================================
 
+TEST(arena, requests_outside_signed_block_range_do_not_acquire_or_advance) {
+    Arena<UndersizedArenaBackend> arena;
+    REQUIRE(arena.init().has_value());
+    auto* first = arena.current;
+    constexpr i64 kSignedMax = INT64_MAX;
+    CHECK_EQ(arena.alloc(-1), nullptr);
+    CHECK_EQ(arena.alloc(kSignedMax), nullptr);      // Alignment exceeds i64.
+    CHECK_EQ(arena.alloc(kSignedMax - 7), nullptr);  // Block header exceeds i64.
+    CHECK_EQ(arena.alloc(u64{kSignedMax}), nullptr);
+    CHECK_EQ(arena.alloc(UINT64_MAX), nullptr);
+    CHECK_EQ(arena.backend.acquire_count, 1u);
+    CHECK_EQ(arena.current, first);
+    CHECK_EQ(first->used, 0);
+    CHECK(arena.alloc(8) != nullptr);
+    arena.destroy();
+}
+
 TEST(arena, overflow_to_new_block) {
     MmapArena a;
     REQUIRE(a.init(256).has_value());
@@ -279,7 +308,7 @@ TEST(arena, large_alloc_gets_own_block) {
     REQUIRE(a.init(256).has_value());
     void* p = a.alloc(1024);
     CHECK(p != nullptr);
-    CHECK_GE(a.current->size, 1024u + sizeof(MmapArena::Block));
+    CHECK_GE(a.current->size.to_u64(), 1024u + sizeof(MmapArena::Block));
     a.destroy();
 }
 
@@ -297,7 +326,7 @@ TEST(arena, alloc_exact_block_capacity) {
     MmapArena a;
     REQUIRE(a.init(4096).has_value());
     u64 cap = a.current->capacity();
-    u64 aligned_cap = cap & ~static_cast<u64>(7);
+    u64 aligned_cap = cap & ~u64{7};
     void* p = a.alloc(aligned_cap);
     CHECK(p != nullptr);
     CHECK_EQ(a.current->remaining(), cap - aligned_cap);
@@ -530,6 +559,18 @@ TEST(arena, space_allocated_grows_with_blocks) {
     a.destroy();
 }
 
+TEST(arena, space_used_reports_invalid_accounting) {
+    MmapArena arena;
+    MmapArena::Block oldest{nullptr, {}, 2};
+    MmapArena::Block middle{&oldest, {}, INT64_MAX};
+    MmapArena::Block newest{&middle, {}, INT64_MAX};
+    arena.current = &newest;
+    CHECK_EQ(arena.space_used(), MmapArena::kInvalidSpaceUsed);
+
+    // A negative counter must fail even if earlier usage could absorb it.
+    middle.used = -1;
+    CHECK_EQ(arena.space_used(), MmapArena::kInvalidSpaceUsed);
+}
 TEST(arena, space_used_zero_after_reset) {
     MmapArena a;
     REQUIRE(a.init(4096).has_value());
@@ -1457,5 +1498,26 @@ TEST(response_body_chain, tls_threshold_keeps_short_bodies_in_slices) {
     CHECK_EQ(offset, sizeof(body));
     CHECK_EQ(pool.bulk_available(), kTestBulk);
     chain.release();
+    pool.destroy();
+}
+
+TEST(slab_pool, rejects_misaligned_and_foreign_pointers_before_freeing) {
+    using Pool = SlabPool<u64, 4>;
+    Pool pool;
+    REQUIRE(pool.init().has_value());
+    u64* slot = pool.alloc();
+    REQUIRE(slot != nullptr);
+    CHECK_EQ(pool.index_of(slot), 3u);
+
+    auto* misaligned = reinterpret_cast<u64*>(reinterpret_cast<u8*>(slot) + 1);
+    u64 foreign = 0;
+    CHECK_EQ(pool.index_of(misaligned), Pool::kInvalidIndex);
+    CHECK_EQ(pool.index_of(&foreign), Pool::kInvalidIndex);
+    pool.free(misaligned);
+    pool.free(&foreign);
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(slot);
+    CHECK_EQ(pool.in_use(), 0u);
     pool.destroy();
 }

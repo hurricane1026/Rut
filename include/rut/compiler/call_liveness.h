@@ -56,8 +56,8 @@ inline bool call_live_values(const Function& fn, MmapArena& arena, u32* saved) {
         bits[id / 64] |= u64(1) << (id % 64);
     };
     for (u32 b = 0; b < fn.block_count; ++b) {
-        auto* used = uses + static_cast<u64>(b) * words;
-        auto* defined = defs + static_cast<u64>(b) * words;
+        auto* used = uses + u64{b} * words;
+        auto* defined = defs + u64{b} * words;
         const auto& block = fn.blocks[b];
         for (u32 i = 0; i < block.inst_count; ++i) {
             const auto& inst = block.insts[i];

@@ -4083,12 +4083,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 return frontend_error(FrontendError::OutOfMemory, term.span);
         }
         const u16 upstream_id = mir.upstreams[term.upstream_index].id;
-        auto upstream =
-            b.emit_const_i32(static_cast<i32>(upstream_id), {term.span.line, term.span.col});
+        auto upstream = b.emit_const_i32(i32{upstream_id}, {term.span.line, term.span.col});
         if (!upstream) return frontend_error(FrontendError::OutOfMemory, term.span);
         rir::ValueId policy = rir::kNoValue;
         if (term.forward_request_policy_id != 0) {
-            auto p = b.emit_const_i32(static_cast<i32>(term.forward_request_policy_id),
+            auto p = b.emit_const_i32(i32{term.forward_request_policy_id},
                                       {term.span.line, term.span.col});
             if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
             policy = p.value();
@@ -4132,8 +4131,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                                         term.forward_response_read_timeout_seconds,
                                                         term.forward_response_buffering};
             }
-            auto bundle =
-                b.emit_const_i32(static_cast<i32>(bundle_id), {term.span.line, term.span.col});
+            auto bundle = b.emit_const_i32(i32{bundle_id}, {term.span.line, term.span.col});
             if (!bundle) return frontend_error(FrontendError::OutOfMemory, term.span);
             if (policy == rir::kNoValue) {
                 auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
@@ -4180,7 +4178,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
                 policy = p0.value();
             }
-            auto p = b.emit_const_i32(static_cast<i32>(term.forward_response_policy_id),
+            auto p = b.emit_const_i32(i32{term.forward_response_policy_id},
                                       {term.span.line, term.span.col});
             if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
             response_policy = p.value();

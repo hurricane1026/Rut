@@ -507,8 +507,8 @@ bool same_inode_replacement_destructor_case(ReplacementRole role) {
          fstat(replacement.foreign, &foreign_status) == 0 &&
          fstat(replacement.target, &target_status) == 0 &&
          fstatat(directory_lease.descriptor(), kBasename, &path_status, AT_SYMLINK_NOFOLLOW) == 0 &&
-         static_cast<std::uint64_t>(foreign_status.st_dev) == identity.device &&
-         static_cast<std::uint64_t>(foreign_status.st_ino) == identity.inode &&
+         std::uint64_t{foreign_status.st_dev} == identity.device &&
+         std::uint64_t{foreign_status.st_ino} == identity.inode &&
          target_status.st_dev == foreign_status.st_dev &&
          target_status.st_ino == foreign_status.st_ino &&
          path_status.st_dev == foreign_status.st_dev &&

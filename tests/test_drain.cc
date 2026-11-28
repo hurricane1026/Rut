@@ -9,7 +9,7 @@
 // ============================================================
 
 // Search for a substring in a Buffer's data.
-static bool buf_contains(const Buffer& buf, const char* needle) {
+static bool buf_contains(const SliceBuffer& buf, const char* needle) {
     const char* data = reinterpret_cast<const char*>(buf.data());
     rut::u32 len = buf.len();
     rut::u32 nlen = 0;
@@ -54,7 +54,7 @@ static bool dispatch_complete_test_request(SmallLoop& loop, Connection& c) {
     if (c.recv_buf.write(reinterpret_cast<const rut::u8*>(kRequest), sizeof(kRequest) - 1u) !=
         sizeof(kRequest) - 1u)
         return false;
-    loop.dispatch(make_ev(c.id, IoEventType::Recv, static_cast<rut::i32>(sizeof(kRequest) - 1u)));
+    loop.dispatch(make_ev(c.id, IoEventType::Recv, rut::i32{sizeof(kRequest) - 1u}));
     return true;
 }
 
@@ -119,6 +119,10 @@ TEST(drain_prob, always_true_zero_period) {
     for (rut::u32 id = 0; id < 100; id++) {
         CHECK(rut::should_drain_close(id, 1000, 1000, 0));
     }
+}
+
+TEST(drain_prob, clock_before_drain_start_closes) {
+    CHECK(should_drain_close(1, UINT64_MAX, 0, 30));
 }
 
 TEST(drain_prob, none_at_start) {

@@ -230,16 +230,12 @@ private:
     // the insert-vs-match round-trip always agrees on what counts
     // as a segment.
     //
-    // Returns the segment count on success, or kMaxPathSegments + 1 as
-    // a sentinel when the path would produce more segments than `out`
-    // can hold. `insert()` rejects sentinel results so a build-time
-    // config with too-deep paths fails cleanly; `match()` ignores the
-    // sentinel and runs with the (truncated) segments so deep request
-    // URIs still fall back to a catchall or prefix route.
-    //
-    // Does not allocate — `out` is caller-provided storage, emitted
-    // Str views point into the path portion of `path.ptr`.
-    static u32 tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out);
+    // Lookup keeps the retained prefix when storage fills. Registration
+    // treats the same condition as an error, indicated by kMaxPathSegments + 1.
+    enum class SegmentLimit : u8 { Reject, KeepPrefix };
+    [[nodiscard]] static u32 tokenize_segments(Str path,
+                                               FixedVec<Str, kMaxPathSegments>& out,
+                                               SegmentLimit limit);
 
     // Linear-scan child lookup: walks `children` from first_child and compares
     // the full segment via Str::eq. Matching skips the parameter partition;

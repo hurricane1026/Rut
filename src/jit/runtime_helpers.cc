@@ -5,7 +5,9 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/http_query.h"
 #include "rut/common/load_balance.h"
+#include "rut/common/range_int.h"
 #include "rut/common/shard_limits.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/uri_normalize.h"
 #include "rut/common/ws_message.h"
@@ -193,9 +195,10 @@ void rut_helper_req_routing_string(void* conn,
         if (!pc.ok) return;
         Str target = pc.req.path;
         if (!forward_target_valid(target)) return;
+        const auto kRemaining = range_int<262144, 262145>{} - range_int(target.len);
         auto& arena = connection.json_arena;
         if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
-            arena.space_used() > 262144 - target.len)
+            __int128_t{arena.space_used()} > kRemaining.value())
             return;
         auto* bytes = static_cast<char*>(arena.alloc(target.len));
         u32 normalized_length = 0;
@@ -248,13 +251,13 @@ void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, 
         *out_len = 1;
         return;
     }
-    i++;  // skip space
+    i = (range_int(i) + range_int<1, 2>{}).min(range_int(req_len)).to<u32>();
     u32 path_start = i;
     while (i < req_len && req_data[i] != ' ' && req_data[i] != '\r') {
         i++;
     }
     *out_ptr = reinterpret_cast<const char*>(req_data + path_start);
-    *out_len = i - path_start;
+    *out_len = (range_int(i) - range_int(path_start)).max(range_int<0, 1>{}).to<u32>();
 }
 
 void rut_helper_req_path_only(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {
@@ -277,8 +280,8 @@ void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, 
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return;
     const ParsedRequest& req = pc.req;
-    const u32 available = req_len - pc.header_end;
-    if (available == 0) return;
+    const auto kAvailable = range_int(req_len) - range_int(pc.header_end);
+    if (kAvailable.value() <= 0) return;
 
     if (req.chunked) return;
     // Without a Content-Length the body framing is undefined: in HTTP/1
@@ -286,7 +289,7 @@ void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, 
     // request's body. The HTTP/2 bridge synthesizes a Content-Length for
     // DATA-only bodies (see h2_finish_body) so they take the path below.
     if (!req.has_content_length) return;
-    if (req.content_length == 0 || available < req.content_length) return;
+    if (req.content_length == 0 || kAvailable.value() < req.content_length) return;
 
     *out_ptr = reinterpret_cast<const char*>(req_data + pc.header_end);
     *out_len = req.content_length;
@@ -452,8 +455,10 @@ extern "C" void* rut_helper_http_call_frame(
     __builtin_memcpy(static_cast<void*>(&saved), ctx.slots(), sizeof(HttpCallFrameHeader*));
     if (saved) return saved;
     auto& arena = conn.json_arena;
+    const auto kRemaining =
+        range_int<262144, 262145>{} - range_int(static_cast<u32>(size)) - range_int(length);
     if (!arena.backend.pool || (!arena.current && !arena.init(arena.backend.pool)) ||
-        arena.space_used() > 262144 - size - length)
+        __int128_t{arena.space_used()} > kRemaining.value())
         return nullptr;
     auto* frame = static_cast<HttpCallFrameHeader*>(arena.alloc(size));
     auto* snapshot = static_cast<u8*>(arena.alloc(length));
@@ -463,16 +468,18 @@ extern "C" void* rut_helper_http_call_frame(
     frame->request = snapshot;
     frame->length = length;
     const uintptr_t kRequestStart = reinterpret_cast<uintptr_t>(request);
-    const uintptr_t kRequestEnd = kRequestStart + length;
     const u32 kParamCount =
         ctx.route_param_count > kMaxRouteParams ? kMaxRouteParams : ctx.route_param_count;
     for (u32 i = 0; i < kParamCount; ++i) {
         auto& param = ctx.route_params[i];
         const uintptr_t kValueStart = reinterpret_cast<uintptr_t>(param.value);
-        if (!param.value || kValueStart < kRequestStart || kValueStart > kRequestEnd ||
-            param.value_len > kRequestEnd - kValueStart)
-            continue;
-        param.value = reinterpret_cast<const char*>(snapshot + (kValueStart - kRequestStart));
+        // RUT_INTEGER_RANGE: addresses can use the full uintptr_t range.
+        const auto kDistance = __int128_t{kValueStart} - __int128_t{kRequestStart};
+        if (!param.value || kDistance < 0 || kDistance > length) continue;
+        const u32 kOffset = static_cast<u32>(kDistance);
+        const auto kAvailable = range_int(length) - range_int(kOffset);
+        if (param.value_len > kAvailable.value()) continue;
+        param.value = reinterpret_cast<const char*>(snapshot + range_int(kOffset).value());
     }
     __builtin_memcpy(ctx.slots(), static_cast<const void*>(&frame), sizeof(HttpCallFrameHeader*));
     return frame;
@@ -507,8 +514,7 @@ extern "C" u64 rut_helper_net_call(void* connection,
                                       opening ? Str{} : Str{data, data_length},
                                       amount,
                                       timeout);
-    if (reply.status == NetReply::kPending)
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+    if (reply.status == NetReply::kPending) return (u64{reply.retry_ms} << 32) | 0x80000000u;
     if (reply.status != 0) return 0;
     *scalar = reply.scalar;
     if (reply.length) {
@@ -553,7 +559,7 @@ extern "C" u64 rut_helper_http_call(void* connection,
     if (http_call_policy({policy, policy_len}, endpoint))
         reply = http_call_for_request(connection, endpoint, {request, request_len}, timeout);
     if (reply.status == static_cast<i32>(0x80000000u))
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+        return (u64{reply.retry_ms} << 32) | 0x80000000u;
     Str result{reply.document, reply.length};
     if (reply.status != 0) {
         result = reply.status == -2 ? lit_str("{\"ok\":false,\"status\":0,\"error\":\"timeout\"}")
@@ -602,21 +608,23 @@ extern "C" u64 rut_helper_forward_auth_header(void* connection,
     // by taking the bytes between the first two spaces in the validated start line.
     u32 start = 0;
     while (start < length && data[start] != ' ') ++start;
+    if (start == length) return 0xffffffffu;
     const Str method{reinterpret_cast<const char*>(data), start};
-    ++start;
+    start = (range_int(start) + range_int<1, 2>{}).min(range_int(length)).to<u32>();
     u32 end = start;
     while (end < length && data[end] != ' ') ++end;
     if (end == length) return 0xffffffffu;
-    const auto reply =
-        forward_auth_for_request(connection,
-                                 {header, header_length},
-                                 policy,
-                                 {credential, credential_length},
-                                 method,
-                                 {reinterpret_cast<const char*>(data + start), end - start},
-                                 timeout_ms);
+    const auto kTargetLength = range_int(end) - range_int(start);
+    const auto reply = forward_auth_for_request(connection,
+                                                {header, header_length},
+                                                policy,
+                                                {credential, credential_length},
+                                                method,
+                                                {reinterpret_cast<const char*>(data + start),
+                                                 kTargetLength.max(range_int<0, 1>{}).to<u32>()},
+                                                timeout_ms);
     if (reply.status == static_cast<i32>(0x80000000u))
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+        return (u64{reply.retry_ms} << 32) | 0x80000000u;
     if (reply.status == 1) {
         const u32 name_length = static_cast<u32>(__builtin_strlen(policy.identity_header));
         rut_helper_req_set_owned_header(connection,
@@ -651,7 +659,7 @@ extern "C" u64 rut_helper_password_verify_header(void* connection,
     const auto reply = verify_password_for_request(
         connection, {password, password_length}, {record, record_length}, timeout_ms);
     if (reply.status == PasswordRequestStatus::Pending)
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+        return (u64{reply.retry_ms} << 32) | 0x80000000u;
     if (reply.status == PasswordRequestStatus::Matched) return 1;
     if (reply.status == PasswordRequestStatus::Rejected) return 0;
     if (reply.status == PasswordRequestStatus::TimedOut) return 0xfffffffeu;
@@ -677,7 +685,12 @@ bool apply_request_body_override(ConnectionBase& conn, Str body) {
         return false;
     const u32 total = conn.recv_buf.len();
     const u32 old_header_end = conn.req_header_end;
-    const u32 old_body_len = conn.req_content_length;
+    if (conn.req_content_length < 0 || conn.req_content_length > i64{total} - i64{old_header_end})
+        return false;
+    const u32 old_body_len = range_int(conn.req_content_length)
+                                 .max(range_int(u32{0}))
+                                 .min(range_int(UINT32_MAX))
+                                 .to<u32>();
     if (old_header_end > total || old_body_len > total - old_header_end ||
         conn.req_initial_send_len < old_header_end ||
         conn.req_initial_send_len - old_header_end < old_body_len)
@@ -692,7 +705,7 @@ bool apply_request_body_override(ConnectionBase& conn, Str body) {
     u32 new_total = total;
     u32 new_header_end = old_header_end;
     if (!replace_h1_body_in_place(
-            data, &new_total, conn.recv_buf.capacity(), &new_header_end, old_body_len, body))
+            data, &new_total, conn.recv_buf.capacity_u32(), &new_header_end, old_body_len, body))
         return false;
     conn.recv_buf.set_len(new_total);
     conn.req_header_end = new_header_end;
@@ -1299,8 +1312,12 @@ u32 rut_helper_req_remote_addr(void* conn) {
 i64 rut_helper_time_now_micros() {
     TimeCache& tc = t_time_cache;
     if (!tc.valid) {
-        tc.value = static_cast<i64>(t_virtual_time_us != nullptr ? *t_virtual_time_us
-                                                                 : rut::monotonic_us());
+        const u64 now_us = t_virtual_time_us ? *t_virtual_time_us : rut::monotonic_us();
+        // Handler simulations reject clocks outside the signed JIT ABI.
+        range_int<0> now;
+        if (!decltype(now)::try_from_u64(now_us, &now))
+            RUT_TRAP("JIT clock exceeds the signed microsecond range");
+        tc.value = now.value();
         tc.valid = true;
     }
     return tc.value;
@@ -1754,7 +1771,7 @@ extern "C" void rut_helper_jwt_issue_hs256(void* conn,
                                          {subject, subject_len},
                                          {issuer, issuer_len},
                                          {audience, audience_len},
-                                         static_cast<i64>(now.tv_sec),
+                                         i64{now.tv_sec},
                                          ttl_seconds,
                                          token,
                                          sizeof(token),
@@ -1818,7 +1835,7 @@ extern "C" void rut_helper_jwt_issue_hs256_with_id(void* conn,
                                                  {issuer, issuer_len},
                                                  {audience, audience_len},
                                                  {token_id, token_id_len},
-                                                 static_cast<i64>(now.tv_sec),
+                                                 i64{now.tv_sec},
                                                  ttl_seconds,
                                                  token,
                                                  sizeof(token),
@@ -1885,7 +1902,7 @@ extern "C" void rut_helper_jwt_issue_hs256_with_id_and_scope(void* conn,
                                                            {audience, audience_len},
                                                            {token_id, token_id_len},
                                                            {scope, scope_len},
-                                                           static_cast<i64>(now.tv_sec),
+                                                           i64{now.tv_sec},
                                                            ttl_seconds,
                                                            token,
                                                            sizeof(token),
@@ -2061,7 +2078,7 @@ rut::u8 rut_helper_signed_request_valid(rut::u8 method,
                                             {body, body_len},
                                             {key_id, key_id_len},
                                             {key, key_len},
-                                            static_cast<rut::i64>(kNow.tv_sec));
+                                            rut::i64{kNow.tv_sec});
 }
 
 u8 rut_helper_hmac_sha256_matches(const char* message,
@@ -2226,11 +2243,11 @@ struct RegexScratchCache {
         rut::MmapBackend backend;
         u64 new_slots_size = 0;
         auto* new_slots = reinterpret_cast<RegexScratchSlot*>(
-            backend.acquire(static_cast<u64>(new_cap) * sizeof(RegexScratchSlot), &new_slots_size));
+            backend.acquire(u64{new_cap} * sizeof(RegexScratchSlot), &new_slots_size));
         if (new_slots == nullptr) return false;
         u64 new_index_size = 0;
-        auto* new_index = reinterpret_cast<RegexScratchIndexEntry*>(backend.acquire(
-            static_cast<u64>(new_index_cap) * sizeof(RegexScratchIndexEntry), &new_index_size));
+        auto* new_index = reinterpret_cast<RegexScratchIndexEntry*>(
+            backend.acquire(u64{new_index_cap} * sizeof(RegexScratchIndexEntry), &new_index_size));
         if (new_index == nullptr) {
             backend.release(reinterpret_cast<u8*>(new_slots), new_slots_size);
             return false;
@@ -3014,7 +3031,7 @@ extern "C" u8 rut_helper_jwt_claims_valid_with_lifetime(const char* claims,
                                           {claims, claims_len},
                                           {issuer, issuer_len},
                                           {audience, audience_len},
-                                          static_cast<i64>(now.tv_sec),
+                                          i64{now.tv_sec},
                                           max_age_seconds,
                                           max_lifetime_seconds)
                ? 1u
@@ -3395,10 +3412,8 @@ extern "C" void rut_helper_json(void* conn,
         if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
             now.tv_nsec >= 1000000000)
             return;
-        scalar = oauth_introspection_valid(
-                     document, {a, a_len}, {b, b_len}, static_cast<i64>(now.tv_sec))
-                     ? 1
-                     : 0;
+        scalar =
+            oauth_introspection_valid(document, {a, a_len}, {b, b_len}, i64{now.tv_sec}) ? 1 : 0;
         view = {"", 0};
     } else if (operation == json::Op::Sha256HexValid) {
         scalar = rut_helper_sha256_hex_valid(a, a_len);
@@ -3423,10 +3438,8 @@ extern "C" void rut_helper_json(void* conn,
         if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
             now.tv_nsec >= 1000000000)
             return;
-        scalar = jwt_claims_valid(
-                     document, {a, a_len}, {b, b_len}, {c, c_len}, static_cast<i64>(now.tv_sec))
-                     ? 1
-                     : 0;
+        scalar =
+            jwt_claims_valid(document, {a, a_len}, {b, b_len}, {c, c_len}, i64{now.tv_sec}) ? 1 : 0;
         // This boolean operation borrows no output and needs no JSON arena.
         view = {"", 0};
     } else if (operation == json::Op::JwtVerifyRs256) {
@@ -3443,10 +3456,10 @@ extern "C" void rut_helper_json(void* conn,
                                 {b, b_len},
                                 document,
                                 {a, a_len},
-                                static_cast<i64>(now.tv_sec),
+                                i64{now.tv_sec},
                                 payload,
                                 sizeof(payload),
-                                length))
+                                &length))
             return;
         writer.text({payload, length});
         if (!writer.ok) return;
@@ -3464,10 +3477,10 @@ extern "C" void rut_helper_json(void* conn,
                                 {b, b_len},
                                 document,
                                 {a, a_len},
-                                static_cast<i64>(now.tv_sec),
+                                i64{now.tv_sec},
                                 payload,
                                 sizeof(payload),
-                                length))
+                                &length))
             return;
         writer.text({payload, length});
         if (!writer.ok) return;
@@ -3555,8 +3568,8 @@ extern "C" rut::u8 rut_helper_parse_int(const char* data,
                                         rut::i64* output) {
     if (!output) return 0;
     *output = 0;
-    if (bits == 32) return rut::parse_integer32({data, length}, *output);
-    if (bits == 64) return rut::parse_integer64({data, length}, *output);
+    if (bits == 32) return rut::parse_integer32({data, length}, output);
+    if (bits == 64) return rut::parse_integer64({data, length}, output);
     return 0;
 }
 
@@ -3616,7 +3629,7 @@ extern "C" const char* rut_helper_bytes_concat(void* conn,
 extern "C" rut::u8 rut_helper_format_int(
     void* conn, void* arena, rut::i64 value, const char** out_ptr, rut::u32* out_size) {
     if (!out_ptr || !out_size) return 0;
-    char buffer[20];
+    char buffer[rut::kFormatIntegerBufferSize];
     const rut::Str kText = rut::format_integer(value, buffer);
     return rut_helper_str_concat(conn, arena, &kText, 1, out_ptr, out_size);
 }

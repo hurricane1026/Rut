@@ -1,7 +1,9 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/integer_conversion.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -203,11 +205,12 @@ public:
                         c.request_config->upstreams[c.upstream_idx].write_timeout_seconds) *
                     1'000'000;
                 const u64 now = monotonic_us();
-                u64 elapsed = 0;
-                (void)__builtin_sub_overflow(now, c.upstream_write_idle_progress_us, &elapsed);
-                if (now < c.upstream_write_idle_progress_us) elapsed = 0;
+                const u64 progress = c.upstream_write_idle_progress_us;
+                // RUT_INTEGER_RANGE: the ordered full-width timestamps have a u64 difference.
+                const u64 elapsed =
+                    now < progress ? 0 : static_cast<u64>(__int128_t{now} - __int128_t{progress});
                 i64 elapsed_signed = 0;
-                if (!try_u64_to_i64(elapsed, elapsed_signed)) {
+                if (!try_u64_to_i64(elapsed, &elapsed_signed)) {
                     disarm_upstream_write_idle(c);
                     expire_upstream_write_idle(&self(), c);
                     continue;
@@ -612,18 +615,16 @@ public:
     const RouteConfig* timer_armed_config = nullptr;
     u64 background_timer_deadline_ns = 0;
 
-    u32 background_timer_wait_ms(u32 limit) const {
+    [[nodiscard]] u32 background_timer_wait_ms(u32 limit) const {
         if (background_timer_deadline_ns == 0) return limit;
-        const u64 now = monotonic_ns();
-        if (background_timer_deadline_ns <= now) return 0;
-        u64 remaining = 0;
-        (void)__builtin_sub_overflow(background_timer_deadline_ns, now, &remaining);
-        const u64 whole_ms = remaining / 1'000'000;
-        // epoll takes a signed millisecond timeout. Saturate before rounding.
-        if (whole_ms >= static_cast<u64>(INT32_MAX))
-            return limit < static_cast<u32>(INT32_MAX) ? limit : static_cast<u32>(INT32_MAX);
-        const i64 ms = static_cast<i64>(whole_ms) + (remaining % 1'000'000 != 0 ? 1 : 0);
-        return ms < static_cast<i64>(limit) ? static_cast<u32>(ms) : limit;
+        u64 remaining;
+        if (sub_overflow(background_timer_deadline_ns, monotonic_ns(), &remaining)) return 0;
+        constexpr u64 kNanosPerMillisecond = 1'000'000;
+        const auto whole = bounded_quotient<kNanosPerMillisecond>(remaining);
+        const auto round = range_int{u8{remaining % kNanosPerMillisecond != 0}};
+        // epoll takes a signed millisecond timeout.
+        constexpr auto kMaxTimeout = range_int<INT32_MAX, i64{INT32_MAX} + 1>{};
+        return (whole + round).min(kMaxTimeout).min(range_int{limit}).to<u32>();
     }
 
     void fire_due_timers() {
@@ -642,14 +643,16 @@ public:
             cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count : RouteConfig::kMaxTimers;
         for (u32 i = 0; i < count; i++) {
             const auto& entry = cfg->timers[i];
-            if (entry.shard >= 0 && static_cast<u32>(entry.shard) != self().shard_id) continue;
+            if (entry.shard >= 0 && entry.shard != range_int{self().shard_id}.template to<i64>())
+                continue;
             if (changed) {
                 timer_deadline_ns[i] = deadline_after(now, entry.interval_ms);
             } else if (now >= timer_deadline_ns[i]) {
                 jit::HandlerCtx ctx{};
                 SliceArena scratch{};
                 if (scratch.init(&self().pool)) {
-                    (void)entry.fn(nullptr, &ctx, nullptr, 0, &scratch);
+                    // Timer bodies use the handler ABI without a request or response.
+                    entry.fn(nullptr, &ctx, nullptr, 0, &scratch);
                     scratch.destroy();
                     timer_fire_count[i]++;
                 }
@@ -671,12 +674,10 @@ public:
     u64 health_probe_last_issue_ns[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     bool health_probe_issued[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     u8 health_probe_backend_cursor[RouteConfig::kMaxUpstreams]{};
-    static u64 deadline_after(u64 now, u32 interval_ms) {
-        u64 delay = 0;
-        if (__builtin_mul_overflow(static_cast<u64>(interval_ms), u64{1'000'000}, &delay))
-            return UINT64_MAX;
+    [[nodiscard]] static u64 deadline_after(u64 now, u32 interval_ms) {
+        const u64 delay = range_int(interval_ms).scaled_by<1'000'000>().to_u64();
         u64 deadline = 0;
-        if (__builtin_add_overflow(now, delay, &deadline)) return UINT64_MAX;
+        if (add_overflow(now, delay, &deadline)) return UINT64_MAX;
         return deadline;
     }
     const RouteConfig* health_armed_config = nullptr;
@@ -1024,8 +1025,7 @@ public:
         }
         for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf =
-                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
+                conns[i].capture_buf = capture_region_ + i64{i} * i64{kCaptureSliceSize};
         }
         return true;
     }
@@ -1124,7 +1124,7 @@ public:
                     running_.store(false, std::memory_order_relaxed);
                 } else {
                     u64 deadline = 0;
-                    if (__builtin_add_overflow(start, static_cast<u64>(period), &deadline))
+                    if (add_overflow(start, static_cast<u64>(period), &deadline))
                         deadline = UINT64_MAX;
                     if (monotonic_secs() < deadline) continue;
                     force_close_all();
@@ -1176,17 +1176,13 @@ public:
     // Zero-cost when epoch pointer is null (no control plane wired).
     void epoch_enter() {
         if (epoch) {
-            u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
-            u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
@@ -1384,8 +1380,7 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf =
-                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
+            conns[id].capture_buf = capture_region_ + i64{id} * i64{kCaptureSliceSize};
         return &conns[id];
     }
 
@@ -1649,10 +1644,10 @@ public:
                 // ev.result carries timerfd tick count — may be >1 if loop stalled.
                 // Advance timer wheel once per accumulated tick to avoid skipping expirations.
                 i32 ticks = ev.result > 0 ? ev.result : 1;
-                const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
+                const i32 max_ticks = i32{TimerWheel::kSlots};
                 if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
                 for (i32 t = 0; t < ticks; t++) {
-                    timer.tick([this](Connection* c) {
+                    timer.advance([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
                         if (ws_handle_timer_tick(this, *c)) return;
 #endif

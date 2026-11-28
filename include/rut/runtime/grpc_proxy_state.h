@@ -38,7 +38,7 @@ struct GrpcExchange {
     u32 ws_offers_len;
     u64 deadline_us;
     u64 request_bytes;
-    u32 expected_request_bytes;
+    i64 expected_request_bytes;
     bool has_request_length;
     bool request_end;
     bool request_headers_sent;
@@ -53,7 +53,7 @@ struct GrpcExchange {
     u32 upload_len;
     u32 download_len;
     u64 response_bytes;
-    u32 expected_response_bytes;
+    i64 expected_response_bytes;
     u32 request_headers_len;
     u32 request_trailers_len;
     u32 response_headers_len;
@@ -105,9 +105,11 @@ struct GrpcExchange {
 // Only upstream sessions join the shard-local pool; mappings keep stream IDs
 // independent on the two hops, allowing multiple downstream clients to share it.
 struct GrpcProxyState {
+    static constexpr u32 kStreamSlots = 64;
+
     TlsClientContext client_tls;
     bool tls_verified;
-    GrpcExchange* streams[64];
+    GrpcExchange* streams[kStreamSlots];
     ConnectionBase* pool_next;
     u32 active;
     u32 cursor;

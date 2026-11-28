@@ -103,8 +103,8 @@ inline void sim_extract_request_info(const CaptureEntry& entry, SimResult& resul
 
 // Elapsed microseconds between two CLOCK_MONOTONIC timespecs.
 inline u32 elapsed_us(const struct timespec& t0, const struct timespec& t1) {
-    i64 sec_diff = static_cast<i64>(t1.tv_sec) - static_cast<i64>(t0.tv_sec);
-    i64 nsec_diff = static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec);
+    i64 sec_diff = i64{t1.tv_sec} - i64{t0.tv_sec};
+    i64 nsec_diff = i64{t1.tv_nsec} - i64{t0.tv_nsec};
     if (nsec_diff < 0) {
         sec_diff -= 1;
         nsec_diff += 1000000000LL;

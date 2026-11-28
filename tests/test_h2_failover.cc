@@ -44,8 +44,8 @@ struct RetryRig {
         h2.streams[0] = {};
         h2.streams[0].id = 1;
         h2.streams[0].state = Http2StreamState::Open;
-        h2.streams[0].send_window = static_cast<i32>(kDefaultInitialWindowSize);
-        h2.streams[0].recv_window = static_cast<i32>(kDefaultInitialWindowSize);
+        h2.streams[0].send_window = i32{kDefaultInitialWindowSize};
+        h2.streams[0].recv_window = i32{kDefaultInitialWindowSize};
         h2.streams[0].got_headers = true;
         h2.async_stream = 1;
         h2.async_kind = H2AsyncKind::Proxy;

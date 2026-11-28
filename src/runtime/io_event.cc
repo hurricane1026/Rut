@@ -89,8 +89,7 @@ consteval bool positive_copy_span_contract() {
                     event.result = kResult;
                     for (const u32 kCursor : kOffsets) {
                         const bool kMatches = kWitness == IoEventCopyWitness::Full && kResult > 0 &&
-                                              kBegin == kCursor &&
-                                              static_cast<i64>(kCursor) + kResult == kEnd;
+                                              kBegin == kCursor && i64{kCursor} + kResult == kEnd;
                         if (matches_positive_copy_span(event, kCursor) != kMatches) return false;
                     }
                 }

@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/http_query.h"
+#include "rut/common/range_int.h"
 #include "rut/common/route_host.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
@@ -252,7 +253,7 @@ static Str stash_owned_string(std::deque<std::string>& store, const std::string&
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
 static bool validate_regex_literal(Str pattern, std::string* error) {
     std::string wrapped;
-    wrapped.reserve(static_cast<size_t>(pattern.len) + 7);
+    wrapped.reserve(size_t{pattern.len} + 7);
     wrapped.append("^(?:", 4);
     wrapped.append(pattern.ptr, pattern.len);
     wrapped.append(")$", 2);
@@ -3603,7 +3604,7 @@ static WsOutputLiteralBounds ws_output_literal_bounds(
     if (value.kind == HirExprKind::StringConcat && value.lhs && value.rhs) {
         const auto kLhs = ws_output_literal_bounds(*value.lhs, locals, count, visits, depth + 1);
         const auto kRhs = ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
-        const u64 kSize = static_cast<u64>(kLhs.minimum) + kRhs.minimum;
+        const u64 kSize = u64{kLhs.minimum} + kRhs.minimum;
         return {kSize > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kSize),
                 kLhs.valid_utf8 && kRhs.valid_utf8,
                 kLhs.complete && kRhs.complete};
@@ -3769,7 +3770,7 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
         if (pipe_lhs == nullptr)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, arg.span, lit_str("placeholder outside pipe"));
-        if (arg.int_value <= 0 || arg.int_value > static_cast<i32>(kMaxTupleSlots))
+        if (arg.int_value <= 0 || arg.int_value > i32{kMaxTupleSlots})
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot out of range"));
@@ -3866,18 +3867,18 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
         i64 folded = 0;
         switch (bit_kind) {
             case HirExprKind::BitAnd:
-                folded = static_cast<i64>(static_cast<u64>(a) & static_cast<u64>(n));
+                folded = a & n;
                 break;
             case HirExprKind::BitOr:
-                folded = static_cast<i64>(static_cast<u64>(a) | static_cast<u64>(n));
+                folded = a | n;
                 break;
             case HirExprKind::BitXor:
-                folded = static_cast<i64>(static_cast<u64>(a) ^ static_cast<u64>(n));
+                folded = a ^ n;
                 break;
             case HirExprKind::BitShl:
                 folded = static_cast<u64>(n) >= width
                              ? 0
-                             : (is64 ? static_cast<i64>(static_cast<u64>(a) << n)
+                             : (is64 ? signed_wrapping_value(static_cast<u64>(a) << n)
                                      : static_cast<i64>(static_cast<i32>(static_cast<u32>(a)
                                                                          << static_cast<u32>(n))));
                 break;
@@ -3936,17 +3937,17 @@ static i32 fold_arith_i32(HirExprKind kind, i32 a, i32 b) {
 
 // 64-bit twin of fold_arith_i32, same total semantics at i64 width.
 static i64 fold_arith_i64(HirExprKind kind, i64 a, i64 b) {
-    const bool ovf = a == static_cast<i64>(0x8000000000000000ull) && b == -1;
+    const bool ovf = a == INT64_MIN && b == -1;
     switch (kind) {
         case HirExprKind::Add:
-            return static_cast<i64>(static_cast<u64>(a) + static_cast<u64>(b));
+            return signed_wrapping_value(static_cast<u64>(a) + static_cast<u64>(b));
         case HirExprKind::Sub:
-            return static_cast<i64>(static_cast<u64>(a) - static_cast<u64>(b));
+            return signed_wrapping_value(static_cast<u64>(a) - static_cast<u64>(b));
         case HirExprKind::Mul:
-            return static_cast<i64>(static_cast<u64>(a) * static_cast<u64>(b));
+            return signed_wrapping_value(static_cast<u64>(a) * static_cast<u64>(b));
         case HirExprKind::Div:
             if (b == 0) return 0;
-            return ovf ? static_cast<i64>(0x8000000000000000ull) : a / b;
+            return ovf ? INT64_MIN : a / b;
         case HirExprKind::Mod:
             if (b == 0) return 0;
             return ovf ? 0 : a % b;
@@ -5560,7 +5561,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                       arg.span,
                                       lit_str("placeholder outside pipe"));
             const i64 kSlot = arg.int_value;
-            if (kSlot <= 0 || kSlot > static_cast<i64>(kMaxTupleSlots))
+            if (kSlot <= 0 || kSlot > i64{kMaxTupleSlots})
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       arg.span,
                                       lit_str("placeholder slot out of range"));
@@ -5571,7 +5572,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                           lit_str("non-tuple source with non-unit placeholder"));
                 return *pipe_placeholder_source;
             }
-            if (kSlot > static_cast<i64>(pipe_placeholder_source->tuple_len))
+            if (kSlot > i64{pipe_placeholder_source->tuple_len})
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       arg.span,
                                       lit_str("placeholder slot exceeds tuple arity"));
@@ -11254,8 +11255,11 @@ static AstStatement ws_remaining_body(const AstStatement& body, u32 first) {
     AstStatement tail{};
     tail.kind = AstStmtKind::Block;
     tail.span = body.span;
-    for (u32 i = first; i < body.block_stmts.len; ++i)
-        (void)tail.block_stmts.push(body.block_stmts[i]);
+    if (first < body.block_stmts.len) {
+        tail.block_stmts.len = body.block_stmts.len - first;
+        for (u32 i = 0; i < tail.block_stmts.len; ++i)
+            tail.block_stmts[i] = body.block_stmts[first + i];
+    }
     return tail;
 }
 
@@ -14304,7 +14308,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (pipe_lhs == nullptr)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, arg.span, lit_str("placeholder outside pipe"));
-        if (arg.int_value <= 0 || arg.int_value > static_cast<i32>(kMaxTupleSlots))
+        if (arg.int_value <= 0 || arg.int_value > i32{kMaxTupleSlots})
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot out of range"));
@@ -15689,9 +15693,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!concretized) return core::make_unexpected(concretized.error());
         return out;
     };
-    const auto apply_return_type = [&](HirExpr& target,
-                                       const char* context) -> FrontendResult<void> {
-        (void)context;
+    const auto apply_return_type = [&](HirExpr& target) -> FrontendResult<void> {
         auto ret = concrete_return_expr();
         if (!ret) return core::make_unexpected(ret.error());
         if (!same_hir_type_shape(mod, target, ret.value())) {
@@ -15721,7 +15723,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     };
     auto placeholder_slot_expr =
         [&](const HirExpr& source, i32 slot, Span span) -> FrontendResult<HirExpr> {
-        if (slot <= 0 || slot > static_cast<i32>(kMaxTupleSlots))
+        if (slot <= 0 || slot > i32{kMaxTupleSlots})
             return fail_call(span, "placeholder slot out of range", nullptr);
         if (source.type != HirTypeKind::Tuple) {
             if (slot != 1)
@@ -15981,7 +15983,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                   fn.type_params.len,
                                                   expr.span);
             if (!then_expr) return core::make_unexpected(then_expr.error());
-            auto pipe_then_typed = apply_return_type(then_expr.value(), "pipe conditional");
+            auto pipe_then_typed = apply_return_type(then_expr.value());
             if (!pipe_then_typed) return core::make_unexpected(pipe_then_typed.error());
             if (pipe_lhs->may_error && then_expr->may_error &&
                 (pipe_lhs->error_struct_index != then_expr->error_struct_index ||
@@ -16126,7 +16128,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     if (!inlined) {
         return core::make_unexpected(inlined.error());
     }
-    auto return_typed = apply_return_type(inlined.value(), "direct");
+    auto return_typed = apply_return_type(inlined.value());
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
     // Same rule as the any/all gates: a fallible i64 has no error carrier
@@ -20460,7 +20462,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     wait.span = stmt.span;
     wait.event_kind = WaitEventKind::Any;
     wait.ms = timer_ms;
-    wait.arm_mask = static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer);
+    wait.arm_mask = u8{kWaitEventArmRecv | kWaitEventArmTimer};
     const u32 wait_index = route.waits.len;
     if (!route.waits.push(wait)) return frontend_error(FrontendError::TooManyItems, stmt.span);
 
@@ -26273,7 +26275,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             timer_count++;
             // A selector outside the process shard range would compile into a
             // timer that never fires on any shard.
-            if (item.timer.shard >= static_cast<i32>(kMaxShards))
+            if (item.timer.shard >= i32{kMaxShards})
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     item.timer.span,
