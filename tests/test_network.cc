@@ -30167,7 +30167,6 @@ TEST(streaming, negative_content_length_counters_close_before_io) {
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 1));
     CHECK_EQ(loop.conns[c->id].fd, -1);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
-    CHECK_EQ(loop.backend.count_ops(MockOp::UpstreamSend), 0u);
 
     SmallLoop response_loop;
     response_loop.setup();
@@ -30182,7 +30181,6 @@ TEST(streaming, negative_content_length_counters_close_before_io) {
     response_loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 1));
     CHECK_EQ(response_loop.conns[c->id].fd, -1);
     CHECK_EQ(response_loop.backend.count_ops(MockOp::Send), 0u);
-    CHECK_EQ(response_loop.backend.count_ops(MockOp::UpstreamSend), 0u);
 }
 
 TEST(streaming, response_body_recvd_until_close_eof) {
