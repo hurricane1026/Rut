@@ -4043,7 +4043,7 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
     const hpack::Header wide_complete_headers[] = {
         {{":status", 7}, {"200", 3}},
         {{"content-type", 12}, {"application/grpc", 16}},
-        {{"content-length", 14}, {"4294967298", 10}},
+        {{"content-length", 14}, {"4294967297", 10}},
     };
     const u8 one_byte[] = {'x'};
     run(wide_complete_headers,
@@ -4051,7 +4051,7 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
         false,
         one_byte,
         1,
-        true,
+        false,
         status_trailers,
         1,
         0,
