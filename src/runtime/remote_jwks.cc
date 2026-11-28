@@ -501,7 +501,7 @@ u16 read16(const u8* data) {
     }
     return false;
 }
-enum class DnsTransfer { Blocked, Partial, Complete, Error };
+enum class DnsTransfer : u8 { Blocked, Partial, Complete, Error };
 
 template <bool Write, typename Byte, size_t Capacity>
 [[nodiscard]] DnsTransfer dns_transfer(

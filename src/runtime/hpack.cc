@@ -92,7 +92,8 @@ struct HuffTrie {
         t.sym[i] = -1;
     }
     t.node_count = 1;  // node 0 = root
-    for (i16 s = 0; s < i32{kSymCount}; s++) {
+    for (u32 s = 0; s < kSymCount; s++) {
+        const i16 symbol = static_cast<i16>(s);
         const u32 kCode = kHuff[s].code;
         const u8 kBits = kHuff[s].bits;
         i16 node = 0;
@@ -106,7 +107,7 @@ struct HuffTrie {
             }
             node = t.child[node][kBit];
         }
-        t.sym[node] = s;
+        t.sym[node] = symbol;
     }
     return t;
 }

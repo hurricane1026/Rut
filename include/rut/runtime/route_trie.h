@@ -232,7 +232,7 @@ private:
     //
     // Lookup keeps the retained prefix when storage fills. Registration
     // treats the same condition as an error, indicated by kMaxPathSegments + 1.
-    enum class SegmentLimit { Reject, KeepPrefix };
+    enum class SegmentLimit : u8 { Reject, KeepPrefix };
     [[nodiscard]] static u32 tokenize_segments(Str path,
                                                FixedVec<Str, kMaxPathSegments>& out,
                                                SegmentLimit limit);

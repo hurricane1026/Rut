@@ -203,10 +203,9 @@ def main():
         source = "src/runtime/buffered_send_vector.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
-            ("source + range_int(offset).value()", "source + kStep"),
+            ("source + range_int{offset}.index()", "source + kStep"),
             ("++message.msg_iov;", "/* leave the previous span selected */"),
-            ("\n            n = (range_int(n) - range_int(kStep)).max(range_int<0, 1>{}).to<u32>();",
-             "\n            n = 0;"),
+            ("n = unsent;", "n = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
                            before, after)

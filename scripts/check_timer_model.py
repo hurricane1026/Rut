@@ -31,7 +31,7 @@ CASES = (
 def check_manifest() -> None:
     # Drift alarms only; concrete tests supply implementation evidence.
     anchors = {
-        "include/rut/runtime/timer_wheel.h": ("++cursor", "node->detach()"),
+        "include/rut/runtime/timer_wheel.h": ("operator++(Tick&", "node->detach()"),
         "include/rut/runtime/epoll_event_loop.h": ("schedule_yield_timer", "drain_yield_heap", "c.handler_gen != entry.handler_gen"),
         "include/rut/runtime/iouring_event_loop.h": ("schedule_yield_timer", "ev.result == static_cast<i32>(c.yield_timer_gen)"),
         "src/runtime/timer_wheel.cc": ("slots[slot_after(seconds)]", "c->timer_node.detach()"),
