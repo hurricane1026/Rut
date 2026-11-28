@@ -30173,6 +30173,7 @@ TEST(streaming, negative_content_length_counters_close_before_io) {
     response_loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
     c = response_loop.find_fd(43);
     REQUIRE(c != nullptr);
+    REQUIRE(response_loop.alloc_upstream_buf(*c));
     c->upstream_fd = 100;
     c->resp_body_mode = BodyMode::ContentLength;
     c->resp_body_remaining = -1;
