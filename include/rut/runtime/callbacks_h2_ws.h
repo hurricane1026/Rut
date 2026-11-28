@@ -313,9 +313,7 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
             if (c.resp_body_mode == BodyMode::ContentLength) {
                 if (n > c.resp_body_remaining) n = c.resp_body_remaining;
                 consumed = produced = n;
-                c.resp_body_remaining = (range_int(c.resp_body_remaining) - range_int(n))
-                                            .max(range_int<0, 1>{})
-                                            .to<u32>();
+                c.resp_body_remaining -= i64{n};
             } else if (c.resp_body_mode == BodyMode::Chunked) {
                 const auto kResult =
                     c.resp_chunk_parser.feed(c.recv_buf.data(), n, &consumed, &start, &produced);

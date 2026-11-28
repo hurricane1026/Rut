@@ -4915,12 +4915,16 @@ TEST(grpc_proxy, upstream_tls_rejections_iouring) {
 }
 
 TEST(grpc_proxy, content_length_preserves_output_on_invalid_input) {
-    u32 length = 0;
+    i64 length = 0;
     REQUIRE(grpc_parse_content_length(lit_str("0004294967295"), &length));
-    CHECK_EQ(length, UINT32_MAX);
-    CHECK_FALSE(grpc_parse_content_length(lit_str("4294967296"), &length));
+    CHECK_EQ(length, i64{UINT32_MAX});
+    REQUIRE(grpc_parse_content_length(lit_str("4294967296"), &length));
+    CHECK_EQ(length, i64{UINT32_MAX} + 1);
+    REQUIRE(grpc_parse_content_length(lit_str("9223372036854775807"), &length));
+    CHECK_EQ(length, INT64_MAX);
+    CHECK_FALSE(grpc_parse_content_length(lit_str("9223372036854775808"), &length));
     CHECK_FALSE(grpc_parse_content_length(lit_str("12x"), &length));
-    CHECK_EQ(length, UINT32_MAX);
+    CHECK_EQ(length, INT64_MAX);
 }
 
 TEST(grpc_proxy, observed_status_metadata) {

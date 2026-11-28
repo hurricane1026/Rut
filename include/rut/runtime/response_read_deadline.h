@@ -210,7 +210,7 @@ classify_complete_content_length_response(const ParsedResponse& response) {
         classification.last >= classification.total)
         return {};
     u64 range_length = 0;
-    u64 expected_length = u64{response.content_length};
+    u64 expected_length = static_cast<u64>(response.content_length);
     if (sub_overflow(classification.last, classification.first, &range_length) ||
         sub_overflow(expected_length, u64{1}, &expected_length) || range_length != expected_length)
         return {};

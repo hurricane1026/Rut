@@ -500,16 +500,18 @@ inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, true, now_us);
 }
-[[nodiscard]] inline bool grpc_parse_content_length(Str value, u32* out) {
+[[nodiscard]] inline bool grpc_parse_content_length(Str value, i64* out) {
     if (value.len == 0) return false;
-    u32 parsed = 0;
+    i64 parsed = 0;
     const char* cursor = value.ptr;
     const char* const kEnd = cursor + range_int{value.len}.index();
     while (cursor != kEnd) {
         GrpcDecimalDigit digit;
         if (!grpc_decimal_digit(*cursor++, &digit)) return false;
-        const auto kNext = range_int{parsed}.scaled_by<10>() + digit;
-        if (!kNext.to(&parsed)) return false;
+        const i64 kDigit = digit.value();
+        if (parsed > (INT64_MAX - kDigit) / 10) return false;
+        // The guard above proves this multiply/add remains representable.
+        parsed = parsed * 10 + kDigit;
     }
     *out = parsed;
     return true;
@@ -642,7 +644,7 @@ void grpc_response_headers(
         }
         if (hs[i].name.eq({"content-type", 12})) content_type = grpc_content_type(hs[i].value);
         if (hs[i].name.eq({"content-length", 14})) {
-            u32 length = 0;
+            i64 length = 0;
             if (x->has_response_length || !grpc_parse_content_length(hs[i].value, &length))
                 invalid_content_length = true;
             else {

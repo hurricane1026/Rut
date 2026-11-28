@@ -1183,17 +1183,19 @@ TEST(ContentLength, Overflow) {
 TEST(ContentLength, MaxU32PlusOne) {
     HttpParser parser;
     ParsedRequest req;
-    // 4294967296 = UINT32_MAX + 1 — must overflow
+    // 4294967296 = UINT32_MAX + 1 — valid in the logical length domain.
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 4294967296\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, i64{UINT32_MAX} + 1);
 }
 
 TEST(ContentLength, MaxU32PlusFive) {
     HttpParser parser;
     ParsedRequest req;
-    // 4294967300 — overflows u32
+    // 4294967300 — valid in the logical length domain.
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 4294967300\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, i64{UINT32_MAX} + 5);
 }
 
 TEST(ContentLength, ElevenDigits) {

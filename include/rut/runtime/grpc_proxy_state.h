@@ -38,7 +38,7 @@ struct GrpcExchange {
     u32 ws_offers_len;
     u64 deadline_us;
     u64 request_bytes;
-    u32 expected_request_bytes;
+    i64 expected_request_bytes;
     bool has_request_length;
     bool request_end;
     bool request_headers_sent;
@@ -53,7 +53,7 @@ struct GrpcExchange {
     u32 upload_len;
     u32 download_len;
     u64 response_bytes;
-    u32 expected_response_bytes;
+    i64 expected_response_bytes;
     u32 request_headers_len;
     u32 request_trailers_len;
     u32 response_headers_len;
