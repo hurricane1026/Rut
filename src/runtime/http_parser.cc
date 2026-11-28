@@ -76,7 +76,7 @@ static inline bool str_ci_eq(const u8* a, const char* b, u32 len) {
 
 // Parse a decimal unsigned integer from `p[0..len)`.
 // Returns the parsed value, or error on empty input, non-digit, or overflow.
-static inline core::Expected<i64, Error> parse_uint(const u8* p, u32 len) {
+[[nodiscard]] static inline core::Expected<i64, Error> parse_uint(const u8* p, u32 len) {
     if (UNLIKELY(len == 0))
         return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
     i64 val = 0;

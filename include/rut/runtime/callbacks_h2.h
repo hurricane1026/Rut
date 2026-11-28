@@ -726,13 +726,13 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn);
 inline void h2_clear_async(Http2Conn& h2);
 
 template <typename Loop>
-bool h2_park_local_outcome(H2Dispatch<Loop>& d,
-                           u32 stream_id,
-                           const JitDispatchOutcome& o,
-                           const RouteConfig* cfg,
-                           bool is_head,
-                           i64 content_length,
-                           bool replace_owned_async = false) {
+[[nodiscard]] bool h2_park_local_outcome(H2Dispatch<Loop>& d,
+                                         u32 stream_id,
+                                         const JitDispatchOutcome& o,
+                                         const RouteConfig* cfg,
+                                         bool is_head,
+                                         i64 content_length,
+                                         bool replace_owned_async = false) {
     Http2Conn& h2 = *d.conn->h2;
     if (h2.pending_stream != 0 || (h2.async_stream != 0 && !replace_owned_async)) return false;
 

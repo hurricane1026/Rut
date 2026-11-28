@@ -13792,8 +13792,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     return ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
 }
 
-inline u32 strict_response_dec(char* out, i64 value);
-inline u32 strict_response_date(char* out, u64 now_us);
+[[nodiscard]] inline u32 strict_response_dec(char* out, i64 value);
+[[nodiscard]] inline u32 strict_response_date(char* out, u64 now_us);
 
 namespace detail {
 
@@ -14857,7 +14857,7 @@ inline bool strict_response_forbidden(Str name) {
     return false;
 }
 
-inline u32 strict_response_dec(char* out, i64 value) {
+[[nodiscard]] inline u32 strict_response_dec(char* out, i64 value) {
     if (value < 0) return 0;
     char tmp[19];
     u32 n = 0;
@@ -14869,7 +14869,7 @@ inline u32 strict_response_dec(char* out, i64 value) {
     return n;
 }
 
-inline u32 strict_response_date(char* out, u64 now_us) {
+[[nodiscard]] inline u32 strict_response_date(char* out, u64 now_us) {
     // HTTP dates have second precision. Each shard runs on one thread, so
     // reuse that thread's formatted second without sharing mutable state.
     struct DateCache {
