@@ -428,7 +428,8 @@ void dyn_clear(DynamicTable& d) {
     if (!(range_int(d.byte_used) - payload).to(&next_used) ||
         !(range_int(d.table_size) - cost).to(&next_size))
         return false;
-    for (u32 i = 1; i < d.nent; i++) {
+    u32 destination = 0;
+    for (u32 i = 1; i < d.nent; ++i) {
         auto entry = d.ents[i];
         if (!(range_int(entry.off) - payload).to(&entry.off)) {
             // The metadata was inconsistent. Drop the partial compaction and
@@ -436,7 +437,7 @@ void dyn_clear(DynamicTable& d) {
             dyn_clear(d);
             return false;
         }
-        d.ents[i - 1] = entry;
+        d.ents[destination++] = entry;
     }
     __builtin_memmove(d.buf, d.buf + payload.index(), next_used);
     d.byte_used = next_used;
@@ -482,7 +483,8 @@ void dyn_clear(DynamicTable& d) {
 
 [[nodiscard]] bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
     if (d.nent > DynamicTable::kMaxEntries || i >= d.nent) return false;
-    const DynamicTable::Entry& e = d.ents[d.nent - i - 1];
+    const auto end = d.ents + range_int{d.nent}.index();
+    const DynamicTable::Entry& e = *(end - range_int{i}.index() - 1);
     const auto offset = range_int{e.off};
     name->ptr = reinterpret_cast<const char*>(d.buf + offset.index());
     name->len = e.nlen;
@@ -490,6 +492,10 @@ void dyn_clear(DynamicTable& d) {
     value->len = e.vlen;
     return true;
 }
+
+// The table index starts at the newest dynamic entry, following all static entries.
+constexpr auto kFirstDynamicIndex =
+    range_int<kStaticCount, i64{kStaticCount} + 1>{} + range_int<1, 2>{};
 
 // Resolve a 1-based HPACK index to (name,value). idx 1..61 = static.
 [[nodiscard]] bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
@@ -502,7 +508,8 @@ void dyn_clear(DynamicTable& d) {
         *value = {e.value, e.vlen};
         return true;
     }
-    return dyn_get(d, idx - kStaticCount - 1, name, value);
+    u32 offset;
+    return (range_int{idx} - kFirstDynamicIndex).to(&offset) && dyn_get(d, offset, name, value);
 }
 
 [[nodiscard]] bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
@@ -529,17 +536,13 @@ void dyn_clear(DynamicTable& d) {
     return 0;
 }
 
-// The table index starts at the newest dynamic entry, following all static entries.
-constexpr auto kFirstDynamicIndex =
-    range_int<kStaticCount, i64{kStaticCount} + 1>{} + range_int<1, 2>{};
 constexpr auto kMaxDynamicEntries =
     range_int<DynamicTable::kMaxEntries, i64{DynamicTable::kMaxEntries} + 1>{};
 
 [[nodiscard]] u32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
-    const auto entries = range_int(d.nent).min(kMaxDynamicEntries);
-    const u32 end = (kFirstDynamicIndex + entries).to<u32>();
-    for (u32 index = kFirstDynamicIndex.to<u32>(); index < end; ++index) {
-        const auto& entry = d.ents[end - index - 1];
+    u32 remaining = range_int{d.nent}.min(kMaxDynamicEntries).to<u32>();
+    for (u32 index = kFirstDynamicIndex.to<u32>(); remaining > 0; ++index) {
+        const auto& entry = d.ents[--remaining];
         const auto offset = range_int{entry.off};
         const Str entry_name{reinterpret_cast<const char*>(d.buf + offset.index()), entry.nlen};
         const Str entry_value{
@@ -551,10 +554,9 @@ constexpr auto kMaxDynamicEntries =
 }
 
 [[nodiscard]] u32 dyn_find_name(const DynamicTable& d, Str name) {
-    const auto entries = range_int(d.nent).min(kMaxDynamicEntries);
-    const u32 end = (kFirstDynamicIndex + entries).to<u32>();
-    for (u32 index = kFirstDynamicIndex.to<u32>(); index < end; ++index) {
-        const auto& entry = d.ents[end - index - 1];
+    u32 remaining = range_int{d.nent}.min(kMaxDynamicEntries).to<u32>();
+    for (u32 index = kFirstDynamicIndex.to<u32>(); remaining > 0; ++index) {
+        const auto& entry = d.ents[--remaining];
         const Str entry_name{reinterpret_cast<const char*>(d.buf + range_int{entry.off}.index()),
                              entry.nlen};
         if (entry_name.eq(name)) return index;

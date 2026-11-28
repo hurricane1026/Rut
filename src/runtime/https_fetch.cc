@@ -94,10 +94,12 @@ void BoundedJsonResponse::reset_dns() {
 }
 
 bool strong_etag_valid(Str value) {
-    if (!value.ptr || value.len < 2 || value.len > kMaxStrongEtagLength || value.ptr[0] != '"' ||
-        value.ptr[value.len - 1] != '"')
+    range_int<2, i64{kMaxStrongEtagLength} + 1> length;
+    if (!value.ptr || !decltype(length)::try_from_u64(value.len, &length) || value.ptr[0] != '"')
         return false;
-    for (u32 i = 1; i < value.len - 1; ++i) {
+    const auto last = length - range_int<1, 2>{};
+    if (value.ptr[last.index()] != '"') return false;
+    for (u32 i = 1; i < last.to<u32>(); ++i) {
         const auto kByte = byte_value(value.ptr[i]);
         if (kByte != 0x21 && (kByte < 0x23 || kByte > 0x7e)) return false;
     }
@@ -155,9 +157,11 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                 if (++type_count != 1) return Result::Error;
                 u32 end = 0;
                 while (end < header.value.len && header.value.ptr[end] != ';') ++end;
-                while (end &&
-                       (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
+                while (end) {
+                    const char last = *(header.value.ptr + range_int{end}.index() - 1);
+                    if (last != ' ' && last != '\t') break;
                     --end;
+                }
                 const Str kType{header.value.ptr, end};
                 if (dns_ && !equal_ci(header.value, lit_str("application/dns-message")))
                     return Result::Error;

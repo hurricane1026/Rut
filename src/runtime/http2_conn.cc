@@ -312,7 +312,8 @@ namespace {
         tmp[n++] = last_decimal_digit(v);
         v /= 10;
     }
-    for (u32 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    u32 remaining = n;
+    for (u32 i = 0; remaining > 0; ++i) buf[i] = tmp[--remaining];
     return n;
 }
 }  // namespace
@@ -513,7 +514,7 @@ namespace {
     while (end < path.len && p[end] != '?' && p[end] != '#') end++;
     u32 start = 0;
     if (start < end && p[start] == '/') ++start;
-    while (end > start && p[end - 1] == '/') --end;
+    while (end > start && *(p + range_int{end}.index() - 1) == '/') --end;
     return path.slice(start, end);
 }
 

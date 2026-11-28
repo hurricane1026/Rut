@@ -558,7 +558,7 @@ bool NetClientWorker::read(Slot& s) {
         wanted = 0;
         for (u32 i = 0; i < count && i < requested.to<u32>(); ++i)
             if (s.buffer[i] == '\n') {
-                wanted = i + 1;
+                if (!(range_int{i} + range_int<1, 2>{}).to(&wanted)) return failed(s);
                 break;
             }
         if (!wanted && count >= requested.to<u32>()) return failed(s);

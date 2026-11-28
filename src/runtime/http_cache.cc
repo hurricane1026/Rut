@@ -39,7 +39,7 @@ constexpr i64 kMaxBufferedResponse =
         --text.len;
     }
     while (text.len) {
-        const char last = text.ptr[text.len - 1];
+        const char last = *(text.ptr + range_int{text.len}.index() - 1);
         if (last != ' ' && last != '\t') break;
         --text.len;
     }
@@ -47,7 +47,8 @@ constexpr i64 kMaxBufferedResponse =
 }
 [[nodiscard]] bool decimal(Str text, u32* value) {
     text = trim(text);
-    if (text.len >= 2 && text.ptr[0] == '"' && text.ptr[text.len - 1] == '"') {
+    if (text.len >= 2 && text.ptr[0] == '"' &&
+        *(text.ptr + range_int{text.len}.index() - 1) == '"') {
         ++text.ptr;
         --text.len;
         --text.len;
@@ -93,7 +94,8 @@ struct Controls {
         const Str name = trim({item.ptr, separator});
         if (!valid_name(name)) return false;
         const bool valued = separator < item.len;
-        const Str value = valued ? trim(item.slice(separator + 1, item.len)) : Str{};
+        if (valued) ++separator;
+        const Str value = valued ? trim(item.slice(separator, item.len)) : Str{};
         if (eq(name, "no-store", 8) || eq(name, "no-cache", 8) ||
             (response && eq(name, "private", 7)))
             out.blocked = true;
@@ -352,8 +354,10 @@ struct ResponseInfo {
         value /= 10;
     } while (value);
     if (!add("Age: ", 5)) return false;
-    for (u32 i = count; i > 0; --i)
-        if (!add(digits + range_int{i - 1}.index(), 1)) return false;
+    while (count > 0) {
+        --count;
+        if (!add(digits + range_int{count}.index(), 1)) return false;
+    }
     const Str connection = keep_alive ? lit_str("\r\nConnection: keep-alive\r\n\r\n")
                                       : lit_str("\r\nConnection: close\r\n\r\n");
     return add(connection.ptr, connection.len) &&

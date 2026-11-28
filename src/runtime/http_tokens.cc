@@ -45,7 +45,8 @@ bool valid_origin(Str origin) {
     if (origin.ptr[start] == '[') {
         while (end < origin.len && origin.ptr[end] != ']') ++end;
         if (end == origin.len) return false;
-        const Str literal = origin.slice(start + 1, end);
+        ++start;
+        const Str literal = origin.slice(start, end);
         if (literal.empty() || literal.len >= INET6_ADDRSTRLEN) return false;
         for (u32 i = 0; i < literal.len; ++i) {
             const char kC = literal.ptr[i];
@@ -63,8 +64,10 @@ bool valid_origin(Str origin) {
         while (end < origin.len && origin.ptr[end] != ':') {
             const char kC = origin.ptr[end];
             if (kC == '.') {
-                if (end == label_start || origin.ptr[end - 1] == '-') return false;
-                label_start = end + 1;
+                if (end == label_start || *(origin.ptr + range_int{end}.index() - 1) == '-')
+                    return false;
+                label_start = end;
+                ++label_start;
             } else {
                 const bool kAlnum = (kC >= 'a' && kC <= 'z') || (kC >= 'A' && kC <= 'Z') ||
                                     (kC >= '0' && kC <= '9');
@@ -73,7 +76,7 @@ bool valid_origin(Str origin) {
             ++end;
         }
         if (end == start || end == label_start) return false;
-        if (origin.ptr[end - 1] == '-') return false;
+        if (*(origin.ptr + range_int{end}.index() - 1) == '-') return false;
     }
     if (end == origin.len) return true;
     if (origin.ptr[end] != ':') return false;
@@ -123,7 +126,11 @@ bool http_origin_list_allows(Str allowed, Str origin, bool credentials) {
         const u32 kStart = offset;
         while (offset < allowed.len && allowed.ptr[offset] != ',') ++offset;
         u32 end = offset;
-        while (end > kStart && (allowed.ptr[end - 1] == ' ' || allowed.ptr[end - 1] == '\t')) --end;
+        while (end > kStart) {
+            const char last = *(allowed.ptr + range_int{end}.index() - 1);
+            if (last != ' ' && last != '\t') break;
+            --end;
+        }
         const Str kItem = allowed.slice(kStart, end);
         if (++count > 32 || !valid_origin(kItem)) return false;
         found |= kItem.eq(origin);
