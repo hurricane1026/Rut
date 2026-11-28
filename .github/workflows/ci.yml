@@ -275,8 +275,8 @@ jobs:
         env:
           OVERFLOW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           # Inventory legacy casts and declarations from before their enforcement began.
-          CAST_MIGRATION_BASE: 1f1b2f44c2c7980a10055deaea6c83503f076035
-          NODISCARD_MIGRATION_BASE: 5faf7a776016b3d6071f0a2f747ac97077cff2ca
+          CAST_MIGRATION_BASE: b608a80ee2b1de306db58c47e7191bb4614d05fc
+          NODISCARD_MIGRATION_BASE: ac442440ad52e09b4146d01b05a5bd6c71995ec6
         run: |
           clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 -fPIC -shared scripts/clang/check_u64_to_i64.cc \
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_u64_to_i64.so
