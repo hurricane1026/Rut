@@ -578,9 +578,15 @@ inline const UpstreamTarget* current_probe_target(Loop* loop, const Connection& 
 
 template <typename Loop>
 inline void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now_us) {
-    if (const auto* target = current_probe_target(loop, conn))
+    if (const auto* target = current_probe_target(loop, conn)) {
         record_active_probe_result(
             conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us, target->hc_thresholds);
+        if constexpr (requires { loop->health_probe_issued[0][0]; }) {
+            if (target->hc_interval_ms == 0 &&
+                !probe_backend_latched_down(conn.upstream_idx, conn.upstream_backend_idx))
+                loop->health_probe_issued[conn.upstream_idx][conn.upstream_backend_idx] = false;
+        }
+    }
 }
 
 template <typename Loop>
@@ -610,7 +616,10 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
                                    target.hc_expected_status,
                                    target.hc_thresholds,
                                    target.hc_timeout_ms,
-                                   target.hc_healthy_statuses) ||
+                                   target.hc_healthy_statuses,
+                                   target.hc_unhealthy_interval_ms,
+                                   target.passive_health.enabled,
+                                   target.hc_require_initial_success) ||
         (target.http2 && target.hc_type != ActiveHealthType::Tcp))
         return false;
 
@@ -803,8 +812,7 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
                               (target->hc_healthy_statuses.empty()
                                    ? resp.status_code == target->hc_expected_status
                                    : target->hc_healthy_statuses.contains(resp.status_code));
-        record_active_probe_result(
-            conn.upstream_idx, conn.upstream_backend_idx, kHealthy, kNowUs, target->hc_thresholds);
+        record_probe_if_current(loop, conn, kHealthy, kNowUs);
     }
     free_probe_conn(loop, conn);
 }

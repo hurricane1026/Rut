@@ -86,8 +86,12 @@ inline bool valid_active_health_check(ActiveHealthType type,
                                       u16 status,
                                       ActiveHealthThresholds thresholds,
                                       u32 timeout_ms,
-                                      ActiveHealthStatuses statuses = {}) {
-    if (!interval_ms || !thresholds.valid() || !valid_active_health_timeout(timeout_ms))
+                                      ActiveHealthStatuses statuses = {},
+                                      u32 unhealthy_interval_ms = 0,
+                                      bool passive_enabled = false,
+                                      bool require_initial_success = false) {
+    if ((!interval_ms && (!unhealthy_interval_ms || !passive_enabled || require_initial_success)) ||
+        !thresholds.valid() || !valid_active_health_timeout(timeout_ms))
         return false;
     if (!statuses.valid()) return false;
     if (type == ActiveHealthType::Tcp) return path_len == 0 && status == 0 && statuses.empty();

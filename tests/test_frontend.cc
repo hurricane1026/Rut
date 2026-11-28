@@ -50733,6 +50733,50 @@ TEST(frontend, upstream_unhealthy_interval_validation) {
     CHECK_EQ(ast->items[0].upstream.hc_unhealthy_interval_ms, 2000u);
 }
 
+TEST(frontend, upstream_recovery_only_validation) {
+    const char* passive =
+        "passive_health: { tcp_failures: 1, timeouts: 1, http_failures: 1, successes: 1, "
+        "healthy_statuses: [200], unhealthy_statuses: [500] }";
+    for (const char* extra :
+         {"unhealthy_interval: 1s", "unhealthy_interval: 1s require_initial_success: true", ""}) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { %s health_check: { path: \"/h\" interval: 0s %s } }",
+                 passive,
+                 extra);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        if (extra[0] == 'u' && strstr(extra, "require_initial_success") == nullptr) {
+            REQUIRE(ast);
+            CHECK_EQ(ast->items[0].upstream.hc_interval_ms, 0u);
+        } else {
+            CHECK_FALSE(ast);
+        }
+    }
+    auto tokens = lex(
+        lit("upstream api { health_check: { path: \"/h\" interval: 0s unhealthy_interval: 1s } }"));
+    REQUIRE(tokens);
+    CHECK_FALSE(parse_file_heap(tokens.value()));
+    for (const char* duration : {"00s", "4294967296s"}) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { %s health_check: { path: \"/h\" interval: %s unhealthy_interval: "
+                 "1s } }",
+                 passive,
+                 duration);
+        auto duration_tokens = lex(lit(source));
+        REQUIRE(duration_tokens);
+        auto ast = parse_file_heap(duration_tokens.value());
+        if (duration[0] == '0')
+            CHECK(ast);
+        else
+            CHECK_FALSE(ast);
+    }
+}
+
 TEST(frontend, upstream_failover_membership_and_validation) {
     const char* valid =
         R"rut(upstream api { failover: ["127.0.0.1:09002"], backends: ["127.0.0.1:9001", "127.0.0.1:9002"] }

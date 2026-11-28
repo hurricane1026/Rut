@@ -804,9 +804,13 @@ public:
                             (static_cast<i64>(first) + static_cast<i64>(scanned_backend)) %
                             static_cast<i64>(count));
                         if (up.weights[b] == 0 || probe_in_flight(static_cast<u16>(u), b)) continue;
+                        const bool kDown = probe_backend_latched_down(static_cast<u16>(u), b);
+                        if (up.hc_interval_ms == 0 && !kDown) {
+                            health_probe_issued[u][b] = false;
+                            continue;
+                        }
                         const u32 cadence =
-                            up.hc_unhealthy_interval_ms != 0 && health_probe_issued[u][b] &&
-                                    probe_backend_latched_down(static_cast<u16>(u), b)
+                            up.hc_unhealthy_interval_ms != 0 && health_probe_issued[u][b] && kDown
                                 ? up.hc_unhealthy_interval_ms
                                 : up.hc_interval_ms;
                         if (now < deadline_after(health_probe_last_issue_ns[u][b], cadence))

@@ -904,6 +904,20 @@ TEST(health_probe, public_health_api_rejects_ambiguous_or_invalid_modes) {
         0, nullptr, 0, 1000, 0, {}, ActiveHealthType::Tcp, 0, {"tenant", 6}));
     CHECK_FALSE(cfg.set_upstream_health_check(
         0, "/", 1, 1000, 200, {}, ActiveHealthType::Http, 0, {"bad,host", 8}));
+    CHECK_FALSE(cfg.set_upstream_health_check(
+        0, "/", 1, 0, 200, {}, ActiveHealthType::Http, 0, {}, {}, false, 1000));
+    auto& passive = cfg.upstreams[0].passive_health;
+    passive.enabled = true;
+    passive.tcp_failures = 1;
+    passive.successes = 1;
+    passive.healthy_statuses[0] = 1;
+    CHECK_FALSE(cfg.set_upstream_health_check(
+        0, "/", 1, 0, 200, {}, ActiveHealthType::Http, 0, {}, {}, true, 1000));
+    CHECK_FALSE(cfg.set_upstream_health_check(
+        0, "/", 1, 0, 200, {}, ActiveHealthType::Http, 0, {}, {}, false, 0));
+    CHECK(cfg.set_upstream_health_check(
+        0, "/", 1, 0, 200, {}, ActiveHealthType::Http, 0, {}, {}, false, 1000));
+    cfg.upstreams[0].hc_enabled = false;
     CHECK_FALSE(cfg.upstreams[0].hc_enabled);
     cfg.upstreams[0].http2 = true;
     CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200));
@@ -1153,6 +1167,61 @@ void unhealthy_cadence(rut::test::TestCase* _tc) {
     CHECK_FALSE(rig.loop->health_probe_issued[0][1]);
     CHECK(rig.loop->health_probe_last_issue_ns[0][1] >= issued);
 }
+template <typename Loop>
+void recovery_only_cadence(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    auto& up = rig.owner.config->upstreams[0];
+    up.hc_interval_ms = 0;
+    up.hc_unhealthy_interval_ms = 1000;
+    up.hc_thresholds.successes = 2;
+    rig.loop->sweep_health_probes();
+    CHECK_FALSE(probe_in_flight(0, 0));
+    BackendHealth* health = backend_health(0, 0);
+    REQUIRE(health);
+    up.passive_health.enabled = true;
+    up.passive_health.tcp_failures = 1;
+    up.passive_health.successes = 1;
+    up.passive_health.healthy_statuses[0] = 1;
+    record_passive_health_result(0, 0, up.passive_health, PassiveHealthOutcome::TcpFailure);
+    REQUIRE(health->passive_down);
+    rig.loop->sweep_health_probes();
+    REQUIRE(probe_in_flight(0, 0));
+    Socket failed;
+    char request[512]{};
+    REQUIRE(rig.receive_request(failed, request, sizeof(request)));
+    REQUIRE(rig.respond(failed, "HTTP/1.1 500 Failed\r\nContent-Length: 0\r\n\r\n"));
+    CHECK(health->passive_down);
+    rig.loop->health_probe_last_issue_ns[0][0] = monotonic_ns() - 2'000'000'000ull;
+    rig.loop->sweep_health_probes();
+    REQUIRE(probe_in_flight(0, 0));
+    Socket first;
+    request[0] = '\0';
+    REQUIRE(rig.receive_request(first, request, sizeof(request)));
+    REQUIRE(rig.respond(first, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    CHECK(health->passive_down);
+    rig.loop->sweep_health_probes();
+    CHECK_FALSE(probe_in_flight(0, 0));
+    rig.loop->health_probe_last_issue_ns[0][0] = monotonic_ns() - 2'000'000'000ull;
+    rig.loop->sweep_health_probes();
+    REQUIRE(probe_in_flight(0, 0));
+    Socket second;
+    request[0] = '\0';
+    REQUIRE(rig.receive_request(second, request, sizeof(request)));
+    REQUIRE(rig.respond(second, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    CHECK_FALSE(health->passive_down);
+    record_passive_health_result(0, 0, up.passive_health, PassiveHealthOutcome::TcpFailure);
+    REQUIRE(health->passive_down);
+    rig.loop->sweep_health_probes();
+    CHECK(probe_in_flight(0, 0));
+}
+TEST(health_probe, epoll_recovery_only_cadence) {
+    recovery_only_cadence<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_recovery_only_cadence) {
+    recovery_only_cadence<IoUringEventLoop>(_tc);
+}
+
 static bool write_idle_loopback_pair(i32 pair[2]) {
     Socket listener;
     listener.fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);

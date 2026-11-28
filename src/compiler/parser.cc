@@ -4344,7 +4344,13 @@ struct Parser {
                             auto dur = expect(TokenType::DurLit);
                             if (!dur) return core::make_unexpected(dur.error());
                             const u32 kIntervalMs = dur_lit_to_ms(dur.value()->text);
-                            if (kIntervalMs == 0)
+                            bool zero_literal = true;
+                            for (u32 i = 0; i < dur.value()->text.len; ++i) {
+                                const char kCh = dur.value()->text.ptr[i];
+                                if (kCh < '0' || kCh > '9') break;
+                                if (kCh != '0') zero_literal = false;
+                            }
+                            if (kIntervalMs == 0 && !zero_literal)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       span_from(*dur.value()),
                                                       dur.value()->text);
@@ -4481,6 +4487,11 @@ struct Parser {
             if (item.upstream.failover_count != 0 && item.upstream.backend_count == 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.upstream.addr_span, {"failover", 8});
+            if (item.upstream.hc_enabled && item.upstream.hc_interval_ms == 0 &&
+                (item.upstream.hc_unhealthy_interval_ms == 0 ||
+                 !item.upstream.passive_health.enabled || item.upstream.hc_require_initial_success))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, {"interval", 8});
             if (item.upstream.passive_health.enabled && item.upstream.http2)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       item.upstream.addr_span,

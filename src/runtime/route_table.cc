@@ -651,11 +651,21 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
                                             u8 concurrency) {
     if (uid >= upstream_count) return false;
     UpstreamTarget& up = upstreams[uid];
-    if (concurrency > UpstreamTarget::kMaxBackends ||
+    if ((interval_ms == 0 && (!up.passive_health.valid() || up.http2)) ||
+        concurrency > UpstreamTarget::kMaxBackends ||
         (host.len && (!active_health_host_valid(host) || type == ActiveHealthType::Tcp)) ||
         path_len >= sizeof(up.hc_path) ||
-        !valid_active_health_check(
-            type, path, path_len, interval_ms, status, thresholds, timeout_ms, statuses) ||
+        !valid_active_health_check(type,
+                                   path,
+                                   path_len,
+                                   interval_ms,
+                                   status,
+                                   thresholds,
+                                   timeout_ms,
+                                   statuses,
+                                   unhealthy_interval_ms,
+                                   up.passive_health.enabled,
+                                   require_initial_success) ||
         (up.http2 && type != ActiveHealthType::Tcp))
         return false;
     for (u32 i = 0; i < host.len; ++i) up.hc_host[i] = host.ptr[i];
