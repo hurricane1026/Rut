@@ -1005,7 +1005,7 @@ business HTTP verdicts. No retry-on-status, live DNS refresh, manual health API 
 cross-shard health synchronization is not implied. Native ABI 28 requires rebuilding
 older artifacts. See [passive-health implementation](passive-health.md).
 An active `health_check` may also set `unhealthy_interval: 2s` using the same
-positive duration bounds as `interval`. The first check uses `interval`.
+positive duration bounds as `interval`. For a positive `interval`, the first check uses `interval`.
 After each issued probe, the next due time uses `unhealthy_interval` while
 that backend has a latched active or passive unhealthy verdict, and `interval`
 otherwise. The legacy timed connect cooldown alone does not select the unhealthy
@@ -1014,6 +1014,13 @@ per-backend schedule. Probe issuance remains subject to the per-sweep budget and
 one-second sweep resolution. Omission preserves the existing upstream-wide
 schedule. Reload resets schedules and verdicts. Native artifact version 34
 requires rebuilding older artifacts.
+
+With an enabled compatible `passive_health` policy, `interval: 0s` and a positive
+`unhealthy_interval` enable recovery-only probes. Healthy backends receive no
+synthetic probes. A latched unhealthy backend is probed on the next sweep and
+then at the unhealthy cadence until the active success threshold restores it.
+`require_initial_success: true` is invalid in this mode. Existing probe limits,
+in-flight guards, one-second sweep resolution, and reload resets still apply.
 
 A native CLI gateway may declare one DNS upstream with
 `upstream api { host: "api.example", port: 8080 }`. Before creating listeners

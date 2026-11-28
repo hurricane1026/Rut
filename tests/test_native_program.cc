@@ -3874,6 +3874,27 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK(target.hc_require_initial_success);
 }
 
+TEST(native_program, recovery_only_health_survives_activation) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream api {
+    backends: ["127.0.0.1:9001"]
+    health_check: { path: "/healthz", interval: 0s, unhealthy_interval: 2s }
+    passive_health: { tcp_failures: 1, timeouts: 1, http_failures: 1, successes: 1, healthy_statuses: [200], unhealthy_statuses: [500] }
+}
+route GET "/" { return forward(api, load_balance: .roundRobin) }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    activate_native_program(*owner.p);
+    const auto& target = owner.p->config.upstreams[0];
+    CHECK(target.hc_enabled);
+    CHECK(target.passive_health.enabled);
+    CHECK_EQ(target.hc_interval_ms, 0u);
+    CHECK_EQ(target.hc_unhealthy_interval_ms, 2000u);
+}
+
 TEST(native_program, consistent_hash_seed_and_key_survive_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(

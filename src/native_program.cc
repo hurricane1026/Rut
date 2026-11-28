@@ -617,7 +617,10 @@ bool load_native_program(const char* source,
                                                              target.hc_expected_status,
                                                              target.hc_thresholds,
                                                              target.hc_timeout_ms,
-                                                             target.hc_healthy_statuses) ||
+                                                             target.hc_healthy_statuses,
+                                                             target.hc_unhealthy_interval_ms,
+                                                             target.passive_health.enabled,
+                                                             target.hc_require_initial_success) ||
                                   (target.http2 && target.hc_type != ActiveHealthType::Tcp)))
             return fail("invalid native upstream health check");
     }
