@@ -561,7 +561,7 @@ public:
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
         if (!upstream || (c.request_config && c.request_config->upstreams[upstream_id].tls.enabled))
             return false;
-        u32 completed = 0;
+        i32 completed = 0;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx, &completed);
         if (fd < 0) return false;
         // Establish a new owner before publishing the borrowed fd in the map.

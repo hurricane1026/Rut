@@ -17619,14 +17619,15 @@ TEST(upstream_pool, max_requests_preserves_counts_and_accounting) {
     i32 sv[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
     REQUIRE(pool.put_idle(sv[0], 1, 0, 0, 0));
-    u32 completed = 0;
+    i32 completed = 0;
     CHECK_EQ(pool.take_idle(1, 0, &completed), sv[0]);
     CHECK_EQ(completed, 1u);
     CHECK(!pool.put_idle(sv[0], 1, 0, 0, completed));
     CHECK_EQ(pool.idle_count, 0u);
     CHECK_EQ(pool.endpoint_counts[1][0], 0u);
     CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
-    CHECK(!pool.put_idle(sv[0], 1, 0, 0, 0xFFFFFFFFu));
+    CHECK(!pool.put_idle(sv[0], 1, 0, 0, -1));
+    CHECK(!pool.put_idle(sv[0], 1, 0, 0, 2147483647));
     close(sv[0]);
     close(sv[1]);
 }
@@ -43683,7 +43684,7 @@ TEST(iouring_upstream_recv, one_shot_selector_restored_after_deferred_idle_retur
     CHECK(conn->idle_return_config == nullptr);
     CHECK(loop->use_one_shot_upstream_recv(*conn));
     CHECK_EQ(conn->idle_return_completed_requests, 0u);
-    u32 completed = 0;
+    i32 completed = 0;
     CHECK_EQ(pool.take_idle(3, 0, &completed), parked[0]);
     CHECK_EQ(completed, 2u);
     close(parked[0]);

@@ -477,14 +477,14 @@ struct ConnectionBase {
     bool req_path_overridden;
     // Counts follow the active upstream socket and a deferred io_uring return.
     // They occupy padding here to keep the per-connection footprint bounded.
-    u32 upstream_completed_requests;
+    i32 upstream_completed_requests;
     Str req_path_override;
     // forward(set_body:) applies eagerly while the handler runs. A failed
     // override poisons forwarding instead of silently sending the original
     // credential-bearing body.
     bool req_body_overridden;
     bool req_body_override_failed;
-    u32 idle_return_completed_requests;
+    i32 idle_return_completed_requests;
     Str req_body_override;
     // Foundation-only target-transform effect. The recorded flag distinguishes
     // no effect from a forged zero/sentinel ID; every recorded effect is rejected

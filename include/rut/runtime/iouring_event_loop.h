@@ -2970,7 +2970,7 @@ public:
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
         if (!upstream || (c.request_config && c.request_config->upstreams[upstream_id].tls.enabled))
             return false;
-        u32 completed = 0;
+        i32 completed = 0;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx, &completed);
         if (fd < 0) return false;
         c.reset_passive_health_observations();
@@ -7610,7 +7610,7 @@ public:
                                           !c.upstream_recv_armed;
         if (c.idle_return_fd >= 0 && kUpstreamRecvDrained) {
             const i32 fd = c.idle_return_fd;
-            const u32 completed = c.idle_return_completed_requests;
+            const i32 completed = c.idle_return_completed_requests;
             c.idle_return_completed_requests = 0;
             c.idle_return_fd = -1;
             // The pin is consumed with the fd: left set, the connection would look
@@ -7957,7 +7957,7 @@ public:
         // reusable fd must not be leaked/closed.
         if (c.idle_return_fd >= 0) {
             const i32 fd = c.idle_return_fd;
-            const u32 completed = c.idle_return_completed_requests;
+            const i32 completed = c.idle_return_completed_requests;
             c.idle_return_completed_requests = 0;
             c.idle_return_fd = -1;
             const RouteConfig* const kParkedConfig = c.idle_return_config;

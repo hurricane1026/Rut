@@ -400,7 +400,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    bool upstream_idle_timeout_set,
                                    u32 upstream_idle_timeout,
                                    u32 upstream_pool_capacity,
-                                   u32 upstream_max_requests,
+                                   i32 upstream_max_requests,
                                    TlsServerContext* tls_server,
                                    bool allow_io_uring_fallback,
                                    const char* access_log_path,
@@ -1003,7 +1003,7 @@ int main(int argc, char** argv) {
     u32 upstream_idle_timeout = 0;
     u32 upstream_pool_capacity = UpstreamPool::kMaxConns;
     bool upstream_pool_capacity_specified = false;
-    u32 upstream_max_requests = 0;
+    i32 upstream_max_requests = 0;
     bool upstream_max_requests_specified = false;
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
@@ -1062,10 +1062,10 @@ int main(int argc, char** argv) {
                     "2147483647\n");
                 return 1;
             }
-            u32 value = 0;
+            i32 value = 0;
             for (const char* p = argv[++i]; *p; ++p) {
-                u32 digit = static_cast<u32>(*p - '0');
-                if (value > (2147483647u - digit) / 10u) {
+                const i32 digit = static_cast<i32>(*p - '0');
+                if (value > (2147483647 - digit) / 10) {
                     write_str("--upstream-keepalive-max-requests must be at most 2147483647\n");
                     return 1;
                 }

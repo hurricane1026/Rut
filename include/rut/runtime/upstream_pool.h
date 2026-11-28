@@ -31,7 +31,7 @@ struct UpstreamConn {
     u8 backend_idx = 0;      // which backend endpoint of the upstream this connects to
     bool idle = false;       // true = parked, available for reuse
     bool allocated = false;  // true = slot in use
-    u32 completed_requests = 0;
+    i32 completed_requests = 0;
     // Seconds in legacy mode; microseconds when an explicit positive timeout is set.
     u64 parked_time = 0;
 };
@@ -47,7 +47,7 @@ struct UpstreamPool {
     bool idle_timeout_configured = false;
     u32 idle_timeout_sec = 0;
     u32 endpoint_capacity = kMaxConns;
-    u32 max_requests = 0;
+    i32 max_requests = 0;
     u16 endpoint_counts[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     // Parked slots form an intrusive list, most recently parked first, so
     // take_idle() and sweep() visit only idle entries instead of every slot.
@@ -75,7 +75,7 @@ struct UpstreamPool {
     // or pool is full, reuse is disabled, or the key is invalid. The caller must
     // close a rejected fd. The fd must have no I/O armed on it. `completed`
     // counts earlier clean requests on this socket, before the current response.
-    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u32 completed = 0) {
+    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, i32 completed = 0) {
         return put_idle_at(fd,
                            upstream_id,
                            backend_idx,
@@ -85,12 +85,13 @@ struct UpstreamPool {
     }
 
     bool put_idle_at(
-        i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u64 now_us, u32 completed = 0) {
+        i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u64 now_us, i32 completed = 0) {
         u32 idx;
         // The active socket has completed one more clean request at this boundary.
-        u32 completed_after = 0;
-        if (max_requests && (__builtin_add_overflow(completed, 1u, &completed_after) ||
-                             completed_after >= max_requests))
+        i32 completed_after = 0;
+        if (completed < 0 || max_requests < 0 ||
+            (max_requests && (__builtin_add_overflow(completed, 1, &completed_after) ||
+                              completed_after >= max_requests)))
             return false;
         if (fd < 0 || upstream_id >= RouteConfig::kMaxUpstreams ||
             backend_idx >= UpstreamTarget::kMaxBackends ||
@@ -149,7 +150,7 @@ struct UpstreamPool {
     // catches the common idle-timeout race before any request bytes are sent; the
     // residual probe-vs-send race is handled by the caller's idempotent resend.
     // Candidates are tried most recently parked first (the likeliest to be live).
-    i32 take_idle(u16 upstream_id, u8 backend_idx, u32* completed = nullptr) {
+    i32 take_idle(u16 upstream_id, u8 backend_idx, i32* completed = nullptr) {
         if (idle_count.load(std::memory_order_acquire) == 0) return -1;
         return take_idle_at(upstream_id,
                             backend_idx,
@@ -157,7 +158,7 @@ struct UpstreamPool {
                             completed);
     }
 
-    i32 take_idle_at(u16 upstream_id, u8 backend_idx, u64 now_us, u32* completed = nullptr) {
+    i32 take_idle_at(u16 upstream_id, u8 backend_idx, u64 now_us, i32* completed = nullptr) {
         for (u32 i = idle_head; i != kNoSlot;) {
             const u32 next = idle_next[i];
             const UpstreamConn& c = conns[i];
@@ -166,7 +167,7 @@ struct UpstreamPool {
                 continue;
             }
             const i32 fd = c.fd;
-            const u32 prior_completed = c.completed_requests;
+            const i32 prior_completed = c.completed_requests;
             u64 idle_us = 0;
             const bool expired = idle_timeout_configured && idle_timeout_sec != 0 &&
                                  !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
