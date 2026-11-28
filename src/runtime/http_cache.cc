@@ -11,13 +11,17 @@
 namespace rut {
 namespace {
 
-constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
+constexpr i64 kMaxBufferedResponse =
+    (range_int<HttpCachePolicy::kMaxResponse, HttpCachePolicy::kMaxResponse + 1>{} -
+     range_int<256, 257>{})
+        .to<i64>();
 
 [[nodiscard]] u8 ascii_lower(char byte) {
     const u8 c = byte_value(byte);
-    if (c < 'A' || c > 'Z') return c;
-    const auto lower = range_int(c) + range_int<'a' - 'A', 'a' - 'A' + 1>{};
-    return lower.min(range_int<UINT8_MAX, i64{UINT8_MAX} + 1>{}).to<u8>();
+    using Uppercase = range_int<'A', 'Z' + 1>;
+    Uppercase upper;
+    if (!Uppercase::try_from_u64(c, &upper)) return c;
+    return (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>();
 }
 
 [[nodiscard]] bool valid_name(Str name) {
@@ -35,7 +39,7 @@ constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
         --text.len;
     }
     while (text.len) {
-        const char last = text.ptr[i64{text.len} - 1];
+        const char last = text.ptr[text.len - 1];
         if (last != ' ' && last != '\t') break;
         --text.len;
     }
@@ -43,14 +47,14 @@ constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
 }
 [[nodiscard]] bool decimal(Str text, u32* value) {
     text = trim(text);
-    if (text.len >= 2 && text.ptr[0] == '"' && text.ptr[i64{text.len} - 1] == '"') {
+    if (text.len >= 2 && text.ptr[0] == '"' && text.ptr[text.len - 1] == '"') {
         ++text.ptr;
         --text.len;
         --text.len;
     }
     if (!text.len) return false;
     u32 result = 0;
-    constexpr range_int<UINT32_MAX, i64{UINT32_MAX} + 1> kMax{};
+    constexpr range_int<UINT32_MAX, UINT32_MAX + 1LL> kMax{};
     for (u32 i = 0; i < text.len; ++i) {
         const char byte = text.ptr[i];
         if (byte < '0' || byte > '9') return false;
@@ -82,19 +86,14 @@ struct Controls {
             if (text.ptr[end] == '\\') return false;  // conservative on escaped extension values
         }
         if (quoted) return false;
-        const auto start = range_int(begin);
-        const auto count = (range_int(end) - start).max(range_int<0, 1>{});
-        const Str item = trim({text.ptr + start.index(), count.to<u32>()});
+        const Str item = trim(text.slice(begin, end));
         if (!item.len) return false;
         u32 separator = 0;
         while (separator < item.len && item.ptr[separator] != '=') ++separator;
         const Str name = trim({item.ptr, separator});
         if (!valid_name(name)) return false;
         const bool valued = separator < item.len;
-        const auto value_start = range_int(separator) + range_int<1, 2>{};
-        const auto value_length = (range_int(item.len) - value_start).max(range_int<0, 1>{});
-        const Str value =
-            valued ? trim({item.ptr + value_start.index(), value_length.to<u32>()}) : Str{};
+        const Str value = valued ? trim(item.slice(separator + 1, item.len)) : Str{};
         if (eq(name, "no-store", 8) || eq(name, "no-cache", 8) ||
             (response && eq(name, "private", 7)))
             out.blocked = true;
@@ -139,9 +138,7 @@ bool hop_header(Str name) {
     while (begin < text.len) {
         u32 end = begin;
         while (end < text.len && text.ptr[end] != ',') ++end;
-        const auto start = range_int(begin);
-        const auto count = (range_int(end) - start).max(range_int<0, 1>{});
-        const Str name = trim({text.ptr + start.index(), count.to<u32>()});
+        const Str name = trim(text.slice(begin, end));
         if (!valid_name(name)) return false;
         if (vary) {
             if (eq(name, "*", 1) || ignored_key_header(name) || hop_header(name)) return false;
@@ -160,23 +157,22 @@ u64 hash_bytes(u64 hash, const void* bytes, u32 size) {
 }
 [[nodiscard]] bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
     const auto start = range_int(key.len);
-    const auto end = start + range_int(size);
-    if (end.value() > HttpCachePolicy::kMaxKey) return false;
+    using KeyLength = range_int<0, HttpCachePolicy::kMaxKey + 1>;
+    KeyLength end;
+    if (!KeyLength::try_from_i64((start + range_int{size}).value(), &end)) return false;
     __builtin_memcpy(key.bytes + start.index(), bytes, size);
-    constexpr i64 kMaxKey = HttpCachePolicy::kMaxKey;
-    key.len = end.min(range_int<kMaxKey, kMaxKey + 1>{}).to<u32>();
+    key.len = end.to<u32>();
     return true;
 }
-using HttpDateSeconds = range_int<0, i64{1} << 40>;
+using HttpDateSeconds = range_int<0, 1LL << 40>;
 
 [[nodiscard]] bool date_pair(const char* text, range_int<0, 100>* out) {
-    const char tens = text[0];
-    const char ones = text[1];
-    if (tens < '0' || tens > '9' || ones < '0' || ones > '9') return false;
-    static_assert('0' == 0x30 && '9' == 0x39);
-    constexpr range_int<9, 10> kMaxDigit{};
-    const auto first = bounded_remainder<16>(byte_value(tens)).min(kMaxDigit);
-    const auto second = bounded_remainder<16>(byte_value(ones)).min(kMaxDigit);
+    using Digit = range_int<0, 10>;
+    constexpr auto kZeroByte = range_int<'0', '0' + 1>{};
+    Digit first, second;
+    if (!Digit::try_from_i64((range_int{byte_value(text[0])} - kZeroByte).value(), &first) ||
+        !Digit::try_from_i64((range_int{byte_value(text[1])} - kZeroByte).value(), &second))
+        return false;
     *out = first.scaled_by<10>() + second;
     return true;
 }
@@ -201,12 +197,14 @@ using HttpDateSeconds = range_int<0, i64{1} << 40>;
     constexpr char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
     constexpr i32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     constexpr u16 kDaysBeforeMonth[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
-    i32 month = 0;
-    while (month < 12 && !Str{p + 8, 3}.eq({kMonths + i64{month} * 3, 3})) ++month;
+    u32 month = 0;
+    while (month < 12 && !Str{p + 8, 3}.eq({kMonths + range_int{month}.scaled_by<3>().index(), 3}))
+        ++month;
     if (month == 12) return false;
     const bool kLeap =
         year.value() % 4 == 0 && (year.value() % 100 != 0 || year.value() % 400 == 0);
-    if (day.value() == 0 || day.value() > i64{kDays[month]} + (month == 1 && kLeap)) return false;
+    if (day.value() == 0 || day.value() > range_int{kDays[month]}.to<i64>() + (month == 1 && kLeap))
+        return false;
 
     constexpr range_int<0, 1> kZero{};
     constexpr range_int<1, 2> kOne{};
@@ -324,12 +322,13 @@ struct ResponseInfo {
         response.content_length !=
             (range_int(entry.response_len) - range_int(parser.header_end)).value())
         return false;
+    const auto limit = range_int{capacity};
     auto add = [&](const void* p, u32 n) {
         const auto start = range_int(*written);
-        const auto end = start + range_int(n);
-        if (end.value() > capacity) return false;
+        auto end = range_int{u32{0}};
+        if (!limit.try_count((start + range_int{n}).value(), &end)) return false;
         __builtin_memcpy(out + start.index(), p, n);
-        *written = end.min(range_int(capacity)).to<u32>();
+        *written = end.to<u32>();
         return true;
     };
     if (!add(http10 ? "HTTP/1.0 200 OK\r\n" : "HTTP/1.1 200 OK\r\n", 17)) return false;
@@ -354,7 +353,7 @@ struct ResponseInfo {
     } while (value);
     if (!add("Age: ", 5)) return false;
     for (u32 i = count; i > 0; --i)
-        if (!add(digits + i64{i} - 1, 1)) return false;
+        if (!add(digits + range_int{i - 1}.index(), 1)) return false;
     const Str connection = keep_alive ? lit_str("\r\nConnection: keep-alive\r\n\r\n")
                                       : lit_str("\r\nConnection: close\r\n\r\n");
     return add(connection.ptr, connection.len) &&
@@ -463,9 +462,10 @@ bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& t
         !info.parsed.has_content_length || info.parsed.content_length_count != 1)
         return false;
     const auto response_size = range_int(parser.header_end) + range_int(info.parsed.content_length);
-    if (response_size.value() > kMaxBufferedResponse) return false;
-    total =
-        response_size.min(range_int<kMaxBufferedResponse, kMaxBufferedResponse + 1>{}).to<u32>();
+    using BufferedLength = range_int<0, kMaxBufferedResponse + 1>;
+    BufferedLength checked;
+    if (!BufferedLength::try_from_i64(response_size.value(), &checked)) return false;
+    total = checked.to<u32>();
     return true;
 }
 bool HttpCachePolicy::prepare_record(
