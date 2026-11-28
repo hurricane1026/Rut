@@ -1,10 +1,13 @@
 #include "rut/runtime/http2_frame.h"
 
 #include "rut/common/range_int.h"
+#include <utility>
 
 namespace rut {
 
 namespace {
+
+constexpr auto kHeaderLength = range_int<kFrameHeaderSize, kFrameHeaderSize + 1>{};
 
 // Big-endian readers/writers. HTTP/2 integers are network byte order.
 [[nodiscard]] u32 read_u24(const u8* p) {
@@ -40,7 +43,7 @@ void write_u16(u8* p, u16 v) {
 [[nodiscard]] u8* emit_header(u8* out, u32 length, Http2FrameType type, u8 flags, u32 stream_id) {
     Http2FrameHeader h;
     h.length = length;
-    h.type = static_cast<u8>(type);
+    h.type = std::to_underlying(type);
     h.flags = flags;
     h.stream_id = stream_id;
     return out + range_int{write_frame_header(out, h)}.index();
@@ -85,7 +88,7 @@ const u8 kClientPreface[kClientPrefaceLen] = {0x50, 0x52, 0x49, 0x20, 0x2a, 0x20
     for (i64 i = 0; i < len; i += 6) {
         const u16 kId = read_u16(payload + i);
         const u32 kVal = read_u32(payload + i + 2);
-        switch (static_cast<Http2SettingId>(kId)) {
+        switch (Http2SettingId{kId}) {
             case Http2SettingId::HeaderTableSize:
                 s->header_table_size = kVal;
                 break;
@@ -124,10 +127,10 @@ const u8 kClientPreface[kClientPrefaceLen] = {0x50, 0x52, 0x49, 0x20, 0x2a, 0x20
 }
 
 [[nodiscard]] u32 write_settings_frame(u8* out, const Http2Settings& s) {
-    u8* p = out + i64{kFrameHeaderSize};
+    u8* p = out + kHeaderLength.index();
     u8 count = 0;
     auto append = [&](Http2SettingId id, u32 value) {
-        write_u16(p, static_cast<u16>(id));
+        write_u16(p, std::to_underlying(id));
         write_u32(p + 2, value);
         p += 6;
         ++count;
@@ -146,33 +149,34 @@ const u8 kClientPreface[kClientPrefaceLen] = {0x50, 0x52, 0x49, 0x20, 0x2a, 0x20
         append(Http2SettingId::MaxFrameSize, s.max_frame_size);
 
     const auto payload = range_int(count).scaled_by<6>();
-    Http2FrameHeader header{payload.to<u32>(), 0, static_cast<u8>(Http2FrameType::Settings), 0};
+    Http2FrameHeader header{payload.to<u32>(), 0, std::to_underlying(Http2FrameType::Settings), 0};
     if (write_frame_header(out, header) != kFrameHeaderSize) return 0;
-    return (range_int<kFrameHeaderSize, i64{kFrameHeaderSize} + 1>{} + payload).to<u32>();
+    return (kHeaderLength + payload).to<u32>();
 }
 
 [[nodiscard]] u32 write_settings_ack(u8* out) {
     return write_frame_header(
-        out, Http2FrameHeader{0, 0, static_cast<u8>(Http2FrameType::Settings), http2_flag::kAck});
+        out,
+        Http2FrameHeader{0, 0, std::to_underlying(Http2FrameType::Settings), http2_flag::kAck});
 }
 
 [[nodiscard]] u32 write_goaway(u8* out, u32 last_stream_id, Http2Error error) {
     u8* p = emit_header(out, 8, Http2FrameType::Goaway, 0, 0);
     write_u32(p, last_stream_id & 0x7fffffffu);
-    write_u32(p + 4, static_cast<u32>(error));
-    return u32{i64{kFrameHeaderSize} + 8};
+    write_u32(p + 4, std::to_underlying(error));
+    return (kHeaderLength + range_int<8, 9>{}).to<u32>();
 }
 
 [[nodiscard]] u32 write_window_update(u8* out, u32 stream_id, u32 increment) {
     u8* p = emit_header(out, 4, Http2FrameType::WindowUpdate, 0, stream_id);
     write_u32(p, increment & 0x7fffffffu);
-    return u32{i64{kFrameHeaderSize} + 4};
+    return (kHeaderLength + range_int<4, 5>{}).to<u32>();
 }
 
 [[nodiscard]] u32 write_rst_stream(u8* out, u32 stream_id, Http2Error error) {
     u8* p = emit_header(out, 4, Http2FrameType::RstStream, 0, stream_id);
-    write_u32(p, static_cast<u32>(error));
-    return u32{i64{kFrameHeaderSize} + 4};
+    write_u32(p, std::to_underlying(error));
+    return (kHeaderLength + range_int<4, 5>{}).to<u32>();
 }
 
 }  // namespace rut
