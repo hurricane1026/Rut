@@ -4677,8 +4677,15 @@ Parameters:
 - `every:` (required) — interval as Duration
 - `shard: N` (optional) — run on specific shard only; default is every shard
 
-Timer body can use I/O (`get http://`, `fire`, `submit`/`wait`). The compiler
-generates a state machine per timer, scheduled by the shard's event loop.
+Intervals use positive duration literals with millisecond resolution. Each shard
+bounds its event wait by its earliest timer deadline, independently of the
+connection timeout wheel. Install and reload arm each timer from activation.
+After a delayed firing, the next interval starts from that firing without
+replaying missed periods.
+
+Current callbacks run synchronously on their owning shard with scratch storage.
+Request access, forwarding, and suspending I/O remain unavailable in background
+timer callbacks.
 
 #### 3.4.24 Lifecycle Hooks
 

@@ -26271,17 +26271,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (timer_count >= HirModule::kMaxTimers)
                 return frontend_error(FrontendError::TooManyItems, item.timer.span);
             timer_count++;
-            // The firing path is the shard keepalive tick (1s granularity);
-            // pulling that tick forward would also advance the idle/probe
-            // timer wheel, so honest rejection beats silently drifting a
-            // sub-second interval to 1s. Lift when timers get a dedicated
-            // precise wakeup (TODO.md).
-            if (item.timer.interval_ms < 1000 || item.timer.interval_ms % 1000 != 0)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax,
-                    item.timer.span,
-                    lit_str("timer intervals have 1s granularity today; use a whole "
-                            "number of seconds (every: 1s or coarser)"));
             // A selector outside the process shard range would compile into a
             // timer that never fires on any shard.
             if (item.timer.shard >= static_cast<i32>(kMaxShards))

@@ -741,8 +741,7 @@ public:
         if (config_ptr && *config_ptr) (void)(*config_ptr)->activate_rs256(shard_id);
         if (config_ptr && *config_ptr) (void)(*config_ptr)->activate_es256(shard_id);
         rearm_accept();
-        // Arm timer deadlines from activation (config is installed before run()),
-        // so `every: D` measures from here rather than from the first 1s tick.
+        // Measure the first background interval from config activation.
         this->fire_due_timers();
         // Reset verdicts and arm probe deadlines from this configuration install.
         this->arm_health_on_config_change();
@@ -759,7 +758,8 @@ public:
                 kMaxEventsPerWait,
                 conns,
                 slots_initialized,
-                deferred_relay_read_count == 0 && !fetch_busy && !this->has_ready_jit_handlers());
+                deferred_relay_read_count == 0 && !fetch_busy && !this->has_ready_jit_handlers(),
+                this->background_timer_deadline_ns);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -773,7 +773,8 @@ public:
                     fetch_busy, kEventCount, this->has_ready_jit_handlers())) {
                 // Advance nonblocking TLS state regularly on an idle shard
                 // without spinning while the fetch socket has no gateway slot.
-                struct timespec pause = {0, 10'000'000};
+                const u32 delay_ms = this->background_timer_wait_ms(10);
+                struct timespec pause = {0, static_cast<long>(delay_ms) * 1'000'000};
                 while (clock_nanosleep(CLOCK_MONOTONIC, 0, &pause, &pause) == EINTR) {
                 }
             }
@@ -781,7 +782,7 @@ public:
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
             poll_command();
-            // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
+            // Run due timers and arm any newly activated config after reload.
             this->fire_due_timers();
             // Reset/arm active-health state on hot reload (#161 F4). No-op when
             // unchanged; advances health_armed_config so the later sweep doesn't
@@ -8624,7 +8625,6 @@ public:
                         }
                     });
                 }
-                this->fire_due_timers();
                 // Budget active probes against SQ capacity and client slot reserves.
                 this->sweep_health_probes();
                 // Evict idle pooled upstream sockets past the keepalive deadline

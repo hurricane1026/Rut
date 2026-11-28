@@ -45,7 +45,7 @@ let buckets = Cache<IP, i64>(capacity: 100000)     // lossy per-key state
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
-timer cleanup, every: 1m { ... }  // background tasks (1s+ intervals; body: no req/forward/wait)
+timer cleanup, every: 1m { ... }  // background tasks (1ms+ intervals; body: no req/forward/wait)
 timer push, every: 5s, shard: 0 { ... }   // shard-pinned singleton (default: every shard)
 init { ... }    shutdown { ... }  // lifecycle hooks
 route GET "/health" { return 200 } // zero or more top-level route declarations
@@ -1821,6 +1821,7 @@ throttle(downstream: 100kb per 1s, burst: 256kb)
 
 // Background / lifecycle
 timer checkHealth, every: 5s, shard: 0 { ... }   // shard: omitted = every shard
+timer sample, every: 250ms { ... }             // millisecond interval, driven by the shard loop
 init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```

@@ -6540,8 +6540,7 @@ struct Parser {
     }
 
     // Convert a DurLit token ("5s", "100ms", "1m", "1h") to milliseconds. 0 = bad
-    // unit / overflow. Unlike dur_lit_to_seconds this preserves sub-second values
-    // for forward compatibility (slice 1 fires on the 1s tick regardless).
+    // unit / numeric magnitude beyond u32. Conversion preserves sub-second values.
     static u32 dur_lit_to_ms(Str t) {
         u64 digits = 0;
         u32 i = 0;
@@ -6564,8 +6563,7 @@ struct Parser {
         return ms > 0xffffffffull ? 0xffffffffu : static_cast<u32>(ms);
     }
 
-    // `timer <name>, every: <duration> { <body> }` — a background periodic task.
-    // (slice 1: the optional `shard: N` selector is not yet parsed.)
+    // `timer <name>, every: <duration>[, shard: N] { <body> }`.
     FrontendResult<AstItem> parse_timer() {
         // `timer` is a contextual keyword (an Ident, not reserved). The top-level
         // dispatch only routes here when cur() is the `timer` identifier.
