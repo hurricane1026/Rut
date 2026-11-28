@@ -253,6 +253,7 @@ void unhealthy_statuses(rut::test::TestCase* _tc) {
     REQUIRE(respond("HTTP/1.1 301 Neutral\r\n\r\n"));
     CHECK_EQ(health->active_failures, 1u);
     CHECK_EQ(health->active_successes, 0u);
+    CHECK_FALSE(health->active_initial_success);
     REQUIRE(respond("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 503 Fail\r\n\r\n"));
     CHECK(health->active_down);
     REQUIRE(respond("HTTP/1.1 200 OK\r\n\r\n"));
@@ -262,6 +263,9 @@ void unhealthy_statuses(rut::test::TestCase* _tc) {
     CHECK(health->active_down);
     REQUIRE(respond("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\n\r\n"));
     CHECK_FALSE(health->active_down);
+    CHECK(health->active_initial_success);
+    REQUIRE(respond("HTTP/1.1 301 Neutral\r\n\r\n"));
+    CHECK(health->active_initial_success);
     // Deliver the interim response on its own, then wait for the receive to
     // be rearmed before delivering the final response.
     REQUIRE(start_health_probe(rig.loop, 0, 0));
