@@ -457,17 +457,21 @@ void capture_request_metadata(Connection& conn) {
                 kLen > parser.header_end
                     ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
                     : 0;
-            if (kBodyInBuf >= conn.req_body_remaining)
+            if (i64{kBodyInBuf} >= conn.req_body_remaining)
                 conn.req_body_remaining = 0;
             else
-                conn.req_body_remaining = static_cast<u32>(
-                    static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(kBodyInBuf));
+                conn.req_body_remaining -= i64{kBodyInBuf};
         }
         if (conn.req_body_mode == BodyMode::None) {
             conn.req_initial_send_len = parser.header_end;
         } else if (conn.req_body_mode == BodyMode::ContentLength) {
-            const u32 kBodyInInitial = static_cast<u32>(static_cast<i64>(conn.req_content_length) -
-                                                        static_cast<i64>(conn.req_body_remaining));
+            const u32 kBodyInBuf =
+                kLen > parser.header_end
+                    ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
+                    : 0;
+            const u32 kBodyInInitial = conn.req_content_length <= i64{kBodyInBuf}
+                                           ? static_cast<u32>(conn.req_content_length)
+                                           : kBodyInBuf;
             conn.req_initial_send_len = static_cast<u32>(static_cast<i64>(parser.header_end) +
                                                          static_cast<i64>(kBodyInInitial));
         }

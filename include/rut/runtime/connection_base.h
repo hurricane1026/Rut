@@ -1953,10 +1953,10 @@ struct ConnectionBase {
     // Access-log metadata captured from the request/peer.
     u8 req_method;
     // Raw HTTP/1 request bytes received downstream and assigned to this request boundary.
-    u32 downstream_req_size;
+    i64 downstream_req_size;
     // Internal request/upstream-policy length bookkeeping; not the preserved downstream access
     // size or actual partial-send telemetry.
-    u32 req_size;
+    i64 req_size;
     u32 peer_addr;
     u16 peer_port;
     char routing_host_bytes[254]{};

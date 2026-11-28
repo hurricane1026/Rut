@@ -1158,6 +1158,7 @@ TEST(ContentLength, AbsentHasNeutralFieldIdentity) {
     CHECK_FALSE(request_content_length_identity_is_valid(false, 0, 1));
     CHECK_FALSE(request_content_length_identity_is_valid(true, 0, 0));
     CHECK_FALSE(request_content_length_identity_is_valid(true, kMaxHeaders + 1, 0));
+    CHECK_FALSE(request_content_length_identity_is_valid(true, 1, -1));
     CHECK(request_content_length_identity_is_valid(true, 1, 0));
     CHECK(request_content_length_identity_is_valid(true, 2, 5));
 }

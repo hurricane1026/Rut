@@ -108,7 +108,8 @@ struct ParsedRequest {
 inline bool request_content_length_identity_is_valid(bool has_content_length,
                                                      u8 content_length_count,
                                                      i64 content_length) {
-    return has_content_length ? content_length_count != 0 && content_length_count <= kMaxHeaders
+    return has_content_length ? content_length >= 0 && content_length_count != 0 &&
+                                    content_length_count <= kMaxHeaders
                               : content_length_count == 0 && content_length == 0;
 }
 

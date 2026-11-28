@@ -2920,7 +2920,9 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
         entry.resp_size = resp_size;
-        entry.req_size = conn.downstream_req_size;
+        entry.req_size = conn.downstream_req_size > i64{UINT32_MAX}
+                              ? UINT32_MAX
+                              : static_cast<u32>(conn.downstream_req_size);
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
         // Every access-enabled production entry uses an explicit state. A snapshot must belong
@@ -3921,14 +3923,13 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
     conn.req_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
-    u32 downstream_size = conn.downstream_req_size;
-    u32 request_size = conn.req_size;
-    if (!try_add_to(&downstream_size, consume) || !try_add_to(&request_size, consume)) {
+    if (i64{consume} > INT64_MAX - conn.downstream_req_size ||
+        i64{consume} > INT64_MAX - conn.req_size) {
         loop->close_conn(conn);
         return;
     }
-    conn.downstream_req_size = downstream_size;
-    conn.req_size = request_size;
+    conn.downstream_req_size += i64{consume};
+    conn.req_size += i64{consume};
     conn.req_initial_send_len = static_cast<u32>(
         static_cast<i64>(conn.req_header_end) +
         (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
@@ -4017,14 +4018,13 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.req_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
-    u32 downstream_size = conn.downstream_req_size;
-    u32 request_size = conn.req_size;
-    if (!try_add_to(&downstream_size, consume) || !try_add_to(&request_size, consume)) {
+    if (i64{consume} > INT64_MAX - conn.downstream_req_size ||
+        i64{consume} > INT64_MAX - conn.req_size) {
         loop->close_conn(conn);
         return;
     }
-    conn.downstream_req_size = downstream_size;
-    conn.req_size = request_size;
+    conn.downstream_req_size += i64{consume};
+    conn.req_size += i64{consume};
     conn.req_initial_send_len = static_cast<u32>(
         static_cast<i64>(conn.req_header_end) +
         (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
