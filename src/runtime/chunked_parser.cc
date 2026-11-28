@@ -1,13 +1,26 @@
 #include "rut/runtime/chunked_parser.h"
 
-namespace rut {
+#include "rut/common/range_int.h"
 
-static i32 hex_val(u8 c) {
-    if (c >= '0' && c <= '9') return static_cast<i32>(c) - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (static_cast<i32>(c) - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (static_cast<i32>(c) - 'A');
-    return -1;
+namespace rut {
+namespace {
+
+using HexDigit = range_int<0, 16>;
+
+[[nodiscard]] bool hex_digit(u8 c, HexDigit* out) {
+    range_int<0, 10> digit;
+    if (decltype(digit)::try_from_i64((range_int{c} - range_int<'0', '0' + 1>{}).value(), &digit)) {
+        *out = digit;
+        return true;
+    }
+    range_int<0, 6> letter;
+    if (!decltype(letter)::try_from_i64((range_int{c | 0x20} - range_int<'a', 'a' + 1>{}).value(),
+                                        &letter))
+        return false;
+    *out = letter + range_int<10, 11>{};
+    return true;
 }
+}  // namespace
 
 ChunkStatus ChunkedParser::feed(
     const u8* input, u32 in_len, u32* consumed, u32* out_start, u32* out_len) {
@@ -18,13 +31,15 @@ ChunkStatus ChunkedParser::feed(
 
         switch (state) {
             case State::Size: {
-                i32 v = hex_val(c);
-                if (v >= 0) {
-                    if (chunk_remaining > 0x0FFFFFFFu) {
+                HexDigit digit;
+                if (hex_digit(c, &digit)) {
+                    using Prefix = range_int<0, 0x10000000>;
+                    Prefix prefix;
+                    if (!Prefix::try_from_u64(chunk_remaining, &prefix)) {
                         *consumed = pos;
                         return ChunkStatus::Error;
                     }
-                    chunk_remaining = (chunk_remaining << 4) | static_cast<u32>(v);
+                    chunk_remaining = (prefix.scaled_by<16>() + digit).to<u32>();
                     has_digits = true;
                     pos++;
                 } else if (c == '\r') {
@@ -72,13 +87,20 @@ ChunkStatus ChunkedParser::feed(
 
             case State::Data: {
                 // Bulk copy: consume min(remaining input, chunk_remaining).
-                u32 avail = static_cast<u32>(static_cast<i64>(in_len) - static_cast<i64>(pos));
-                u32 n = avail < chunk_remaining ? avail : chunk_remaining;
+                const auto cursor = range_int{pos};
+                const auto remaining = range_int{chunk_remaining};
+                const auto available = range_int{in_len - pos};
+                const auto taken = available.min(remaining);
+                u32 next;
+                u32 left;
+                if (!(cursor + taken).to(&next) || !(remaining - taken).to(&left)) {
+                    *consumed = pos;
+                    return ChunkStatus::Error;
+                }
                 *out_start = pos;
-                *out_len = n;
-                *consumed = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(n));
-                chunk_remaining =
-                    static_cast<u32>(static_cast<i64>(chunk_remaining) - static_cast<i64>(n));
+                *out_len = taken.to<u32>();
+                *consumed = next;
+                chunk_remaining = left;
                 if (chunk_remaining == 0) {
                     state = State::DataCR;
                 }
