@@ -2666,6 +2666,48 @@ struct FakeH2Loop {
 };
 }  // namespace
 
+TEST(h2_serving, prepared_forward_body_is_rejected_before_pending_clear) {
+    FakeH2Loop loop;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init();
+    conn.h2 = &h2;
+    h2.pending_stream = 1;
+    h2.pending_prepared_forward = true;
+    h2.pending_body_len = 1;
+    h2.pending_synth_len = 0;
+    h2.pending_has_content_length = false;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+    h2_finish_body(d, 1);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_FALSE(h2.pending_prepared_forward);
+    CHECK_EQ(h2.async_stream, 0u);
+    REQUIRE(d.resp_len != 0);
+    Http2FrameHeader frame;
+    REQUIRE(parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete);
+    CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+    hpack::DynamicTable table;
+    table.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(table,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool status_503 = false;
+    for (u32 i = 0; i < count; i++)
+        if (decoded[i].name.eq(Str{":status", 7}) && decoded[i].value.eq(Str{"503", 3}))
+            status_503 = true;
+    CHECK(status_503);
+}
+
 TEST(h2_serving, lazy_receive_promotion_happens_after_process_releases_input) {
     FakeH2Loop loop;
 
