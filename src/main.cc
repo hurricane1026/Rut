@@ -605,6 +605,12 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         source_live_ring_count = 0u;
         return success;
     };
+    const auto fail_source_live_startup = [&]() -> RunShardsOutcome {
+        if (!release_source_live_rings())
+            write_str("SourceLive access log startup cleanup was incomplete\n");
+        for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+        return {RunShardsOutcomeKind::Failure};
+    };
     if (source_live_fd != nullptr) {
         for (u32 i = 0; i < shard_count; i++) {
             auto ring = shards[i].init_live_access_log_ring();
@@ -614,9 +620,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 write_str(" (reason=");
                 write_u32(static_cast<u32>(ring.error()));
                 write_str(")\n");
-                (void)release_source_live_rings();
-                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-                return {RunShardsOutcomeKind::Failure};
+                return fail_source_live_startup();
             }
             source_live_ring_count++;
             if (source_live_host_profile) {
@@ -627,9 +631,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                     write_str(" (reason=");
                     write_u32(static_cast<u32>(host_ring.error()));
                     write_str(")\n");
-                    (void)release_source_live_rings();
-                    for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-                    return {RunShardsOutcomeKind::Failure};
+                    return fail_source_live_startup();
                 }
                 source_live_host_bindings[i] = shards[i].live_access_log_host_binding();
             } else {
@@ -657,9 +659,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                             source_live_ring_count);
         if (!started) {
             report_source_live_start_error(started.error());
-            (void)release_source_live_rings();
-            for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
-            return {RunShardsOutcomeKind::Failure};
+            return fail_source_live_startup();
         }
         source_live_started = true;
         for (u32 i = 0; i < shard_count; i++) {
@@ -676,9 +676,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 source_live_started = false;
                 if (finished.status == SourceLiveAccessLogFinishStatus::Fatal)
                     report_source_live_fatal(finished.fatal);
-                (void)release_source_live_rings();
-                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-                return {RunShardsOutcomeKind::Failure};
+                return fail_source_live_startup();
             }
         }
     }
@@ -714,7 +712,10 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 write_u64(static_cast<u64>(log_flusher.syslog_send_failures()));
                 write_str("\n");
             }
-            close(access_log_fd);
+            if (close(access_log_fd) != 0) {
+                write_str("Failed to close access log output\n");
+                success = false;
+            }
             access_log_fd = -1;
         }
         if (!finish_source_live()) success = false;
@@ -851,7 +852,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             // Stop all already-spawned shards
             for (u32 j = 0; j < i; j++) shards[j].stop();
             for (u32 j = 0; j < i; j++) shards[j].join();
-            (void)finish_access_logs_and_shutdown();
+            if (!finish_access_logs_and_shutdown()) write_str("Startup cleanup was incomplete\n");
             return {RunShardsOutcomeKind::Failure};
         }
     }
@@ -863,7 +864,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             write_error("Failed to start access log flusher", flusher_rc.error());
             for (u32 i = 0; i < shard_count; i++) shards[i].stop();
             for (u32 i = 0; i < shard_count; i++) shards[i].join();
-            (void)finish_access_logs_and_shutdown();
+            if (!finish_access_logs_and_shutdown()) write_str("Startup cleanup was incomplete\n");
             return {RunShardsOutcomeKind::Failure};
         }
     }
@@ -949,14 +950,14 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         if (sig == SIGINT || sig == SIGTERM) break;
         if (sig < 0 && errno != EAGAIN && errno != EINTR) {
             write_str("Failed to wait for shutdown signal\n");
-            (void)stop_all_shards();
+            if (!stop_all_shards()) write_str("Shutdown cleanup was incomplete\n");
             return {RunShardsOutcomeKind::Failure};
         }
     }
 
     if (source_live_fatal.kind != SourceLiveAccessLogFatalKind::None || backend_error != 0) {
         report_runtime_failures();
-        (void)stop_all_shards();
+        if (!stop_all_shards()) write_str("Shutdown cleanup was incomplete\n");
         return {RunShardsOutcomeKind::Failure};
     }
 

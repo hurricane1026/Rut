@@ -1,4 +1,5 @@
 #include "rut/common/types.h"
+#include "rut/platform/write.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/password.h"
 
@@ -34,7 +35,8 @@ struct Signals {
     ~Signals() {
         while (installed) {
             --installed;
-            (void)sigaction(kSignals[installed], &previous[installed], nullptr);
+            if (sigaction(kSignals[installed], &previous[installed], nullptr) != 0)
+                platform::write_diagnostic("Failed to restore password command signal handler\n");
         }
     }
 };
@@ -64,7 +66,7 @@ bool message(const char* text) {
 }
 int failure(const char* text) {
     // Diagnostic output must still be attempted after cancellation.
-    (void)write(STDERR_FILENO, text, strlen(text));
+    platform::write_diagnostic(text);
     return 2;
 }
 
@@ -89,7 +91,9 @@ struct Terminal {
         if (rc == 0) active = false;
         return rc == 0;
     }
-    ~Terminal() { (void)restore(); }
+    ~Terminal() {
+        if (!restore()) platform::write_diagnostic("Failed to restore terminal settings\n");
+    }
 };
 
 bool terminal_control_key(const Terminal& terminal, int index, unsigned char byte) {
@@ -157,7 +161,7 @@ bool read_password(Secret& password) {
         }
     }
     if (!terminal.restore()) ok = false;
-    if (kInteractive) (void)message("\n");
+    if (kInteractive && !message("\n")) ok = false;
     return ok && !interrupted && password.length > 0 && password.length <= kPasswordMaxBytes;
 }
 
@@ -235,7 +239,8 @@ struct Directory {
                   sync_fd(kFile);
         if (close(kFile) != 0) ok = false;
         if (!ok || interrupted) {
-            (void)unlinkat(fd, temporary, 0);
+            if (unlinkat(fd, temporary, 0) != 0)
+                return "record preparation failed and temporary record cleanup failed\n";
             return "record preparation failed or was interrupted\n";
         }
         // Same-directory hard-link publication is atomic and never replaces an

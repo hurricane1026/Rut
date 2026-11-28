@@ -1,6 +1,7 @@
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
+#include "rut/platform/write.h"
 #include "rut/runtime/auth.h"
 #include "rut/runtime/consumer_registry.h"
 #include "rut/runtime/crypto_c.h"
@@ -75,17 +76,11 @@ struct OutputPair {
 };
 
 int failure(const char* message) {
-    (void)write(STDERR_FILENO, message, strlen(message));
+    platform::write_diagnostic(message);
     return 2;
 }
-bool write_all(int fd, Str value) {
-    while (value.len) {
-        const auto kN = write(fd, value.ptr, value.len);
-        if (kN < 0 && errno == EINTR) continue;
-        if (kN <= 0) return false;
-        value = value.slice(static_cast<u32>(kN), value.len);
-    }
-    return true;
+[[nodiscard]] bool write_all(int fd, Str value) {
+    return platform::write_all(fd, value.ptr, value.len);
 }
 bool sync_fd(int fd) {
     int rc;
@@ -114,6 +109,18 @@ bool read_private(const char* path, Buffer& result) {
     return ok && result.len > 0 && result.len <= json::kMaxBytes;
 }
 
+[[nodiscard]] int create_temporary_snapshot(int directory, char (&name)[64]) {
+    for (u32 attempt = 0; attempt < 32; ++attempt) {
+        const long pid = getpid();
+        const int length = snprintf(name, sizeof(name), ".rut-consumers-%ld-%u", pid, attempt);
+        if (length < 0 || length >= int{sizeof(name)}) return -1;
+        const int fd =
+            openat(directory, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd >= 0 || errno != EEXIST) return fd;
+    }
+    return -1;
+}
+
 // Immutable output avoids overwriting either a published snapshot or another
 // administrator's result. A private parent prevents hostile rename races.
 const char* publish(const char* path, Str value) {
@@ -137,17 +144,7 @@ const char* publish(const char* path, Str value) {
         return "output requires an owned directory without group/other write permission\n";
     }
     char temporary[64];
-    int file = -1;
-    for (u32 attempt = 0; attempt < 32; ++attempt) {
-        (void)snprintf(temporary,
-                       sizeof(temporary),
-                       ".rut-consumers-%ld-%u",
-                       static_cast<long>(getpid()),
-                       attempt);
-        file = openat(
-            kDirectory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (file >= 0 || errno != EEXIST) break;
-    }
+    const int file = create_temporary_snapshot(kDirectory, temporary);
     if (file < 0) {
         close(kDirectory);
         return "cannot create private temporary snapshot\n";
@@ -213,17 +210,7 @@ bool output_pair(const char* snapshot_path, const char* key_path, OutputPair& pa
 enum class PublishAtResult : u8 { NotPublished, Published, Uncertain };
 PublishAtResult publish_at(int directory, const char* name, Str value) {
     char temporary[64];
-    int file = -1;
-    for (u32 attempt = 0; attempt < 32; ++attempt) {
-        (void)snprintf(temporary,
-                       sizeof(temporary),
-                       ".rut-consumers-%ld-%u",
-                       static_cast<long>(getpid()),
-                       attempt);
-        file = openat(
-            directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (file >= 0 || errno != EEXIST) break;
-    }
+    const int file = create_temporary_snapshot(directory, temporary);
     if (file < 0) return PublishAtResult::NotPublished;
     bool ready = fchmod(file, 0600) == 0 && write_all(file, value) && sync_fd(file);
     if (close(file) != 0) ready = false;
@@ -1018,8 +1005,10 @@ int evaluate_deployment_policy(json::Document& registry, const char* policy_path
         report.text(lit_str("Consumer deployment policy rejected rule: "));
         report.text(rule.name);
         report.put('\n');
-        if (report.ok) (void)write_all(STDERR_FILENO, {message, report.len});
-        return 2;
+        if (!report.ok || report.len >= sizeof(message))
+            return failure("Consumer deployment policy rejected a rule\n");
+        message[report.len] = '\0';
+        return failure(message);
     }
     return 0;
 }

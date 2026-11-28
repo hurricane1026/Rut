@@ -765,7 +765,7 @@ bool load_native_program(const char* source,
                 if (query.fd >= 0) {
                     const short events = (query.phase == 3 || query.phase == 6) ? POLLIN : POLLOUT;
                     pollfd ready{query.fd, events, 0};
-                    (void)poll(&ready, 1, 10);
+                    if (poll(&ready, 1, 10) < 0 && errno != EINTR) break;
                 }
             }
             query.close();
