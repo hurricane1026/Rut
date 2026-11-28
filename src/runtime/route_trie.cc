@@ -28,7 +28,7 @@ namespace rut {
     // tokenize pure means the insert-vs-match round-trip always
     // agrees on what a segment is: bytes between slashes.
     constexpr auto kSegmentLimitExceeded =
-        range_int<kMaxPathSegments + 1, kMaxPathSegments + 2>{}.to<u32>();
+        range_int<i64{kMaxPathSegments} + 1, i64{kMaxPathSegments} + 2>{}.to<u32>();
     u32 start = 0;
     u32 end = 0;
     for (;;) {
@@ -120,7 +120,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
         nodes.len = saved_nodes_len;
     };
 
-    FixedVec<u16, kMaxPathSegments + 1u> visited;
+    FixedVec<u16, i64{kMaxPathSegments} + 1> visited;
     [[maybe_unused]] const bool kRootRecorded = visited.push(0);
     u16 cur = 0;  // root
     for (u32 i = 0; i < n; i++) {
@@ -291,7 +291,7 @@ u16 RouteTrie::match_key(Str path,
         u32 static_segments;
         u64 static_mask;
     };
-    FixedVec<Frame, kMaxPathSegments + 1u> stack;
+    FixedVec<Frame, i64{kMaxPathSegments} + 1> stack;
     [[maybe_unused]] const bool kPushed = stack.push(Frame{});
 
     struct Candidate {

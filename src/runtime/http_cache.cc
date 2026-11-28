@@ -12,7 +12,7 @@ namespace rut {
 namespace {
 
 constexpr i64 kMaxBufferedResponse =
-    (range_int<HttpCachePolicy::kMaxResponse, HttpCachePolicy::kMaxResponse + 1>{} -
+    (range_int<HttpCachePolicy::kMaxResponse, i64{HttpCachePolicy::kMaxResponse} + 1>{} -
      range_int<256, 257>{})
         .to<i64>();
 
@@ -157,7 +157,7 @@ u64 hash_bytes(u64 hash, const void* bytes, u32 size) {
 }
 [[nodiscard]] bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
     const auto start = range_int(key.len);
-    using KeyLength = range_int<0, HttpCachePolicy::kMaxKey + 1>;
+    using KeyLength = range_int<0, i64{HttpCachePolicy::kMaxKey} + 1>;
     KeyLength end;
     if (!KeyLength::try_from_i64((start + range_int{size}).value(), &end)) return false;
     __builtin_memcpy(key.bytes + start.index(), bytes, size);

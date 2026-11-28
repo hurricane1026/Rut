@@ -68,18 +68,18 @@ struct SlicePool {
     static constexpr u32 kMaxBufferedResponseBody = 1u << 20;
     static constexpr size_t kResponseBodyOverhead = sizeof(void*) + 3 * sizeof(u32);
     static constexpr u32 kResponseBodyPayload =
-        (range_int<kSliceSize, kSliceSize + 1>{} -
-         range_int<kResponseBodyOverhead, kResponseBodyOverhead + 1>{})
+        (range_int<kSliceSize, i64{kSliceSize} + 1>{} -
+         range_int<kResponseBodyOverhead, i64{kResponseBodyOverhead} + 1>{})
             .to<u32>();
     static constexpr u32 kMaxBufferedResponseSlices =
         (range_int{kMaxBufferedResponseBody} +
-         range_int<kResponseBodyPayload - 1, kResponseBodyPayload>{})
+         range_int<i64{kResponseBodyPayload} - 1, kResponseBodyPayload>{})
             .divided_by<kResponseBodyPayload>()
             .to<u32>();
     static constexpr u32 kOrdinarySlicesPerConnection = 6;
     static constexpr u32 kSlicesPerConnection =
-        (range_int<kOrdinarySlicesPerConnection, kOrdinarySlicesPerConnection + 1>{} +
-         range_int<kMaxBufferedResponseSlices, kMaxBufferedResponseSlices + 1>{})
+        (range_int<kOrdinarySlicesPerConnection, i64{kOrdinarySlicesPerConnection} + 1>{} +
+         range_int<kMaxBufferedResponseSlices, i64{kMaxBufferedResponseSlices} + 1>{})
             .to<u32>();
 
     // Bulk relay buffers: large buffers a connection borrows only while it
@@ -261,7 +261,7 @@ struct SlicePool {
         if (prealloc > 0) {
             if (prealloc > n) prealloc = n;
             // Round up to kGrowStep for mprotect alignment.
-            const u32 steps = (range_int{prealloc} + range_int<kGrowStep - 1, kGrowStep>{})
+            const u32 steps = (range_int{prealloc} + range_int<i64{kGrowStep} - 1, kGrowStep>{})
                                   .divided_by<kGrowStep>()
                                   .to<u32>();
             for (u32 s = 0; s < steps && count < max_count; s++) {
@@ -616,7 +616,8 @@ private:
     bool grow() {
         if (count >= max_count) return false;
 
-        const auto step = range_int{max_count - count}.min(range_int<kGrowStep, kGrowStep + 1>{});
+        const auto step =
+            range_int{max_count - count}.min(range_int<kGrowStep, i64{kGrowStep} + 1>{});
         // step <= max_count - count, so the sum remains representable.
         const u32 next_count = count + step.to<u32>();
 

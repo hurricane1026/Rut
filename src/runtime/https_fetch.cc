@@ -20,7 +20,7 @@
 namespace rut {
 namespace {
 constexpr u32 kMaxStrongEtagLength = 128;
-using EtagLength = range_int<0, kMaxStrongEtagLength + 1>;
+using EtagLength = range_int<0, i64{kMaxStrongEtagLength} + 1>;
 
 bool terminated(const char* value, u32 capacity) {
     for (u32 i = 0; i < capacity; ++i)
@@ -106,7 +106,7 @@ bool strong_etag_valid(Str value) {
 
 BoundedJsonResponse::Result BoundedJsonResponse::append(Str bytes) {
     const auto cursor = range_int{wire_len_};
-    using WireLength = range_int<0, kMaxWire + 1>;
+    using WireLength = range_int<0, i64{kMaxWire} + 1>;
     WireLength end;
     if (result_ != Result::More || (bytes.len && !bytes.ptr) ||
         !WireLength::try_from_i64((cursor + range_int{bytes.len}).value(), &end))

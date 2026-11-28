@@ -579,7 +579,7 @@ bool NetClientWorker::read(Slot& s) {
         return success(s, 0);
     }
     if (s.eof || count == kMaxBytes) return failed(s);
-    constexpr auto kCapacity = range_int<kMaxBytes, kMaxBytes + 1>{};
+    constexpr auto kCapacity = range_int<kMaxBytes, i64{kMaxBytes} + 1>{};
     const auto available = kCapacity - buffered;
     char* const tail = s.buffer + buffered.index();
     i32 received;

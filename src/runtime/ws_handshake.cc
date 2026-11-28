@@ -12,7 +12,8 @@
 namespace rut {
 namespace {
 
-constexpr auto kAcceptLength = range_int<kWsHandshakeAcceptLength, kWsHandshakeAcceptLength + 1>{};
+constexpr auto kAcceptLength =
+    range_int<kWsHandshakeAcceptLength, i64{kWsHandshakeAcceptLength} + 1>{};
 constexpr auto kAcceptCapacity = kAcceptLength + range_int<1, 2>{};
 
 bool name_is(Str name, const char* value, u32 length) {
@@ -398,8 +399,9 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    bool opaque_extensions) {
     if (upstream_deflate) *upstream_deflate = {};
     if (storage == nullptr ||
-        offers_len > (range_int<SlicePool::kSliceSize, SlicePool::kSliceSize + 1>{} - kAcceptLength)
-                         .to<u32>() ||
+        offers_len >
+            (range_int<SlicePool::kSliceSize, i64{SlicePool::kSliceSize} + 1>{} - kAcceptLength)
+                .to<u32>() ||
         (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
         response.header_count > kMaxHeaders || response.version != HttpVersion::Http11 ||
         response.status_code != 101 || response.headers_truncated)

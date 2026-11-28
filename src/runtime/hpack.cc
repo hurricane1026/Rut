@@ -454,7 +454,7 @@ void dyn_clear(DynamicTable& d) {
 
 // Add (name,value). Caller MUST ensure the source bytes do not alias d.buf.
 [[nodiscard]] bool dyn_add(DynamicTable& d, Str name, Str value) {
-    constexpr auto kByteCap = range_int<DynamicTable::kByteCap, DynamicTable::kByteCap + 1>{};
+    constexpr auto kByteCap = range_int<DynamicTable::kByteCap, i64{DynamicTable::kByteCap} + 1>{};
     const auto payload = range_int(name.len) + range_int(value.len);
     const auto cost = payload + range_int<32, 33>{};
     if (cost.value() > d.max_size || payload.value() > DynamicTable::kByteCap) {
@@ -494,7 +494,7 @@ void dyn_clear(DynamicTable& d) {
 // Resolve a 1-based HPACK index to (name,value). idx 1..61 = static.
 [[nodiscard]] bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     if (idx == 0) return false;
-    using StaticIndex = range_int<1, kStaticCount + 1>;
+    using StaticIndex = range_int<1, i64{kStaticCount} + 1>;
     StaticIndex index;
     if (StaticIndex::try_from_u64(idx, &index)) {
         const StaticEntry& e = (index - range_int<1, 2>{}).at(kStatic);
@@ -530,9 +530,10 @@ void dyn_clear(DynamicTable& d) {
 }
 
 // The table index starts at the newest dynamic entry, following all static entries.
-constexpr auto kFirstDynamicIndex = range_int<kStaticCount, kStaticCount + 1>{} + range_int<1, 2>{};
+constexpr auto kFirstDynamicIndex =
+    range_int<kStaticCount, i64{kStaticCount} + 1>{} + range_int<1, 2>{};
 constexpr auto kMaxDynamicEntries =
-    range_int<DynamicTable::kMaxEntries, DynamicTable::kMaxEntries + 1>{};
+    range_int<DynamicTable::kMaxEntries, i64{DynamicTable::kMaxEntries} + 1>{};
 
 [[nodiscard]] u32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
     const auto entries = range_int(d.nent).min(kMaxDynamicEntries);
@@ -711,7 +712,7 @@ void DynamicTable::init(u32 settings_max) {
 // dynamic table size update so the next header block tells the peer's decoder the
 // new size in lockstep. Without that the two tables desync and decoding breaks.
 [[nodiscard]] bool Encoder::set_table_size(u32 settings_max) {
-    constexpr auto kCap = range_int<DynamicTable::kHardCap, DynamicTable::kHardCap + 1>{};
+    constexpr auto kCap = range_int<DynamicTable::kHardCap, i64{DynamicTable::kHardCap} + 1>{};
     const auto size = range_int(settings_max).min(kCap);
     const i32 next = size.to<i32>();
     // The size currently in effect for the peer's decoder is the final pending

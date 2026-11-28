@@ -21,7 +21,7 @@ json::Document& ws_json_document() {
 }
 
 [[nodiscard]] bool ws_json_input(const u8* payload, u64 len, Str path, Str* input) {
-    using JsonLength = range_int<0, json::kMaxBytes + 1>;
+    using JsonLength = range_int<0, i64{json::kMaxBytes} + 1>;
     JsonLength length;
     if (!payload || !JsonLength::try_from_u64(len, &length) || path.len > json::kMaxBytes ||
         (!path.ptr && path.len))
@@ -659,7 +659,7 @@ namespace {
                                         u16 code,
                                         Str reason,
                                         u32* size) {
-    using ReasonLength = range_int<0, kWsMaxCloseReasonBytes + 1>;
+    using ReasonLength = range_int<0, i64{kWsMaxCloseReasonBytes} + 1>;
     ReasonLength length;
     if (!ws_valid_close_code(code) || !ReasonLength::try_from_u64(reason.len, &length) ||
         !ws_valid_text_payload(reason))
@@ -1136,7 +1136,7 @@ WsClosingRead ws_read_closing(
             if (kStatus == ParseStatus::Error) return WsClosingRead::Error;
         }
         if (ws_opcode_is_control(header.opcode)) {
-            using ControlPayload = range_int<0, kWsMaxControlPayload + 1>;
+            using ControlPayload = range_int<0, i64{kWsMaxControlPayload} + 1>;
             ControlPayload count;
             if (st.partial_data_frame || !ControlPayload::try_from_i64(header.payload_len, &count))
                 return WsClosingRead::Error;

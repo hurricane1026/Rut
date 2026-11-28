@@ -7,7 +7,7 @@ namespace rut {
 
 namespace {
 
-constexpr auto kHeaderLength = range_int<kFrameHeaderSize, kFrameHeaderSize + 1>{};
+constexpr auto kHeaderLength = range_int<kFrameHeaderSize, i64{kFrameHeaderSize} + 1>{};
 
 // Big-endian readers/writers. HTTP/2 integers are network byte order.
 [[nodiscard]] u32 read_u24(const u8* p) {

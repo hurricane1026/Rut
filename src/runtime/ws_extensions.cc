@@ -240,7 +240,7 @@ u32 ws_rewrite_extensions(
         pos = next;
     }
     constexpr Str kPrefix = lit_str("Sec-WebSocket-Extensions: ");
-    constexpr auto kPrefixLen = range_int<kPrefix.len, kPrefix.len + 1>{};
+    constexpr auto kPrefixLen = range_int<kPrefix.len, i64{kPrefix.len} + 1>{};
     constexpr u32 kLineOverhead = (kPrefixLen + range_int<2, 3>{}).to<u32>();
     const u32 kOverhead = extension_value.len ? kLineOverhead : 0;
     const auto added = range_int(extension_value.len) + range_int(kOverhead);

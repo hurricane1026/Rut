@@ -16,10 +16,10 @@ namespace {
         .to<u32>();
 }
 
-constexpr auto kFrameHeader = range_int<kFrameHeaderSize, kFrameHeaderSize + 1>{};
+constexpr auto kFrameHeader = range_int<kFrameHeaderSize, i64{kFrameHeaderSize} + 1>{};
 constexpr u32 kShortControlFrame = (kFrameHeader + range_int<4, 5>{}).to<u32>();
 constexpr u32 kLongControlFrame = (kFrameHeader + range_int<8, 9>{}).to<u32>();
-using ConnectionWindow = range_int<0, kMaxWindowSize + 1LL>;
+using ConnectionWindow = range_int<0, i64{kMaxWindowSize} + 1>;
 
 [[nodiscard]] bool connection_window_add(i64 current, u32 credit, i64* out) {
     ConnectionWindow window;
@@ -271,7 +271,7 @@ namespace {
         // kWorst is a complete write-before bound for encode_header.
         o += kEncoded;
     }
-    range_int<0, kMaxAllowedFrameSize + 1> payload;
+    range_int<0, i64{kMaxAllowedFrameSize} + 1> payload;
     if (!decltype(payload)::try_from_i64(o - kFrameHeader.value(), &payload)) return 0;
     u8 flags = http2_flag::kEndHeaders;
     if (end_stream) flags |= http2_flag::kEndStream;
@@ -286,7 +286,7 @@ namespace {
 
 [[nodiscard]] u32 http2_write_data(
     u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream) {
-    range_int<0, kMaxAllowedFrameSize + 1> payload;
+    range_int<0, i64{kMaxAllowedFrameSize} + 1> payload;
     if (!decltype(payload)::try_from_i64(len, &payload)) return 0;
     Http2FrameHeader h;
     h.length = len;
@@ -820,7 +820,8 @@ struct OutWriter {
 
 // Append a header-block fragment, guarding the assembly buffer.
 [[nodiscard]] Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
-    constexpr auto kCap = range_int<Http2Conn::kHeaderBlockCap, Http2Conn::kHeaderBlockCap + 1>{};
+    constexpr auto kCap =
+        range_int<Http2Conn::kHeaderBlockCap, i64{Http2Conn::kHeaderBlockCap} + 1>{};
     const auto cursor = range_int{c.hdr_block_len};
     const auto end = cursor + range_int{n};
     if (end.value() > kCap.value()) return Http2Error::CompressionError;

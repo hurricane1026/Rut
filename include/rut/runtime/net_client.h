@@ -55,7 +55,7 @@ public:
                                 const void* config = nullptr);
 
 private:
-    using IoCount = range_int<0, kMaxBytes + 1>;
+    using IoCount = range_int<0, i64{kMaxBytes} + 1>;
     enum Phase : u8 { Empty, Queued, Running, Done, Idle, Cancelled };
     struct Slot {
         u32 phase = Empty;
