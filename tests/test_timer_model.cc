@@ -1,5 +1,6 @@
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/cross_shard.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/timer_wheel.h"
@@ -175,6 +176,113 @@ TEST(timer_model, epoll_disarm_removes_all_entries_and_preserves_peer) {
     CHECK_EQ(c->yield_timer_gen, 10u);
     loop.pool.destroy();
     loop.destroy_slot_storage();
+}
+
+TEST(cross_shard, bounded_ring_wraps_and_publishes_batches) {
+    ShardSpscRing<i32, 3> ring;
+    i32 out[3]{};
+    for (i32 batch = 0; batch < 12; ++batch) {
+        const i32 first = batch * 3;
+        REQUIRE(ring.stage(first));
+        REQUIRE(ring.stage(first + 1));
+        REQUIRE(ring.stage(first + 2));
+        CHECK_FALSE(ring.stage(-1));
+        CHECK_FALSE(ring.has_incoming());
+        CHECK_EQ(ring.drain(out, 3), 0);
+        REQUIRE(ring.publish());
+        CHECK_EQ(ring.drain(out, 1), 1);
+        CHECK_EQ(out[0], first);
+        REQUIRE(ring.stage(first + 3));
+        CHECK_EQ(ring.drain(out, 3), 2);
+        CHECK_EQ(out[0], first + 1);
+        CHECK_EQ(out[1], first + 2);
+        REQUIRE(ring.publish());
+        CHECK_EQ(ring.drain(out, 3), 1);
+        CHECK_EQ(out[0], first + 3);
+        CHECK_FALSE(ring.has_incoming());
+    }
+}
+
+TEST(cross_shard, ordering_and_deadline_policies) {
+    struct Message {
+        ShardWorkSchedule schedule;
+        i32 id;
+    };
+    ShardReadyHeap<Message, 6> heap;
+    REQUIRE(heap.push({{20, ShardWorkPriority::High}, 4}));
+    REQUIRE(heap.push({{10, ShardWorkPriority::Low}, 3}));
+    REQUIRE(heap.push({{10, ShardWorkPriority::High}, 1}));
+    REQUIRE(heap.push({{0, ShardWorkPriority::High}, 6}));
+    REQUIRE(heap.push({{10, ShardWorkPriority::High}, 2}));
+    REQUIRE(heap.push({{20, ShardWorkPriority::Normal}, 5}));
+    CHECK_FALSE(heap.push({{}, 7}));
+    Message message{};
+    for (i32 expected = 1; expected <= 6; ++expected) {
+        REQUIRE(heap.pop(message));
+        CHECK_EQ(message.id, expected);
+    }
+    CHECK_FALSE(heap.pop(message));
+    const ShardWorkSchedule schedule{10, ShardWorkPriority::Normal};
+    CHECK_FALSE(schedule.expires_before_start(9, ShardDeadlinePolicy::Hard));
+    CHECK(schedule.expires_before_start(10, ShardDeadlinePolicy::Hard));
+    CHECK_FALSE(schedule.expires_before_start(20, ShardDeadlinePolicy::Soft));
+    CHECK_FALSE(ShardWorkSchedule{}.expires_before_start(20, ShardDeadlinePolicy::Hard));
+}
+
+TEST(cross_shard, wake_only_once_per_idle_arm) {
+    ShardWakeChannel wake;
+    i32 signals = 0;
+    wake.context = &signals;
+    wake.signal = [](void* count) { ++*static_cast<i32*>(count); };
+    wake.notify_published();
+    CHECK_EQ(signals, 0);
+    CHECK_FALSE(wake.prepare_wait([] { return true; }));
+    CHECK(wake.prepare_wait([] { return false; }));
+    wake.notify_published();
+    wake.notify_published();
+    CHECK_EQ(signals, 1);
+    wake.finish_wait();
+
+    i32 checks = 0;
+    CHECK_FALSE(wake.prepare_wait([&] { return ++checks == 2; }));
+    wake.notify_published();
+    CHECK_EQ(signals, 1);
+}
+
+namespace {
+i32 cross_shard_execution_order = 0;
+
+template <i32 Id>
+u64 record_timer_order(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    cross_shard_execution_order = cross_shard_execution_order * 10 + Id;
+    return 0;
+}
+}  // namespace
+
+TEST(cross_shard, target_executes_admitted_timers_in_schedule_order) {
+    EpollEventLoop target;
+    REQUIRE(target.pool.init(8));
+    RouteConfig config{};
+    REQUIRE(config.add_timer("one", 3, 100, &record_timer_order<1>, 1));
+    REQUIRE(config.add_timer("two", 3, 100, &record_timer_order<2>, 1));
+    REQUIRE(config.add_timer("three", 5, 100, &record_timer_order<3>, 1));
+    const RouteConfig* active = &config;
+    target.config_ptr = &active;
+    target.shard_id = 1;
+
+    BackgroundTimerDispatch dispatch;
+    dispatch.shard_count = 2;
+    target.timer_dispatch = &dispatch;
+    auto& channel = dispatch.targets[1];
+    channel.stage({{20, ShardWorkPriority::High}, config.timer_generation, 0, 0});
+    channel.stage({{10, ShardWorkPriority::Low}, config.timer_generation, 0, 1});
+    channel.stage({{10, ShardWorkPriority::High}, config.timer_generation, 0, 2});
+    channel.flush();
+    cross_shard_execution_order = 0;
+    target.fire_due_timers();
+    CHECK_EQ(cross_shard_execution_order, 321);
+    CHECK_FALSE(target.has_background_work());
+    target.pool.destroy();
 }
 
 int main(int argc, char** argv) {

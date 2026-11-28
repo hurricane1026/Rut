@@ -32,6 +32,9 @@ struct EpollBackend {
 
     i32 epoll_fd = -1;
     i32 timer_fd = -1;
+    i32 background_timer_wake_fd = -1;
+    bool enable_background_timer_wakeup();
+    void wake_background_timers();
     // One-shot timerfd for JIT handler yield precision. EpollEventLoop
     // maintains a min-heap of pending yield deadlines and re-arms this
     // fd via arm_yield_timerfd() whenever the heap's top entry changes.

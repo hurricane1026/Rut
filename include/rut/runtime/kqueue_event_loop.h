@@ -278,17 +278,19 @@ public:
             this->drain_ready_jit_handlers();
             const bool fetch_busy =
                 config_ptr && *config_ptr && (*config_ptr)->jwks_fetch_busy(shard_id);
-            u32 n = backend.wait(events,
-                                 kMaxEventsPerWait,
-                                 conns,
-                                 kMaxConns,
-                                 this->has_ready_jit_handlers()
-                                     ? 0u
-                                     : this->background_timer_wait_ms(fetch_busy ? 10u : ~u32{0}));
+            const bool can_block =
+                !this->has_ready_jit_handlers() && this->prepare_background_wait();
+            u32 n = backend.wait(
+                events,
+                kMaxEventsPerWait,
+                conns,
+                kMaxConns,
+                can_block ? this->background_timer_wait_ms(fetch_busy ? 10u : ~u32{0}) : 0u);
+            if (can_block) this->finish_background_wait();
             dispatch_batch(events, n);
             poll_command();
             // Run due timers and arm any newly activated config after reload.
-            this->fire_due_timers();
+            if (is_running()) this->fire_due_timers();
             // Reset/arm active-health state the instant a hot reload installs a
             // new config, so it doesn't route off stale numeric-slot verdicts
             // until the next 1s sweep (#161 F4). No-op when unchanged; advances

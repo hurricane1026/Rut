@@ -5,6 +5,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
+#include "rut/runtime/background_timer.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_capacity.h"
@@ -608,8 +609,13 @@ public:
     // The shard's wait is bounded by the nearest deadline. Background timers
     // do not advance the separate connection idle/keepalive wheel.
     u64 timer_deadline_ns[RouteConfig::kMaxTimers]{};
-    u32 timer_fire_count[RouteConfig::kMaxTimers]{};
-    const RouteConfig* timer_armed_config = nullptr;
+    i64 timer_fire_count[RouteConfig::kMaxTimers]{};
+    BackgroundTimerDispatch* timer_dispatch = nullptr;
+    ShardReadyHeap<BackgroundTimerMessage, BackgroundTimerDispatch::kCapacity> ready_timers;
+    bool local_timer_pending[RouteConfig::kMaxTimers]{};
+    i64 stale_timer_triggers = 0;
+    i64 late_timer_starts = 0;
+    i64 armed_timer_generation = 0;
     u64 background_timer_deadline_ns = 0;
 
     u32 background_timer_wait_ms(u32 limit) const {
@@ -626,40 +632,123 @@ public:
         return ms < static_cast<i64>(limit) ? static_cast<u32>(ms) : limit;
     }
 
-    void fire_due_timers() {
-        const RouteConfig** cfg_ptr = self().config_ptr;
-        const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
-        const bool changed = cfg != timer_armed_config;
-        timer_armed_config = cfg;
-        if (changed) background_timer_deadline_ns = 0;
-        if (cfg == nullptr || cfg->timer_count == 0) return;
-        if (!changed && background_timer_deadline_ns == 0) return;
+    bool attach_background_timers(BackgroundTimerDispatch& dispatch) {
+        if (self().shard_id != 0) {
+            if (!self().backend.enable_background_timer_wakeup()) return false;
+            auto& wake = dispatch.targets[self().shard_id].wake;
+            wake.context = &self();
+            wake.signal = [](void* loop) {
+                static_cast<Derived*>(loop)->backend.wake_background_timers();
+            };
+        }
+        timer_dispatch = &dispatch;
+        return true;
+    }
 
+    BackgroundTimerDispatch::Target* incoming_timer_target() {
+        return timer_dispatch && self().shard_id != 0 ? &timer_dispatch->targets[self().shard_id]
+                                                      : nullptr;
+    }
+
+    bool has_background_work() {
+        auto* target = incoming_timer_target();
+        return !ready_timers.empty() || (target && target->ring.has_incoming());
+    }
+
+    bool prepare_background_wait() {
+        if (!ready_timers.empty()) return false;
+        auto* target = incoming_timer_target();
+        return !target || target->wake.prepare_wait([&] { return target->ring.has_incoming(); });
+    }
+
+    void finish_background_wait() {
+        if (auto* target = incoming_timer_target()) target->wake.finish_wait();
+    }
+
+    void schedule_background_timers(const RouteConfig* cfg) {
+        const i64 generation = cfg ? cfg->timer_generation : 0;
+        const bool changed = generation != armed_timer_generation;
+        armed_timer_generation = generation;
+        if (changed) background_timer_deadline_ns = 0;
+        if (generation == 0 || (!changed && background_timer_deadline_ns == 0)) return;
         const u64 now = monotonic_ns();
         if (!changed && now < background_timer_deadline_ns) return;
+
+        u64 recipients = 0;
         background_timer_deadline_ns = 0;
-        const u32 count =
-            cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count : RouteConfig::kMaxTimers;
-        for (u32 i = 0; i < count; i++) {
+        for (u32 i = 0; i < cfg->timer_count; ++i) {
             const auto& entry = cfg->timers[i];
-            if (entry.shard >= 0 && static_cast<u32>(entry.shard) != self().shard_id) continue;
+            if (entry.shard >= 0) {
+                const auto target = static_cast<u32>(entry.shard);
+                if (timer_dispatch ? target >= timer_dispatch->shard_count
+                                   : target != self().shard_id)
+                    continue;
+            }
             if (changed) {
                 timer_deadline_ns[i] = deadline_after(now, entry.interval_ms);
             } else if (now >= timer_deadline_ns[i]) {
-                jit::HandlerCtx ctx{};
-                SliceArena scratch{};
-                if (scratch.init(&self().pool)) {
-                    (void)entry.fn(nullptr, &ctx, nullptr, 0, &scratch);
-                    scratch.destroy();
-                    timer_fire_count[i]++;
+                const BackgroundTimerMessage message{
+                    {timer_deadline_ns[i], ShardWorkPriority::Normal}, generation, 0, i};
+                if ((entry.shard < 0 || static_cast<u32>(entry.shard) == self().shard_id) &&
+                    !local_timer_pending[i])
+                    local_timer_pending[i] = ready_timers.push(message);
+                if (timer_dispatch) {
+                    for (u32 shard = 1; shard < timer_dispatch->shard_count; ++shard) {
+                        if (entry.shard >= 0 && static_cast<u32>(entry.shard) != shard) continue;
+                        timer_dispatch->targets[shard].stage(message);
+                        recipients |= u64{1} << shard;
+                    }
                 }
-                // Schedule from this firing, including after scratch exhaustion.
-                // A delayed shard never runs a backlog of missed periods.
+                // A stalled scheduler never replays missed periods.
                 timer_deadline_ns[i] = deadline_after(now, entry.interval_ms);
             }
             if (background_timer_deadline_ns == 0 ||
                 timer_deadline_ns[i] < background_timer_deadline_ns)
                 background_timer_deadline_ns = timer_deadline_ns[i];
+        }
+        while (recipients != 0) {
+            const i32 shard = __builtin_ctzll(recipients);
+            recipients &= ~(u64{1} << shard);
+            timer_dispatch->targets[shard].flush();
+        }
+    }
+
+    void fire_due_timers() {
+        const RouteConfig* cfg = self().config_ptr ? *self().config_ptr : nullptr;
+        auto* incoming = incoming_timer_target();
+        bool draining = false;
+        if constexpr (requires { self().is_draining(); }) draining = self().is_draining();
+        if (incoming) {
+            BackgroundTimerMessage batch[BackgroundTimerDispatch::kCapacity];
+            const i32 count = incoming->ring.drain(batch, ready_timers.available());
+            for (i32 i = 0; i < count; ++i) {
+                if (!ready_timers.push(batch[i])) incoming->acknowledge(batch[i]);
+            }
+        } else if (!draining) {
+            schedule_background_timers(cfg);
+        }
+
+        constexpr i32 kCallbacksPerTurn = 8;
+        BackgroundTimerMessage message;
+        for (i32 i = 0; i < kCallbacksPerTurn && ready_timers.pop(message); ++i) {
+            if (incoming)
+                incoming->acknowledge(message);
+            else
+                local_timer_pending[message.timer] = false;
+            if (draining) continue;
+            if (!cfg || message.generation != cfg->timer_generation) {
+                if (stale_timer_triggers < INT64_MAX) ++stale_timer_triggers;
+                continue;
+            }
+            jit::HandlerCtx ctx{};
+            SliceArena scratch{};
+            if (!scratch.init(&self().pool)) continue;
+            if (monotonic_ns() > message.schedule.deadline_ns && late_timer_starts < INT64_MAX)
+                ++late_timer_starts;
+            (void)cfg->timers[message.timer].fn(nullptr, &ctx, nullptr, 0, &scratch);
+            scratch.destroy();
+            auto& count = timer_fire_count[message.timer];
+            if (count < INT64_MAX) ++count;
         }
     }
 

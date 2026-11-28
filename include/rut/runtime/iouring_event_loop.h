@@ -753,13 +753,16 @@ public:
             retry_response_splice_cancels();
             const bool fetch_busy =
                 config_ptr && *config_ptr && (*config_ptr)->jwks_fetch_busy(shard_id);
-            const u32 kEventCount = backend.wait(
-                events,
-                kMaxEventsPerWait,
-                conns,
-                slots_initialized,
-                deferred_relay_read_count == 0 && !fetch_busy && !this->has_ready_jit_handlers(),
-                this->background_timer_deadline_ns);
+            const bool can_block = deferred_relay_read_count == 0 && !fetch_busy &&
+                                   !this->has_ready_jit_handlers() &&
+                                   this->prepare_background_wait();
+            const u32 kEventCount = backend.wait(events,
+                                                 kMaxEventsPerWait,
+                                                 conns,
+                                                 slots_initialized,
+                                                 can_block,
+                                                 this->background_timer_deadline_ns);
+            if (can_block) this->finish_background_wait();
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -770,7 +773,9 @@ public:
             relay_budget_calls = kRelayTurnMaxCalls;
             relay_budget_bytes = kRelayTurnMaxBytes;
             if (this->fetch_idle_pause_allowed(
-                    fetch_busy, kEventCount, this->has_ready_jit_handlers())) {
+                    fetch_busy,
+                    kEventCount,
+                    this->has_ready_jit_handlers() || this->has_background_work())) {
                 // Advance nonblocking TLS state regularly on an idle shard
                 // without spinning while the fetch socket has no gateway slot.
                 const u32 delay_ms = this->background_timer_wait_ms(10);
@@ -783,7 +788,7 @@ public:
             retry_deferred_accepts();
             poll_command();
             // Run due timers and arm any newly activated config after reload.
-            this->fire_due_timers();
+            if (is_running()) this->fire_due_timers();
             // Reset/arm active-health state on hot reload (#161 F4). No-op when
             // unchanged; advances health_armed_config so the later sweep doesn't
             // double-reset.
