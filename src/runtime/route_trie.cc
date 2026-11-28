@@ -1,6 +1,7 @@
 #include "rut/runtime/route_trie.h"
 
 #include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/runtime/route_params.h"
 
@@ -34,13 +35,13 @@ namespace rut {
     for (;;) {
         if (end == path.len || path.ptr[range_int{end}.index()] == '/') {
             if (end > start) {
-                const auto length = range_int{end - start};
-                if (!out.push(Str{path.ptr + range_int{start}.index(), length.to<u32>()}))
+                if (!out.push(path.slice(start, end)))
                     return limit == SegmentLimit::KeepPrefix ? out.len : kSegmentLimitExceeded;
             }
             if (end == path.len) break;
             // A separator before the end leaves room to advance.
-            start = end + 1u;
+            start = end;
+            ++start;
         }
         ++end;
     }
@@ -174,11 +175,19 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     for (u32 i = 0; i < pushed_parents.len; ++i) {
         auto& parent = nodes[pushed_parents[i]];
         // This parent recorded a successful append before publication.
-        const u32 kLast = range_int{parent.children.len}.to<u32>() - 1u;
+        range_int<1, 256> child_count;
+        if (!decltype(child_count)::try_from_u64(parent.children.len, &child_count))
+            RUT_TRAP("RouteTrie recorded an empty child list after append");
+        const u32 kLast = (child_count - range_int<1, 2>{}).to<u32>();
         const u16 kChild = parent.children[kLast];
         if (is_param_segment(nodes[kChild].segment)) {
-            for (u32 j = kLast; j > parent.children.param_count; --j)
-                parent.children[j] = parent.children[range_int{j - 1u}.index()];
+            u32 destination = kLast;
+            while (destination > parent.children.param_count) {
+                u32 source = destination;
+                --source;
+                parent.children[destination] = parent.children[source];
+                destination = source;
+            }
             parent.children[parent.children.param_count++] = kChild;
         }
         needs_backtracking_ |= parent.children.param_count != 0 && parent.children.len > 1;
@@ -256,16 +265,15 @@ u16 RouteTrie::match_key(Str path,
             const u32 kStart = position;
             while (position < path.len && path.ptr[position] != '/') ++position;
             // The scan starts at kStart and only advances toward path.len.
-            const auto segment_length = range_int{position - kStart};
-            const Str kValue{path.ptr + range_int{kStart}.index(), segment_length.to<u32>()};
+            const Str kValue = path.slice(kStart, position);
             const u16 kChild =
                 node.children.len == 1 ? node.children[0] : find_child(current, kValue);
             if (kChild == TrieNode::kInvalidNodeIdx) break;
             const Str kName = nodes[kChild].segment;
             if (is_param_segment(kName)) {
                 if (captured < kCap) {
-                    out_params[captured++] =
-                        RouteParam{kName.ptr + 1, kName.len - 1u, kValue.ptr, kValue.len};
+                    const Str name = kName.slice(1, kName.len);
+                    out_params[captured++] = RouteParam{name.ptr, name.len, kValue.ptr, kValue.len};
                 }
             } else if (!kName.eq(kValue)) {
                 break;
@@ -321,14 +329,14 @@ u16 RouteTrie::match_key(Str path,
             // Record only node IDs for the winning path. Capture views are
             // materialized once, after the search, and only when requested.
             if (out_params && out_param_count && out_param_cap != 0 && depth != static_segments) {
-                for (u32 i = 1; i < stack.len; ++i)
-                    best_path[range_int{i - 1u}.index()] = stack[i].node;
+                u32 destination = 0;
+                for (u32 i = 1; i < stack.len; ++i) best_path[destination++] = stack[i].node;
             }
         }
     };
 
     while (stack.len > 0) {
-        Frame& frame = stack[range_int{stack.len - 1u}.index()];
+        Frame& frame = *(stack.data + range_int{stack.len}.index() - 1);
         const auto& node = nodes[frame.node];
         if (frame.next_child == 0) {
             consider(pick_terminal(node, want_slot),
@@ -350,11 +358,15 @@ u16 RouteTrie::match_key(Str path,
             const u16 kLiteral =
                 find_child(frame.node, segs[frame.depth], node.children.param_count);
             if (kLiteral != TrieNode::kInvalidNodeIdx) {
-                const u32 kDepth = frame.depth + 1u;
+                u32 depth;
+                u32 static_segments;
+                if (!(range_int{frame.depth} + range_int<1, 2>{}).to(&depth) ||
+                    !(range_int{frame.static_segments} + range_int<1, 2>{}).to(&static_segments))
+                    return TrieNode::kInvalidRoute;
                 const u64 kMask = frame.static_mask |
-                                  (kDepth < 64 ? 1ull << (63 - range_int{kDepth}.to<i64>()) : 0);
+                                  (depth < 64 ? 1ull << (63 - range_int{depth}.to<i64>()) : 0);
                 [[maybe_unused]] const bool kOk =
-                    stack.push(Frame{kLiteral, kDepth, 0, frame.static_segments + 1u, kMask});
+                    stack.push(Frame{kLiteral, depth, 0, static_segments, kMask});
                 continue;
             }
         }
@@ -362,8 +374,11 @@ u16 RouteTrie::match_key(Str path,
         while (frame.next_child <= node.children.param_count) {
             const u16 kChild = node.children[range_int{frame.next_child++}.to<i64>() - 1];
             if ((nodes[kChild].children.method_mask & kEligibleMethods) == 0) continue;
-            [[maybe_unused]] const bool kOk = stack.push(
-                Frame{kChild, frame.depth + 1u, 0, frame.static_segments, frame.static_mask});
+            u32 depth;
+            if (!(range_int{frame.depth} + range_int<1, 2>{}).to(&depth))
+                return TrieNode::kInvalidRoute;
+            [[maybe_unused]] const bool kOk =
+                stack.push(Frame{kChild, depth, 0, frame.static_segments, frame.static_mask});
             descended = true;
             break;
         }
@@ -376,8 +391,9 @@ u16 RouteTrie::match_key(Str path,
             const Str kName = nodes[best_path[i]].segment;
             if (!is_param_segment(kName)) continue;
             const Str kValue = segs[i];
+            const Str name = kName.slice(1, kName.len);
             out_params[(*out_param_count)++] =
-                RouteParam{kName.ptr + 1, kName.len - 1u, kValue.ptr, kValue.len};
+                RouteParam{name.ptr, name.len, kValue.ptr, kValue.len};
         }
     }
     return best.route_idx;
