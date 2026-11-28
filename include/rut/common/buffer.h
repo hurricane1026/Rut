@@ -3,6 +3,7 @@
 #include "rut/common/range_int.h"
 #include "rut/common/trap.h"
 #include "rut/common/types.h"
+#include <type_traits>
 
 #include <inttypes.h>
 
@@ -129,7 +130,8 @@ public:
 
     [[nodiscard]] Size read(u8* dst, i64 max) const noexcept {
         BufferLength<Size> count;
-        if (!ptr_ || !len_.try_nonempty_prefix(max, &count)) return 0;
+        const Length current{len_};
+        if (!ptr_ || !current.try_nonempty_prefix(max, &count)) return 0;
         __builtin_memmove(dst, ptr_, count.to_u64());
         return count.template to<Size>();
     }
@@ -141,7 +143,7 @@ public:
         if (released_) RUT_TRAP("Buffer::release called twice");
         if (!ptr_) return BasicView<Size>();  // invalid buffer → empty BasicView<Size>, no lock
         released_ = true;
-        return BasicView<Size>(ptr_, len_, this);
+        return BasicView<Size>(ptr_, Length{len_}, this);
     }
 
     void reset() noexcept {
@@ -157,7 +159,7 @@ public:
     // Returns pointer past current data; write_avail() bytes available.
     [[nodiscard]] u8* write_ptr() noexcept {
         if (released_) RUT_TRAP("Buffer::write_ptr: buffer has a live view");
-        return ptr_ ? ptr_ + len_.index() : nullptr;
+        return ptr_ ? ptr_ + Length{len_}.index() : nullptr;
     }
 
     [[nodiscard]] Size write_avail() const noexcept {
@@ -179,21 +181,24 @@ public:
     void set_len(i64 n) noexcept {
         if (released_) RUT_TRAP("Buffer::set_len: buffer has a live view");
         if (!ptr_) RUT_TRAP("Buffer::set_len: buffer has no storage");
-        if (!cap_.try_count(n, &len_))
+        Length next;
+        if (!Length{cap_}.try_count(n, &next))
             RUT_TRAP("Buffer::set_len: invalid length (%" PRId64 ", capacity=%" PRId64 ")",
                      n,
-                     cap_.value());
+                     Length{cap_}.value());
+        len_ = store_length(next);
     }
 
     // Drop the first n already-consumed bytes, shifting the remainder to the front.
     void consume(i64 n) noexcept {
         if (released_) RUT_TRAP("Buffer::consume: buffer has a live view");
         Length consumed;
-        if (!len_.try_nonempty_prefix(n, &consumed)) return;
-        const auto kRemaining = (len_ - consumed).max(range_int<0, 1>{});
+        const Length current{len_};
+        if (!current.try_nonempty_prefix(n, &consumed)) return;
+        const auto kRemaining = (current - consumed).max(range_int<0, 1>{});
         if (kRemaining.value())
             __builtin_memmove(ptr_, ptr_ + consumed.index(), kRemaining.to_u64());
-        len_ = kRemaining;
+        len_ = store_length(kRemaining);
     }
 
     // Read-only data pointer for kernel send() / zero-copy forwarding.
@@ -206,31 +211,36 @@ public:
     // Forceful reinit — only for connection reset (all Views must be dead).
     // Caller guarantees no live Views reference this BasicBuffer.
     void bind(u8* ptr, i64 cap) noexcept {
-        if (!Length::try_from_i64(cap, &cap_))
+        Length checked_cap;
+        if (!Length::try_from_i64(cap, &checked_cap))
             RUT_TRAP("Buffer::bind: invalid capacity (%" PRId64 ")", cap);
         ptr_ = ptr;
+        cap_ = store_length(checked_cap);
         len_ = {};
         released_ = false;
     }
 
-    [[nodiscard]] Size len() const noexcept { return len_.template to<Size>(); }
-    [[nodiscard]] i64 capacity() const noexcept { return cap_.value(); }
+    [[nodiscard]] Size len() const noexcept { return Length{len_}.template to<Size>(); }
+    [[nodiscard]] i64 capacity() const noexcept { return Length{cap_}.value(); }
 
     [[nodiscard]] u32 capacity_u32() const noexcept
         requires(__is_same(Size, u32))
     {
-        return cap_.template to<u32>();
+        return Length{cap_}.template to<u32>();
     }
     bool valid() const noexcept { return ptr_ != nullptr; }
     bool is_released() const noexcept { return released_; }
 
 private:
-    [[nodiscard]] Length available() const noexcept { return (cap_ - len_).max(range_int<0, 1>{}); }
+    [[nodiscard]] Length available() const noexcept {
+        return (Length{cap_} - Length{len_}).max(range_int<0, 1>{});
+    }
 
     void advance(Length available, Length written) noexcept {
         // Subtract the unwritten tail from capacity so no sum of two unbounded
         // i64 quantities is ever formed. The caller bounds written by available.
-        len_ = (cap_ - (available - written).max(range_int<0, 1>{})).max(range_int<0, 1>{});
+        len_ = store_length(
+            (Length{cap_} - (available - written).max(range_int<0, 1>{})).max(range_int<0, 1>{}));
     }
 
     void copy_prefix(const u8* src, i64 n, Length* copied) noexcept {
@@ -239,7 +249,7 @@ private:
         const auto kAvailable = available();
         Length written;
         if (!kAvailable.try_nonempty_prefix(n, &written)) return;
-        __builtin_memmove(ptr_ + len_.index(), src, written.to_u64());
+        __builtin_memmove(ptr_ + Length{len_}.index(), src, written.to_u64());
         advance(kAvailable, written);
         if (copied) *copied = written;
     }
@@ -248,15 +258,24 @@ private:
                                                               i64 n) const noexcept {
         RUT_TRAP("Buffer::commit: %s (length=%" PRId64 ", capacity=%" PRId64 ", bytes=%" PRId64 ")",
                  reason,
-                 len_.value(),
-                 cap_.value(),
+                 Length{len_}.value(),
+                 Length{cap_}.value(),
                  n);
     }
 
     friend struct BasicView<Size>;
+    using StoredLength = std::conditional_t<__is_same(Size, u32), u32, Length>;
+
+    [[nodiscard]] static StoredLength store_length(Length value) noexcept {
+        if constexpr (__is_same(Size, u32))
+            return value.template to<u32>();
+        else
+            return value;
+    }
+
     u8* ptr_ = nullptr;
-    Length cap_;
-    Length len_;
+    StoredLength cap_{};
+    StoredLength len_{};
     bool released_ = false;
 };
 
