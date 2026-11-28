@@ -1589,6 +1589,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     }
 
     if (h2->pending_prepared_forward) {
+        const i64 kBodyLen = h2->pending_body_len;
         const u32 kSynthLen = h2->pending_synth_len;
         const RouteConfig* cfg = h2->pending_route_config;
         d.conn->forward_load_balance = h2->pending_load_balance;
@@ -1597,7 +1598,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const u32 kCacheRoute = h2->pending_http_cache_route;
         const u8* synth = h2->pending_synth;
         h2_clear_pending(*h2);
-        if (h2->pending_body_len != 0) {
+        if (kBodyLen != 0) {
             h2_emit_status(d, stream_id, 503);
             return;
         }

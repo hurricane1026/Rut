@@ -739,7 +739,7 @@ public:
                !c.request_body_fully_buffered && !c.req_body_streamed &&
                c.request_upload_complete && c.throttle_down_bps == 0 && c.http_cache_ttl == 0 &&
                c.http_cache_mutation_host == 0 && !c.is_ws_terminate_route && !c.h1_tls_upstream &&
-               c.resp_body_remaining >= 64 * 1024 && c.upstream_recv_buf.len() == 0 &&
+               c.resp_body_remaining >= i64{64} * 1024 && c.upstream_recv_buf.len() == 0 &&
                !c.upstream_recv_armed && !c.upstream_recv_direct_armed && !c.upstream_send_armed &&
                !c.send_armed && c.upstream_relay_send_len == 0 && !c.relay_owner.active() &&
                c.relay_owner.segment_len == 0 && c.relay_owner.segment_sent == 0 &&
@@ -755,7 +755,7 @@ public:
         if (send_len == 0 || c.upstream_recv_buf.len() != send_len) return false;
         // Eligibility is checked again after the ordinary prefix send retires.
         if (c.tls_active || c.response_policy_id != 0 ||
-            c.resp_body_mode != BodyMode::ContentLength || c.resp_body_remaining < 64 * 1024 ||
+            c.resp_body_mode != BodyMode::ContentLength || c.resp_body_remaining < i64{64} * 1024 ||
             c.throttle_down_bps != 0 || c.http_cache_ttl != 0 || c.http_cache_mutation_host != 0 ||
             !c.response_read_deadline_owner_is_neutral())
             return false;

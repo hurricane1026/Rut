@@ -2136,6 +2136,14 @@ TEST(http2_conn, write_head_headers_with_representation_length_is_transactional)
             wide_decoded[i].value.eq(Str{"9223372036854775807", 19}))
             has_wide_length = true;
     CHECK(has_wide_length);
+
+    hpack::Encoder negative_enc;
+    negative_enc.init(4096);
+    const u32 negative_entries = negative_enc.dyn.nent;
+    CHECK_EQ(
+        http2_write_head_response_headers(out, sizeof(out), negative_enc, 1, 200, hdrs, 1, i64{-1}),
+        0u);
+    CHECK_EQ(negative_enc.dyn.nent, negative_entries);
 }
 
 // http2_write_response must refuse (return 0) rather than overflow its fixed 8 KiB

@@ -30031,6 +30031,7 @@ TEST(streaming, request_body_recvd_cl_forwards) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     c->upstream_fd = 100;
+    c->recv_buf.reset();
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = i64{UINT32_MAX} + 50;
     c->req_size = i64{UINT32_MAX} + 10;
