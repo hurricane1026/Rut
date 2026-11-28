@@ -185,6 +185,9 @@ struct WsHandlerOutput {
     bool ready = false;
 };
 
+// The message and frame-prefix buffers use u32 lengths at their I/O boundaries.
+using WsBufferedBytes = range_int<0, __int128_t{UINT32_MAX} + 1>;
+
 // Per-direction inspection state. One instance per tunnel direction; persists across
 // recv chunks because frames and messages span reads.
 //
@@ -235,20 +238,20 @@ struct WsInspector {
     // The tunnel supplies one and leaves this disabled.
     bool reject_fragmented = false;
     WsMessageAssembler assembler;  // fragmentation state across frames
-    i64 message_len = 0;           // bytes accumulated into the message buffer so far
+    WsBufferedBytes message_len;   // bytes accumulated into the message buffer so far
     bool partial_data_frame = false;
     WsFrameHeader partial_header{};
-    i64 partial_payload_len = 0;
+    WsBufferedBytes partial_payload_len;
 
     void reset() {
         echo_close_reason_len = 0;
         echo_close_code = 1000;
         received_close = false;
         assembler.reset();
-        message_len = 0;
+        message_len = {};
         compressed_message = false;
         partial_data_frame = false;
-        partial_payload_len = 0;
+        partial_payload_len = {};
     }
 };
 

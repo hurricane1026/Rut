@@ -2327,8 +2327,8 @@ struct ConnectionBase {
         ws_forward_text_count = 0;
         ws_c2u.reset();
         ws_u2c.reset();
-        ws_c2u.message_len = 0;
-        ws_u2c.message_len = 0;
+        ws_c2u.message_len = {};
+        ws_u2c.message_len = {};
         ws_c2u_msg = nullptr;
         ws_u2c_msg = nullptr;
         ws_c2u_out = nullptr;
