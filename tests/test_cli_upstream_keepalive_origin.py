@@ -33,7 +33,7 @@ def request(client):
     return body
 
 
-def exercise(binary, backend, timeout):
+def exercise(binary, backend, timeout, max_requests=None):
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
     origin.daemon_threads = True
     threading.Thread(target=origin.serve_forever, daemon=True).start()
@@ -51,7 +51,8 @@ def exercise(binary, backend, timeout):
                     [binary, str(path / "main.rut"), "--backend", backend,
                      "--shards", "1", "--no-pin", "--drain", "0",
                      "--max-connections-per-shard", "128",
-                     "--upstream-keepalive-idle-timeout", str(timeout)],
+                     "--upstream-keepalive-idle-timeout", str(timeout)] +
+                    ([] if max_requests is None else ["--upstream-keepalive-max-requests", str(max_requests)]),
                     stdout=log, stderr=log,
                 )
                 try:
@@ -71,12 +72,18 @@ def exercise(binary, backend, timeout):
                         raise AssertionError("gateway startup timed out: " + output)
                     client = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
                     try:
-                        first = request(client)
-                        second = request(client)
-                        assert first == second, (first, second)
-                        time.sleep(2.2)
-                        third = request(client)
-                        assert (third != second) == (timeout != 0), (timeout, first, second, third)
+                        if max_requests is not None:
+                            sockets = [request(client) for _ in range(5)]
+                            for i in range(1, len(sockets)):
+                                expected_reuse = max_requests == 0 or i % max_requests != 0
+                                assert (sockets[i] == sockets[i - 1]) == expected_reuse, (max_requests, sockets)
+                        else:
+                            first = request(client)
+                            second = request(client)
+                            assert first == second, (first, second)
+                            time.sleep(2.2)
+                            third = request(client)
+                            assert (third != second) == (timeout != 0), (timeout, first, second, third)
                     finally:
                         client.close()
                 finally:
@@ -96,6 +103,10 @@ def main():
     binary, backend = sys.argv[1:]
     for timeout in (1, 0):
         result = exercise(binary, backend, timeout)
+        if result:
+            return result
+    for limit in (0, 1, 2):
+        result = exercise(binary, backend, 0, limit)
         if result:
             return result
     return 0
