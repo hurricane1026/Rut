@@ -617,11 +617,12 @@ public:
         if (background_timer_deadline_ns <= now) return 0;
         u64 remaining = 0;
         (void)__builtin_sub_overflow(background_timer_deadline_ns, now, &remaining);
-        const i64 ms =
-            static_cast<i64>(remaining / 1'000'000) + (remaining % 1'000'000 != 0 ? 1 : 0);
-        // epoll takes a signed millisecond timeout.
-        const i64 bounded = ms < INT32_MAX ? ms : INT32_MAX;
-        return bounded < static_cast<i64>(limit) ? static_cast<u32>(bounded) : limit;
+        const u64 whole_ms = remaining / 1'000'000;
+        // epoll takes a signed millisecond timeout. Saturate before rounding.
+        if (whole_ms >= static_cast<u64>(INT32_MAX))
+            return limit < static_cast<u32>(INT32_MAX) ? limit : static_cast<u32>(INT32_MAX);
+        const i64 ms = static_cast<i64>(whole_ms) + (remaining % 1'000'000 != 0 ? 1 : 0);
+        return ms < static_cast<i64>(limit) ? static_cast<u32>(ms) : limit;
     }
 
     void fire_due_timers() {

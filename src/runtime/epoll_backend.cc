@@ -1113,8 +1113,7 @@ u32 EpollBackend::wait(
                 if (harvested >= 0) break;
                 // A finite maintenance wait represents a caller-owned deadline.
                 // Let the caller recompute its remaining time after a signal.
-                if (errno == EINTR && !probe_pending && maintenance_timeout_ms == ~u32{0})
-                    continue;
+                if (errno == EINTR && !probe_pending && maintenance_timeout_ms == ~u32{0}) continue;
                 if (probe_pending) {
                     pending_streak = 0;
                     return pop_pending(conns, max_conns);

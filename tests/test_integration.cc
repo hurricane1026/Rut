@@ -1940,9 +1940,9 @@ TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
     usleep(5000);
     loop0->fire_due_timers();
     loop1->fire_due_timers();
-    CHECK_EQ(loop0->timer_fire_count[0], 0u);  // wrong shard: never fires
+    CHECK_EQ(loop0->timer_fire_count[0], 0u);           // wrong shard: never fires
     CHECK_EQ(loop0->background_timer_deadline_ns, 0u);  // and needs no timer wakeup
-    CHECK_GE(loop1->timer_fire_count[0], 1u);  // pinned shard fires
+    CHECK_GE(loop1->timer_fire_count[0], 1u);           // pinned shard fires
     loop0->pool.destroy();
     loop1->pool.destroy();
 }

@@ -111,8 +111,13 @@ static i32 io_uring_enter_until(i32 fd, u32 to_submit, u32 flags, u64 deadline_n
     u64 ns = 0;
     (void)__builtin_sub_overflow(deadline_ns, now, &ns);
     IoTimespec timeout{};
-    timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(ns / 1'000'000'000);
-    timeout.tv_nsec = static_cast<decltype(timeout.tv_nsec)>(ns % 1'000'000'000);
+    const u64 seconds = ns / 1'000'000'000;
+    if (seconds > static_cast<u64>(INT64_MAX))
+        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(INT64_MAX);
+    else
+        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(seconds);
+    const i32 nanoseconds = static_cast<i32>(ns % 1'000'000'000);
+    timeout.tv_nsec = nanoseconds;
     io_uring_getevents_arg args{};
     args.ts = static_cast<decltype(args.ts)>(reinterpret_cast<uintptr_t>(&timeout));
     const i32 ret = static_cast<i32>(syscall(
