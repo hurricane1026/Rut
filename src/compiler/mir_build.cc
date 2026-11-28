@@ -1599,6 +1599,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.hc_concurrency = module.upstreams[i].hc_concurrency;
         up.hc_expected_status = module.upstreams[i].hc_expected_status;
         up.hc_healthy_statuses = module.upstreams[i].hc_healthy_statuses;
+        up.hc_unhealthy_statuses = module.upstreams[i].hc_unhealthy_statuses;
         up.hc_thresholds = module.upstreams[i].hc_thresholds;
         up.passive_health = module.upstreams[i].passive_health;
         up.hc_require_initial_success = module.upstreams[i].hc_require_initial_success;

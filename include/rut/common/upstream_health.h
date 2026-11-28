@@ -89,12 +89,19 @@ inline bool valid_active_health_check(ActiveHealthType type,
                                       ActiveHealthStatuses statuses = {},
                                       u32 unhealthy_interval_ms = 0,
                                       bool passive_enabled = false,
-                                      bool require_initial_success = false) {
+                                      bool require_initial_success = false,
+                                      ActiveHealthStatuses unhealthy = {}) {
     if ((!interval_ms && (!unhealthy_interval_ms || !passive_enabled || require_initial_success)) ||
         !thresholds.valid() || !valid_active_health_timeout(timeout_ms))
         return false;
-    if (!statuses.valid()) return false;
-    if (type == ActiveHealthType::Tcp) return path_len == 0 && status == 0 && statuses.empty();
+    if (!statuses.valid() || !unhealthy.valid()) return false;
+    if (type == ActiveHealthType::Tcp)
+        return path_len == 0 && status == 0 && statuses.empty() && unhealthy.empty();
+    if (!unhealthy.empty()) {
+        if (statuses.empty() && (status < 200 || unhealthy.contains(status))) return false;
+        for (u32 i = 0; i < ActiveHealthStatuses::kWords; ++i)
+            if (statuses.words[i] & unhealthy.words[i]) return false;
+    }
     if (type != ActiveHealthType::Http || !path || !path_len || path[0] != '/' ||
         (statuses.empty() ? (status < 100 || status > 599) : status != 0))
         return false;

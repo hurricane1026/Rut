@@ -4440,7 +4440,7 @@ TEST(native_program, active_healthy_statuses_round_trip) {
     Source source;
     REQUIRE(source.append(R"rut(
 upstream api { backends: ["127.0.0.1:9001"]
-    health_check: { path: "/health" interval: 1s healthy_statuses: [200, 302] concurrency: 2 } }
+    health_check: { path: "/health" interval: 1s healthy_statuses: [200, 302] unhealthy_statuses: [429, 503] concurrency: 2 } }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut"));
     Program owner;
@@ -4452,4 +4452,6 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK(target.hc_healthy_statuses.contains(200));
     CHECK(target.hc_healthy_statuses.contains(302));
     CHECK_FALSE(target.hc_healthy_statuses.contains(301));
+    CHECK(target.hc_unhealthy_statuses.contains(429));
+    CHECK(target.hc_unhealthy_statuses.contains(503));
 }

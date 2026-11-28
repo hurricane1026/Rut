@@ -11981,3 +11981,12 @@ for cleartext), replacing any client-supplied value. The other fields and
 admission rules of the preserve-host profile remain required. The existing
 `forwarded_proto: .http` profile retains its cleartext-only behavior. The
 upstream remains cleartext HTTP/1.1.
+
+
+Active HTTP and verified HTTPS probes optionally accept `unhealthy_statuses`, a
+nonempty, duplicate-free 200–599 list disjoint from the effective healthy set.
+When present, listed statuses advance the failure threshold; unlisted final
+statuses are neutral and preserve both streaks and readiness. The singleton
+`status` must then be 200–599. Informational responses other than 101 are
+consumed under the existing probe deadline; 101 is a failure. Omission retains
+the legacy unexpected-status failure behavior. TCP forbids this field.

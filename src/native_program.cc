@@ -596,8 +596,9 @@ bool load_native_program(const char* source,
               !active_health_host_valid({target.hc_host, target.hc_host_len}) ||
               target.hc_type == ActiveHealthType::Tcp)))
             return fail("invalid native upstream health host");
-        if (!target.hc_healthy_statuses.valid() ||
-            (!target.hc_enabled && !target.hc_healthy_statuses.empty()))
+        if (!target.hc_healthy_statuses.valid() || !target.hc_unhealthy_statuses.valid() ||
+            (!target.hc_enabled &&
+             (!target.hc_healthy_statuses.empty() || !target.hc_unhealthy_statuses.empty())))
             return fail("invalid native upstream health statuses");
         if (target.hc_require_initial_success > 1 ||
             (target.hc_require_initial_success && !target.hc_enabled))
@@ -620,7 +621,8 @@ bool load_native_program(const char* source,
                                                              target.hc_healthy_statuses,
                                                              target.hc_unhealthy_interval_ms,
                                                              target.passive_health.enabled,
-                                                             target.hc_require_initial_success) ||
+                                                             target.hc_require_initial_success,
+                                                             target.hc_unhealthy_statuses) ||
                                   (target.http2 && target.hc_type != ActiveHealthType::Tcp)))
             return fail("invalid native upstream health check");
     }

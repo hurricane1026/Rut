@@ -619,7 +619,8 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
                                    target.hc_healthy_statuses,
                                    target.hc_unhealthy_interval_ms,
                                    target.passive_health.enabled,
-                                   target.hc_require_initial_success) ||
+                                   target.hc_require_initial_success,
+                                   target.hc_unhealthy_statuses) ||
         (target.http2 && target.hc_type != ActiveHealthType::Tcp))
         return false;
 
@@ -790,13 +791,30 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     }
     HttpResponseParser parser;
     ParsedResponse resp;
-    resp.reset();
-    parser.reset();
-    const ParseStatus kStatus =
-        parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+    ParseStatus status;
+    for (;;) {
+        resp.reset();
+        parser.reset();
+        status = parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+        const auto* target = current_probe_target(loop, conn);
+        if (!target || target->hc_unhealthy_statuses.empty() || status != ParseStatus::Complete ||
+            resp.status_code >= 200 || resp.status_code == 101)
+            break;
+        const u32 remaining = static_cast<u32>(static_cast<i64>(conn.upstream_recv_buf.len()) -
+                                               static_cast<i64>(parser.header_end));
+        const u8* src = conn.upstream_recv_buf.data() + parser.header_end;
+        conn.upstream_recv_buf.reset();
+        __builtin_memmove(conn.upstream_recv_buf.write_ptr(), src, remaining);
+        conn.upstream_recv_buf.commit(remaining);
+        if (remaining == 0) {
+            if (ev.result <= 0) break;
+            if (!loop->submit_recv_upstream(conn)) free_probe_conn(loop, conn);
+            return;
+        }
+    }
     // Headers split across packets: keep reading while bytes arrive and buffer space
     // remains. The probe's upstream_timeout bounds stalled/trickling responses.
-    if (kStatus == ParseStatus::Incomplete && ev.result > 0 &&
+    if (status == ParseStatus::Incomplete && ev.result > 0 &&
         conn.upstream_recv_buf.write_avail() > 0) {
         if (!loop->submit_recv_upstream(conn)) {
             free_probe_conn(loop, conn);
@@ -808,11 +826,13 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     // comparison — after a swap the response is meaningless, so free without
     // recording (the stale result must not touch the new backend at this index).
     if (const auto* target = current_probe_target(loop, conn)) {
-        const bool kHealthy = kStatus == ParseStatus::Complete &&
+        const bool kHealthy = status == ParseStatus::Complete &&
                               (target->hc_healthy_statuses.empty()
                                    ? resp.status_code == target->hc_expected_status
                                    : target->hc_healthy_statuses.contains(resp.status_code));
-        record_probe_if_current(loop, conn, kHealthy, kNowUs);
+        if (status != ParseStatus::Complete || kHealthy || target->hc_unhealthy_statuses.empty() ||
+            resp.status_code < 200 || target->hc_unhealthy_statuses.contains(resp.status_code))
+            record_probe_if_current(loop, conn, kHealthy, kNowUs);
     }
     free_probe_conn(loop, conn);
 }

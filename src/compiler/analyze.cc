@@ -22974,6 +22974,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_concurrency = item.upstream.hc_concurrency;
         up.hc_expected_status = item.upstream.hc_expected_status;
         up.hc_healthy_statuses = item.upstream.hc_healthy_statuses;
+        up.hc_unhealthy_statuses = item.upstream.hc_unhealthy_statuses;
         up.hc_thresholds = item.upstream.hc_thresholds;
         up.passive_health = item.upstream.passive_health;
         up.hc_require_initial_success = item.upstream.hc_require_initial_success;
