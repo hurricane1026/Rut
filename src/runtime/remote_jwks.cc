@@ -443,28 +443,29 @@ u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
 
 namespace {
 u16 read16(const u8* data) {
-    return static_cast<u16>((data[0] << 8) | data[1]);
+    return (range_int{data[0]}.scaled_by<256>() + range_int{data[1]}).to<u16>();
 }
 Str ctext(const char* text) {
     return {text, static_cast<u32>(strlen(text))};
 }
 // Only previously decoded label boundaries are legal compression targets. This
 // cold JWKS profile intentionally rejects arbitrary DNS packet offsets.
-bool jwks_dns_name(
-    const u8* packet, u32 length, u32& offset, bool (&known)[512], char (&out)[254]) {
-    u32 at = offset, used = 0, jumps = 0;
-    bool jumped = false;
+[[nodiscard]] bool jwks_dns_name(
+    const u8* packet, u32 length, u32* offset, bool (&known)[512], char (&out)[254]) {
+    const auto wire_size = range_int{length};
+    u32 at = *offset, used = 0, jumps = 0, compressed_end = 0;
+    auto* output = reinterpret_cast<u8*>(out);
     for (u32 labels = 0; labels < 128; ++labels) {
         if (at >= length) return false;
         const u32 start = at;
-        const u8 count = packet[at++];
+        const u32 count = range_int{packet[at++]}.to<u32>();
         if ((count & 0xc0) == 0xc0) {
             if (at >= length || ++jumps > 16) return false;
-            const u32 target = ((count & 63u) << 8) | packet[at++];
+            const auto high = bounded_remainder<64>(count).scaled_by<256>();
+            const u32 target = (high + range_int{packet[at++]}).to<u32>();
             if (target < 12 || target >= start || !known[target]) return false;
             known[start] = true;
-            if (!jumped) offset = at;
-            jumped = true;
+            if (compressed_end == 0) compressed_end = at;
             at = target;
             continue;
         }
@@ -472,26 +473,68 @@ bool jwks_dns_name(
         if (!count) {
             if (!used) return false;
             known[start] = true;
-            if (!jumped) offset = at;
-            out[used] = 0;
+            *offset = compressed_end == 0 ? at : compressed_end;
+            output[used] = 0;
             return true;
         }
-        if (static_cast<i64>(at) + static_cast<i64>(count) > static_cast<i64>(length) ||
-            static_cast<i64>(used) + static_cast<i64>(count) + (used ? 1 : 0) > 253 ||
-            packet[at] == '-' || packet[static_cast<i64>(at) + static_cast<i64>(count) - 1] == '-')
+        const auto label_size = range_int{count};
+        const auto last = range_int{at} + range_int{count - 1};
+        const auto expanded_size = range_int{used} + label_size + range_int{u8{used != 0}};
+        if (last.value() >= wire_size.value() || expanded_size.value() >= sizeof(out) ||
+            packet[at] == '-' || packet[last.index()] == '-')
             return false;
-        if (used) out[used++] = '.';
+        if (used) output[used++] = '.';
         for (u32 i = 0; i < count; ++i) {
-            const u8 byte = packet[i64{at++}];
-            const char value =
-                static_cast<char>(byte >= 'A' && byte <= 'Z' ? static_cast<i64>(byte) + 32 : byte);
+            const u8 byte = packet[at++];
+            using Uppercase = range_int<'A', 'Z' + 1>;
+            Uppercase upper;
+            const u8 value = Uppercase::try_from_u64(byte, &upper)
+                                 ? (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>()
+                                 : byte;
             if ((value < 'a' || value > 'z') && (value < '0' || value > '9') && value != '-')
                 return false;
-            out[used++] = value;
+            output[used++] = value;
         }
         known[start] = true;
     }
     return false;
+}
+enum class DnsTransfer { Blocked, Partial, Complete, Error };
+
+template <bool Write, typename Byte, size_t Capacity>
+[[nodiscard]] DnsTransfer dns_transfer(
+    int fd, SSL* ssl, Byte (&buffer)[Capacity], u32 target, u32* offset) {
+    using Count = range_int<0, Capacity + 1>;
+    Count limit, remaining;
+    const auto cursor = range_int{*offset};
+    if (!Count::try_from_u64(target, &limit) ||
+        !limit.try_count((limit - cursor).value(), &remaining) || remaining.value() == 0)
+        return DnsTransfer::Error;
+    Byte* const data = buffer + cursor.index();
+    i64 transferred;
+    if (ssl) {
+        ERR_clear_error();
+        const int n = Write ? SSL_write(ssl, data, remaining.template to<i32>())
+                            : SSL_read(ssl, data, remaining.template to<i32>());
+        if (n <= 0) {
+            const int error = SSL_get_error(ssl, n);
+            return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE
+                       ? DnsTransfer::Blocked
+                       : DnsTransfer::Error;
+        }
+        transferred = range_int{n}.to<i64>();
+    } else {
+        transferred = Write ? ::send(fd, data, remaining.to_u64(), platform::kSendFlags)
+                            : ::recv(fd, data, remaining.to_u64(), 0);
+        if (transferred < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            return DnsTransfer::Blocked;
+    }
+    Count bytes, end;
+    if (transferred <= 0 || !remaining.try_count(transferred, &bytes) ||
+        !limit.try_count((cursor + bytes).value(), &end))
+        return DnsTransfer::Error;
+    *offset = end.template to<u32>();
+    return end.value() == limit.value() ? DnsTransfer::Complete : DnsTransfer::Partial;
 }
 }  // namespace
 
@@ -544,27 +587,25 @@ bool jwks_dns_answer(Str packet,
     const auto* bytes = reinterpret_cast<const u8*>(packet.ptr);
     if (memcmp(packet.ptr, query.ptr, 2) != 0 || (read16(bytes + 2) & 0xfa4f) != 0x8000 ||
         read16(bytes + 4) != 1 || read16(bytes + 8) || read16(bytes + 10) ||
-        memcmp(packet.ptr + 12,
-               query.ptr + 12,
-               static_cast<u32>(static_cast<i64>(query.len) - 12)) != 0)
+        memcmp(packet.ptr + 12, query.ptr + 12, query.len - 12) != 0)
         return false;
     const u32 answers = read16(bytes + 6);
     constexpr u32 kMaxAnswers = 8;
     if (!answers || answers > kMaxAnswers ||
         configuration.allowed_count > RemoteJwks::kMaxDnsAddresses)
         return false;
-    const u16 kRecordType = read16(bytes + i64{query.len} - 4);
+    const u16 kRecordType = read16(bytes + range_int{query.len - 4}.index());
     if (kRecordType != 1 && kRecordType != 28) return false;
     const bool kAaaa = kRecordType == 28;
     if (!configuration.dns_dual_stack && kAaaa != configuration.dns_aaaa) return false;
     bool boundaries[512]{};
     char current[254]{};
     u32 question_end = 12;
-    if (!jwks_dns_name(bytes, packet.len, question_end, boundaries, current) ||
-        i64{question_end} + 4 != i64{query.len} ||
-        read16(bytes + i64{question_end}) != kRecordType ||
-        read16(bytes + i64{question_end} + 2) != 1)
+    if (!jwks_dns_name(bytes, packet.len, &question_end, boundaries, current) ||
+        question_end != query.len - 4)
         return false;
+    const u8* question_tail = bytes + range_int{question_end}.index();
+    if (read16(question_tail) != kRecordType || read16(question_tail + 2) != 1) return false;
     struct Record {
         char owner[254]{};
         char target[254]{};
@@ -575,35 +616,41 @@ bool jwks_dns_answer(Str packet,
     Record records[kMaxAnswers]{};
     u32 offset = query.len;
     u32 min_ttl = ~u32{0};
+    const auto wire_size = range_int{packet.len};
     for (u32 i = 0; i < answers; ++i) {
         auto& record = records[i];
-        if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.owner) ||
-            i64{packet.len} - i64{offset} < 10)
+        if (!jwks_dns_name(bytes, packet.len, &offset, boundaries, record.owner)) return false;
+        const auto cursor = range_int{offset};
+        auto record_data = cursor;
+        if (!wire_size.try_count((cursor + range_int<10, 11>{}).value(), &record_data))
             return false;
-        record.type = read16(bytes + i64{offset});
+        const u8* fields = bytes + cursor.index();
+        record.type = read16(fields);
         const u32 ttl =
-            (u32{read16(bytes + i64{offset} + 4)} << 16) | read16(bytes + i64{offset} + 6);
-        const u32 size = read16(bytes + i64{offset} + 8);
-        if (read16(bytes + i64{offset} + 2) != 1 || !ttl || (ttl & 0x80000000u)) return false;
+            (range_int{read16(fields + 4)}.scaled_by<65536>() + range_int{read16(fields + 6)})
+                .to<u32>();
+        const u32 size = read16(fields + 8);
+        if (read16(fields + 2) != 1 || !ttl || (ttl & 0x80000000u)) return false;
         if (ttl < min_ttl) min_ttl = ttl;
-        offset = static_cast<u32>(static_cast<i64>(offset) + 10);
-        if (i64{size} > i64{packet.len} - i64{offset}) return false;
-        const u32 end = static_cast<u32>(static_cast<i64>(offset) + static_cast<i64>(size));
+        offset = record_data.to<u32>();
+        auto end = record_data;
+        if (!wire_size.try_count((record_data + range_int{size}).value(), &end)) return false;
         if (record.type == 5) {
-            if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.target) ||
-                offset != end)
+            if (!jwks_dns_name(bytes, packet.len, &offset, boundaries, record.target) ||
+                offset != end.value())
                 return false;
         } else if (record.type == kRecordType) {
             const u32 expected_size = kAaaa ? 16 : 4;
             const int family = kAaaa ? AF_INET6 : AF_INET;
             if (size != expected_size ||
-                !inet_ntop(family, bytes + i64{offset}, record.address, sizeof(record.address)))
+                !inet_ntop(
+                    family, bytes + record_data.index(), record.address, sizeof(record.address)))
                 return false;
             bool allowed = false;
             for (u32 n = 0; n < configuration.allowed_count; ++n)
                 allowed |= ctext(record.address).eq(ctext(configuration.allowed_addresses[n]));
             if (!allowed) return false;
-            offset = end;
+            offset = end.to<u32>();
         } else {
             return false;
         }
@@ -812,18 +859,25 @@ bool JwksFetch::start(u64 now,
     query_[5] = 1;
     query_length_ = 12;
     const char* host = configuration_.endpoint.tls.server_name;
+    using QueryLength = range_int<0, sizeof(query_) + 1>;
     u32 begin = 0;
     for (u32 end = 0;; ++end) {
         if (host[end] && host[end] != '.') continue;
-        const u32 length = static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(begin));
-        if (!length || length > 63 || i64{query_length_} + i64{length} + 6 > i64{sizeof(query_)})
+        using LabelLength = range_int<1, 64>;
+        LabelLength label;
+        QueryLength next;
+        const auto cursor = range_int{query_length_};
+        const auto label_start = cursor + range_int<1, 2>{};
+        if (!LabelLength::try_from_i64((range_int{end} - range_int{begin}).value(), &label) ||
+            !QueryLength::try_from_i64((label_start + label).value(), &next) ||
+            (next + range_int<5, 6>{}).value() > sizeof(query_))
             return fail();
-        query_[query_length_++] = static_cast<u8>(length);
-        __builtin_memcpy(query_ + i64{query_length_}, host + i64{begin}, length);
-        query_length_ =
-            static_cast<u32>(static_cast<i64>(query_length_) + static_cast<i64>(length));
+        query_[cursor.index()] = label.to<u8>();
+        __builtin_memcpy(
+            query_ + label_start.index(), host + range_int{begin}.index(), label.to_u64());
+        query_length_ = next.to<u32>();
         if (!host[end]) break;
-        begin = static_cast<u32>(static_cast<i64>(end) + 1);
+        begin = end + 1;
     }
     query_[query_length_++] = 0;
     query_[query_length_++] = 0;
@@ -850,7 +904,10 @@ bool JwksFetch::begin_dns_tls() {
     return true;
 }
 bool JwksFetch::send_dns_query(bool aaaa, u64 now) {
-    query_[i64{query_length_} - 3] = aaaa ? 28 : 1;
+    using QueryLength = range_int<17, sizeof(query_) + 1>;
+    QueryLength query_size;
+    if (!QueryLength::try_from_u64(query_length_, &query_size)) return fail();
+    query_[(query_size - range_int<3, 4>{}).index()] = aaaa ? 28 : 1;
     if (dns_https_) {
         const Str kQuery{reinterpret_cast<const char*>(query_), query_length_};
         if (!dns_https_->set_dns_query(kQuery) || !dns_https_->start(now, timeout_)) return fail();
@@ -874,12 +931,13 @@ bool JwksFetch::send_dns_query(bool aaaa, u64 now) {
     if (dns_fd_ < 0) return fail();
     const int kConnected = ::connect(dns_fd_, reinterpret_cast<const sockaddr*>(&resolver), length);
     if (kConnected != 0 && errno != EINPROGRESS) return fail();
-    const i64 kOutLength = i64{query_length_} + 2;
-    if (kOutLength > i64{sizeof(dns_out_)}) return fail();
-    dns_out_len_ = static_cast<u32>(kOutLength);
-    dns_out_[0] = static_cast<char>(query_length_ >> 8);
-    dns_out_[1] = static_cast<char>(query_length_ & 0xff);
-    __builtin_memcpy(dns_out_ + 2, query_, query_length_);
+    const auto out_length = query_size + range_int<2, 3>{};
+    static_assert(sizeof(query_) + 2 == sizeof(dns_out_));
+    dns_out_len_ = out_length.to<u32>();
+    auto* frame = reinterpret_cast<u8*>(dns_out_);
+    frame[0] = query_size.divided_by<256>().to<u8>();
+    frame[1] = bounded_remainder<256>(query_size.to_u64()).to<u8>();
+    __builtin_memcpy(frame + 2, query_, query_size.to_u64());
     dns_out_sent_ = 0;
     if (kConnected != 0) {
         dns_step_ = DnsStep::Connect;
@@ -938,99 +996,31 @@ bool JwksFetch::advance_dns_stream(u64 now) {
             continue;
         }
         if (dns_step_ == DnsStep::Write) {
-            const i64 kRemaining = i64{dns_out_len_} - i64{dns_out_sent_};
-            if (kRemaining <= 0) return false;
-            ssize_t sent = 0;
-            if (dns_ssl_) {
-                ERR_clear_error();
-                const int kResult = SSL_write(dns_ssl_,
-                                              dns_out_ + static_cast<i64>(dns_out_sent_),
-                                              static_cast<int>(kRemaining));
-                if (kResult <= 0) {
-                    const int kError = SSL_get_error(dns_ssl_, kResult);
-                    if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE)
-                        return true;
-                    return false;
-                }
-                sent = kResult;
-            } else {
-                sent = ::send(dns_fd_,
-                              dns_out_ + i64{dns_out_sent_},
-                              static_cast<size_t>(kRemaining),
-                              platform::kSendFlags);
-                if (sent < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
-                    return false;
-                }
-            }
-            if (sent == 0) return false;
-            dns_out_sent_ = static_cast<u32>(static_cast<i64>(dns_out_sent_) + sent);
-            if (dns_out_sent_ == dns_out_len_) dns_step_ = DnsStep::ReadLength;
+            const auto status =
+                dns_transfer<true>(dns_fd_, dns_ssl_, dns_out_, dns_out_len_, &dns_out_sent_);
+            if (status == DnsTransfer::Error) return false;
+            if (status == DnsTransfer::Blocked) return true;
+            if (status == DnsTransfer::Complete) dns_step_ = DnsStep::ReadLength;
             continue;
         }
         if (dns_step_ == DnsStep::ReadLength) {
-            const i64 kRemaining = i64{2} - i64{dns_length_have_};
-            if (kRemaining <= 0) return false;
-            ssize_t received = 0;
-            if (dns_ssl_) {
-                ERR_clear_error();
-                const int kResult = SSL_read(dns_ssl_,
-                                             dns_length_ + static_cast<i64>(dns_length_have_),
-                                             static_cast<int>(kRemaining));
-                if (kResult <= 0) {
-                    const int kError = SSL_get_error(dns_ssl_, kResult);
-                    if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE)
-                        return true;
-                    return false;
-                }
-                received = kResult;
-            } else {
-                received = ::recv(dns_fd_,
-                                  dns_length_ + i64{dns_length_have_},
-                                  static_cast<size_t>(kRemaining),
-                                  0);
-                if (received < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
-                    return false;
-                }
-            }
-            if (received == 0) return false;
-            dns_length_have_ = static_cast<u32>(static_cast<i64>(dns_length_have_) + received);
-            if (dns_length_have_ != 2) continue;
-            const u32 kExpected =
-                (static_cast<u32>(dns_length_[0]) << 8) | static_cast<u32>(dns_length_[1]);
-            if (kExpected < 12 || kExpected > sizeof(dns_in_)) return false;
-            dns_in_expected_ = kExpected;
+            const auto status = dns_transfer<false>(
+                dns_fd_, dns_ssl_, dns_length_, sizeof(dns_length_), &dns_length_have_);
+            if (status == DnsTransfer::Error) return false;
+            if (status == DnsTransfer::Blocked) return true;
+            if (status == DnsTransfer::Partial) continue;
+            const u32 expected = range_int{read16(dns_length_)}.to<u32>();
+            if (expected < 12 || expected > sizeof(dns_in_)) return false;
+            dns_in_expected_ = expected;
             dns_in_len_ = 0;
             dns_step_ = DnsStep::ReadBody;
             continue;
         }
-        const i64 kRemaining = i64{dns_in_expected_} - i64{dns_in_len_};
-        if (kRemaining <= 0) return false;
-        ssize_t received = 0;
-        if (dns_ssl_) {
-            ERR_clear_error();
-            const int kResult = SSL_read(
-                dns_ssl_, dns_in_ + static_cast<i64>(dns_in_len_), static_cast<int>(kRemaining));
-            if (kResult <= 0) {
-                const int kError = SSL_get_error(dns_ssl_, kResult);
-                if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE) return true;
-                return false;
-            }
-            received = kResult;
-        } else {
-            received = ::recv(dns_fd_,
-                              dns_in_ + static_cast<i64>(dns_in_len_),
-                              static_cast<size_t>(kRemaining),
-                              0);
-            if (received < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
-                return false;
-            }
-        }
-        if (received == 0) return false;
-        dns_in_len_ = static_cast<u32>(static_cast<i64>(dns_in_len_) + received);
-        if (dns_in_len_ != dns_in_expected_) continue;
+        const auto status =
+            dns_transfer<false>(dns_fd_, dns_ssl_, dns_in_, dns_in_expected_, &dns_in_len_);
+        if (status == DnsTransfer::Error) return false;
+        if (status == DnsTransfer::Blocked) return true;
+        if (status == DnsTransfer::Partial) continue;
         JwksDnsAddresses result;
         if (!jwks_dns_answer({dns_in_, dns_in_len_},
                              {reinterpret_cast<const char*>(query_), query_length_},
@@ -1057,24 +1047,34 @@ bool JwksFetch::advance_dns_https(u64 now) {
         const auto& header = response.headers[i];
         if (!http_header_name_eq_ci(header.name.ptr, header.name.len, "Age", 3)) continue;
         if (seen_age || !header.value.len || header.value.len > 10) return false;
-        i64 age = 0;
+        u32 age = 0;
         for (u32 j = 0; j < header.value.len; ++j) {
-            const char digit = header.value.ptr[j];
-            if (digit < '0' || digit > '9') return false;
-            age = age * 10 + i64{digit - '0'};
+            using Digit = range_int<0, 10>;
+            Digit digit;
+            const auto byte = range_int{byte_value(header.value.ptr[j])};
+            if (!Digit::try_from_i64((byte - range_int<'0', '0' + 1>{}).value(), &digit) ||
+                !(range_int{age}.scaled_by<10>() + digit).to(&age))
+                return false;
         }
         if (age && age >= result.ttl_seconds) return false;
-        result.ttl_seconds = static_cast<u32>(static_cast<i64>(result.ttl_seconds) - age);
+        if (!(range_int{result.ttl_seconds} - range_int{age}).to(&result.ttl_seconds)) return false;
         seen_age = true;
     }
     return accept_dns_result(result, now);
 }
 bool JwksFetch::accept_dns_result(const JwksDnsAddresses& result, u64 now) {
-    if (configuration_.dns_dual_stack && query_[i64{query_length_} - 3] == 28) {
-        addresses_ = result;
-        return send_dns_query(false, now);
+    if (configuration_.dns_dual_stack) {
+        using QueryLength = range_int<17, sizeof(query_) + 1>;
+        QueryLength query_size;
+        if (!QueryLength::try_from_u64(query_length_, &query_size)) return false;
+        if (query_[(query_size - range_int<3, 4>{}).index()] == 28) {
+            addresses_ = result;
+            return send_dns_query(false, now);
+        }
     }
-    if (i64{result.count} > i64{RemoteJwks::kMaxDnsAddresses} - i64{addresses_.count}) return false;
+    if ((range_int{addresses_.count} + range_int{result.count}).value() >
+        RemoteJwks::kMaxDnsAddresses)
+        return false;
     if (!addresses_.count || result.ttl_seconds < addresses_.ttl_seconds)
         addresses_.ttl_seconds = result.ttl_seconds;
     for (u32 i = 0; i < result.count; ++i)
