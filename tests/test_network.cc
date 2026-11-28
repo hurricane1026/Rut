@@ -15969,6 +15969,11 @@ TEST(tls_iouring, proxy_stream_defers_raced_cqe_while_tail_parked) {
 
 struct ParkedTlsCounterLoop : SmallLoop {
     static constexpr u32 kTlsOutHigh = UINT32_MAX;
+    i64 sent_at_close = 0;
+    void close_conn(Connection& conn) {
+        sent_at_close = conn.resp_body_sent;
+        SmallLoop::close_conn(conn);
+    }
 };
 
 TEST(tls_iouring, parked_tail_accounting_rejects_signed_overflow) {
@@ -15984,7 +15989,7 @@ TEST(tls_iouring, parked_tail_accounting_rejects_signed_overflow) {
     conn->tls_send_src = &parked;
     proxy_tls_parked_drained<ParkedTlsCounterLoop>(&loop, *conn, 1);
     CHECK_EQ(loop.conns[conn->id].fd, -1);
-    CHECK_EQ(conn->resp_body_sent, i64{INT64_MAX});
+    CHECK_EQ(loop.sent_at_close, i64{INT64_MAX});
 }
 
 // Round-4 race fix #C (cross-request half): proxy_stream_complete must clear
