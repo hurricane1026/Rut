@@ -31,6 +31,7 @@ struct UpstreamConn {
     u8 backend_idx = 0;      // which backend endpoint of the upstream this connects to
     bool idle = false;       // true = parked, available for reuse
     bool allocated = false;  // true = slot in use
+    i32 completed_requests = 0;
     // Seconds in legacy mode; microseconds when an explicit positive timeout is set.
     u64 parked_time = 0;
 };
@@ -46,6 +47,7 @@ struct UpstreamPool {
     bool idle_timeout_configured = false;
     u32 idle_timeout_sec = 0;
     u32 endpoint_capacity = kMaxConns;
+    i32 max_requests = 0;
     u16 endpoint_counts[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     // Parked slots form an intrusive list, most recently parked first, so
     // take_idle() and sweep() visit only idle entries instead of every slot.
@@ -71,17 +73,26 @@ struct UpstreamPool {
     // Park a connected, idle upstream fd for reuse by a later request to the same
     // (upstream_id, backend_idx) endpoint. Returns false when the endpoint quota
     // or pool is full, reuse is disabled, or the key is invalid. The caller must
-    // close a rejected fd. The fd must have no I/O armed on it.
-    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec) {
+    // close a rejected fd. The fd must have no I/O armed on it. `completed`
+    // counts earlier clean requests on this socket, before the current response.
+    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, i32 completed = 0) {
         return put_idle_at(fd,
                            upstream_id,
                            backend_idx,
                            now_sec,
-                           idle_timeout_configured && idle_timeout_sec ? clock_us() : 0);
+                           idle_timeout_configured && idle_timeout_sec ? clock_us() : 0,
+                           completed);
     }
 
-    bool put_idle_at(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u64 now_us) {
+    bool put_idle_at(
+        i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u64 now_us, i32 completed = 0) {
         u32 idx;
+        // The active socket has completed one more clean request at this boundary.
+        i32 completed_after = 0;
+        if (completed < 0 || max_requests < 0 ||
+            (max_requests && (__builtin_add_overflow(completed, 1, &completed_after) ||
+                              completed_after >= max_requests)))
+            return false;
         if (fd < 0 || upstream_id >= RouteConfig::kMaxUpstreams ||
             backend_idx >= UpstreamTarget::kMaxBackends ||
             endpoint_counts[upstream_id][backend_idx] >= endpoint_capacity || !pop_free_slot(idx))
@@ -92,6 +103,7 @@ struct UpstreamPool {
                       backend_idx,
                       /*idle=*/true,
                       /*allocated=*/true,
+                      completed_after,
                       idle_timeout_configured && idle_timeout_sec ? now_us : now_sec};
         link_idle(idx);
         idle_count.fetch_add(1, std::memory_order_release);
@@ -138,13 +150,15 @@ struct UpstreamPool {
     // catches the common idle-timeout race before any request bytes are sent; the
     // residual probe-vs-send race is handled by the caller's idempotent resend.
     // Candidates are tried most recently parked first (the likeliest to be live).
-    i32 take_idle(u16 upstream_id, u8 backend_idx) {
+    i32 take_idle(u16 upstream_id, u8 backend_idx, i32* completed = nullptr) {
         if (idle_count.load(std::memory_order_acquire) == 0) return -1;
-        return take_idle_at(
-            upstream_id, backend_idx, idle_timeout_configured && idle_timeout_sec ? clock_us() : 0);
+        return take_idle_at(upstream_id,
+                            backend_idx,
+                            idle_timeout_configured && idle_timeout_sec ? clock_us() : 0,
+                            completed);
     }
 
-    i32 take_idle_at(u16 upstream_id, u8 backend_idx, u64 now_us) {
+    i32 take_idle_at(u16 upstream_id, u8 backend_idx, u64 now_us, i32* completed = nullptr) {
         for (u32 i = idle_head; i != kNoSlot;) {
             const u32 next = idle_next[i];
             const UpstreamConn& c = conns[i];
@@ -153,6 +167,7 @@ struct UpstreamPool {
                 continue;
             }
             const i32 fd = c.fd;
+            const i32 prior_completed = c.completed_requests;
             u64 idle_us = 0;
             const bool expired = idle_timeout_configured && idle_timeout_sec != 0 &&
                                  !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
@@ -165,7 +180,10 @@ struct UpstreamPool {
             }
             char probe;
             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (completed) *completed = prior_completed;
+                return fd;
+            }
             ::close(fd);  // EOF / unexpected data / hard error → not reusable
             i = next;
         }

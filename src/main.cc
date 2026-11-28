@@ -400,6 +400,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    bool upstream_idle_timeout_set,
                                    u32 upstream_idle_timeout,
                                    u32 upstream_pool_capacity,
+                                   i32 upstream_max_requests,
                                    TlsServerContext* tls_server,
                                    bool allow_io_uring_fallback,
                                    const char* access_log_path,
@@ -462,6 +463,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         if (rc) {
             shards[i].upstream->idle_timeout_configured = upstream_idle_timeout_set;
             shards[i].upstream->idle_timeout_sec = upstream_idle_timeout;
+            shards[i].upstream->max_requests = upstream_max_requests;
         }
         if (!rc) {
             write_str("Failed to init shard ");
@@ -1001,6 +1003,8 @@ int main(int argc, char** argv) {
     u32 upstream_idle_timeout = 0;
     u32 upstream_pool_capacity = UpstreamPool::kMaxConns;
     bool upstream_pool_capacity_specified = false;
+    i32 upstream_max_requests = 0;
+    bool upstream_max_requests_specified = false;
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
     const char* tls_client_ca_path = nullptr;
@@ -1051,6 +1055,26 @@ int main(int argc, char** argv) {
     //   /metrics?…) is served by the built-in endpoint ahead of route matching,
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "--upstream-keepalive-max-requests")) {
+            if (upstream_max_requests_specified || i + 1 >= argc || !is_all_digits(argv[i + 1])) {
+                write_str(
+                    "--upstream-keepalive-max-requests requires one integer from 0 to "
+                    "2147483647\n");
+                return 1;
+            }
+            i32 value = 0;
+            for (const char* p = argv[++i]; *p; ++p) {
+                const i32 digit = static_cast<i32>(*p - '0');
+                if (value > (2147483647 - digit) / 10) {
+                    write_str("--upstream-keepalive-max-requests must be at most 2147483647\n");
+                    return 1;
+                }
+                value = value * 10 + digit;
+            }
+            upstream_max_requests = value;
+            upstream_max_requests_specified = true;
+            continue;
+        }
         if (str_eq(argv[i], "--upstream-keepalive-idle-timeout")) {
             if (upstream_idle_timeout_set || i + 1 >= argc || !is_all_digits(argv[i + 1])) {
                 write_str(
@@ -1702,6 +1726,7 @@ int main(int argc, char** argv) {
                                           upstream_idle_timeout_set,
                                           upstream_idle_timeout,
                                           upstream_pool_capacity,
+                                          upstream_max_requests,
                                           tls_server,
                                           false,
                                           access_log_path,
@@ -1739,6 +1764,7 @@ int main(int argc, char** argv) {
             upstream_idle_timeout_set,
             upstream_idle_timeout,
             upstream_pool_capacity,
+            upstream_max_requests,
             tls_server,
             tls_server != nullptr && backend_selection == BackendSelection::Auto,
             access_log_path,
@@ -1764,6 +1790,7 @@ int main(int argc, char** argv) {
                                                  upstream_idle_timeout_set,
                                                  upstream_idle_timeout,
                                                  upstream_pool_capacity,
+                                                 upstream_max_requests,
                                                  tls_server,
                                                  false,
                                                  access_log_path,
@@ -1789,6 +1816,7 @@ int main(int argc, char** argv) {
                                              upstream_idle_timeout_set,
                                              upstream_idle_timeout,
                                              upstream_pool_capacity,
+                                             upstream_max_requests,
                                              tls_server,
                                              false,
                                              access_log_path,

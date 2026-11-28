@@ -190,6 +190,7 @@ gracefully before exiting.
 | `--pool-prealloc N` | Pre-commit N buffer slices per shard | `0` (lazy) |
 | `--max-connections-per-shard N` | Maximum connection slots allocated by each shard (Linux; macOS accepts only the default) | `16384` |
 | `--upstream-keepalive-idle-timeout N` | Idle lifetime in seconds for pooled plaintext HTTP/1 upstream connections; `0` disables expiry | downstream keepalive timeout (60 seconds by default) |
+| `--upstream-keepalive-max-requests N` | Maximum clean completed requests per pooled plaintext HTTP/1 upstream socket; `0` means unlimited | `0` |
 | `--upstream-keepalive-pool-size N` | Maximum idle plaintext HTTP/1 upstream connections per backend, per shard (0 disables reuse; total per shard remains capped at 4096) | `4096` |
 | `--tls-cert PATH` | TLS certificate (PEM); enables TLS | off |
 | `--tls-key PATH` | TLS private key (PEM); required with `--tls-cert` | off |
@@ -211,6 +212,10 @@ server uses the epoll backend.
 integers from 0 through 2147483647. Idle sockets are checked on reuse and by a
 periodic sweep, so unused sockets may remain open for up to one additional tick.
 This setting applies to plaintext HTTP/1 upstream sockets.
+
+`--upstream-keepalive-max-requests` is a startup-only decimal value from 0 to
+2147483647. A socket is closed after its Nth clean completed request when N
+is positive. Omission and 0 leave the request count unlimited.
 
 `--upstream-keepalive-pool-size` is a startup-only decimal value from 0 to 4096. Each shard applies the limit separately to each upstream and backend pair. When the limit or the shared 4096-slot shard pool is full, completed upstream connections are closed.
 

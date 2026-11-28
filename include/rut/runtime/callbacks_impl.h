@@ -2868,6 +2868,7 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     const i32 fd = UpstreamPool::create_socket();
     if (fd < 0) return false;
     conn.upstream_fd = fd;
+    conn.upstream_completed_requests = 0;
     conn.upstream_start_us = monotonic_us();
     // This is recovery from a dead pooled transport, not endpoint failover:
     // reconnect to the endpoint whose idle socket died. Keep its attempted bit

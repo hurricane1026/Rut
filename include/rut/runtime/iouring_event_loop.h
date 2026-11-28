@@ -2970,10 +2970,12 @@ public:
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
         if (!upstream || (c.request_config && c.request_config->upstreams[upstream_id].tls.enabled))
             return false;
-        const i32 fd = upstream->take_idle(upstream_id, backend_idx);
+        i32 completed = 0;
+        const i32 fd = upstream->take_idle(upstream_id, backend_idx, &completed);
         if (fd < 0) return false;
         c.reset_passive_health_observations();
         c.upstream_fd = fd;
+        c.upstream_completed_requests = completed;
         return true;
     }
 
@@ -3044,7 +3046,9 @@ public:
             const i32 fd = c.upstream_fd;
             c.upstream_fd = -1;
             c.upstream_send_armed = false;
-            if (!upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs())) ::close(fd);
+            if (!upstream->put_idle(
+                    fd, upstream_id, backend_idx, monotonic_secs(), c.upstream_completed_requests))
+                ::close(fd);
             return;
         }
         // The recv being drained belongs to the just-completed upstream fd, not to
@@ -3063,6 +3067,7 @@ public:
             return;
         }
         c.idle_return_fd = c.upstream_fd;
+        c.idle_return_completed_requests = c.upstream_completed_requests;
         c.idle_return_uid = upstream_id;
         c.idle_return_bidx = backend_idx;
         // Pin the config this fd is parked under. If a reload swaps it before the
@@ -6367,7 +6372,11 @@ public:
         const i32 pending =
             reusable ? static_cast<i32>(::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)) : 0;
         if (!reusable || pending >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK) ||
-            !upstream->put_idle(fd, c.upstream_idx, c.upstream_backend_idx, monotonic_secs()))
+            !upstream->put_idle(fd,
+                                c.upstream_idx,
+                                c.upstream_backend_idx,
+                                monotonic_secs(),
+                                c.upstream_completed_requests))
             ::close(fd);
     }
 
@@ -7601,6 +7610,8 @@ public:
                                           !c.upstream_recv_armed;
         if (c.idle_return_fd >= 0 && kUpstreamRecvDrained) {
             const i32 fd = c.idle_return_fd;
+            const i32 completed = c.idle_return_completed_requests;
+            c.idle_return_completed_requests = 0;
             c.idle_return_fd = -1;
             // The pin is consumed with the fd: left set, the connection would look
             // non-neutral to every later request (successor-neutrality predicates).
@@ -7621,7 +7632,8 @@ public:
             if (kStaleBytes) c.upstream_recv_buf.reset();
             c.upstream_recv_idle_stale_bytes = false;
             if (kConfigStale || kStaleBytes || kDraining || !upstream ||
-                !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
+                !upstream->put_idle(
+                    fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs(), completed))
                 ::close(fd);
             // A request boundary parked behind this drain (defer_http1_request_boundary)
             // is now ready: the pin is cleared, so request 2 sees a neutral connection.
@@ -7945,6 +7957,8 @@ public:
         // reusable fd must not be leaked/closed.
         if (c.idle_return_fd >= 0) {
             const i32 fd = c.idle_return_fd;
+            const i32 completed = c.idle_return_completed_requests;
+            c.idle_return_completed_requests = 0;
             c.idle_return_fd = -1;
             const RouteConfig* const kParkedConfig = c.idle_return_config;
             c.idle_return_config = nullptr;
@@ -7958,7 +7972,8 @@ public:
             if (kStaleBytes) c.upstream_recv_buf.reset();
             c.upstream_recv_idle_stale_bytes = false;
             if (kConfigStale || kStaleBytes || kDraining || !upstream ||
-                !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
+                !upstream->put_idle(
+                    fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs(), completed))
                 ::close(fd);
         }
         this->free_conn(c);
@@ -9421,6 +9436,7 @@ private:
             if (conns[i].idle_return_fd >= 0) {
                 ::close(conns[i].idle_return_fd);
                 conns[i].idle_return_fd = -1;
+                conns[i].idle_return_completed_requests = 0;
                 conns[i].idle_return_config = nullptr;
             }
         }

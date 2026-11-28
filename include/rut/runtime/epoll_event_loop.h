@@ -561,7 +561,8 @@ public:
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
         if (!upstream || (c.request_config && c.request_config->upstreams[upstream_id].tls.enabled))
             return false;
-        const i32 fd = upstream->take_idle(upstream_id, backend_idx);
+        i32 completed = 0;
+        const i32 fd = upstream->take_idle(upstream_id, backend_idx, &completed);
         if (fd < 0) return false;
         // Establish a new owner before publishing the borrowed fd in the map.
         if (!backend.begin_upstream_episode(c.id, c.upstream_episode)) {
@@ -570,6 +571,7 @@ public:
         }
         c.reset_passive_health_observations();
         c.upstream_fd = fd;
+        c.upstream_completed_requests = completed;
         if (c.id < connection_capacity) backend.upstream_fd_map[c.id] = fd;
         return true;
     }
@@ -583,7 +585,9 @@ public:
         if (c.upstream_fd < 0 || !upstream) return false;
         i32 fd = -1;
         if (!detach_upstream_for_pool(c, fd)) return false;
-        if (fd >= 0 && !upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs()))
+        if (fd >= 0 &&
+            !upstream->put_idle(
+                fd, upstream_id, backend_idx, monotonic_secs(), c.upstream_completed_requests))
             ::close(fd);
         return true;
     }

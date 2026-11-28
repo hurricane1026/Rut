@@ -679,6 +679,14 @@ set_tests_properties(test_cli_upstream_keepalive_timeout PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 45)
 
+add_test(
+    NAME test_cli_upstream_keepalive_max_requests
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_upstream_keepalive_max_requests.py
+            $<TARGET_FILE:rut>)
+set_tests_properties(test_cli_upstream_keepalive_max_requests PROPERTIES
+    LABELS "cli" RUN_SERIAL TRUE TIMEOUT 45)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
 foreach(backend IN ITEMS epoll io_uring)
     add_test(

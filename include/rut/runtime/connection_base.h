@@ -475,12 +475,16 @@ struct ConnectionBase {
     // stable JIT constant memory); on_upstream_connected rewrites the request
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
+    // Counts follow the active upstream socket and a deferred io_uring return.
+    // They occupy padding here to keep the per-connection footprint bounded.
+    i32 upstream_completed_requests;
     Str req_path_override;
     // forward(set_body:) applies eagerly while the handler runs. A failed
     // override poisons forwarding instead of silently sending the original
     // credential-bearing body.
     bool req_body_overridden;
     bool req_body_override_failed;
+    i32 idle_return_completed_requests;
     Str req_body_override;
     // Foundation-only target-transform effect. The recorded flag distinguishes
     // no effect from a forged zero/sentinel ID; every recorded effect is rejected
@@ -2241,6 +2245,8 @@ struct ConnectionBase {
         upstream_keep_alive = false;
         upstream_reused = false;
         upstream_request_incomplete = false;
+        upstream_completed_requests = 0;
+        idle_return_completed_requests = 0;
         idle_return_fd = -1;
         idle_return_uid = 0;
         idle_return_bidx = 0;
