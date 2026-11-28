@@ -329,7 +329,7 @@ namespace {
         tmp[n++] = last_decimal_digit(v % 10);
         v /= 10;
     }
-    for (u32 i = 0; i < n; ++i) buf[i] = tmp[n - 1 - i];
+    for (u32 i = 0; i < n; ++i) buf[i] = tmp[i64{n} - i64{i} - 1];
     return n;
 }
 }  // namespace

@@ -483,7 +483,7 @@ bool HttpCachePolicy::prepare_record(
     ResponseInfo info;
     if (!response_info(response, length, fill.ttl, wall_us, kElapsed, info) ||
         info.parsed.content_length < 0 || info.header_end > length ||
-        info.parsed.content_length != i64{length - info.header_end})
+        info.parsed.content_length != i64{length} - i64{info.header_end})
         return false;
     const u64 kRemainingUs = info.remaining_us;
     u64 max_remaining = 0;
