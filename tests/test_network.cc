@@ -8491,7 +8491,7 @@ TEST(timer, restart_replaces) {
     c.reset();
     c.timer_node.init();
     w.add(&c, 2);
-    (void)w.tick([](Connection*) {});
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
     w.remove(&c);
     w.add(&c, 3);
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
@@ -8528,8 +8528,8 @@ TEST(timer, refresh_resets) {
     c.reset();
     c.timer_node.init();
     w.add(&c, 3);
-    (void)w.tick([](Connection*) {});
-    (void)w.tick([](Connection*) {});
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
     w.refresh(&c, 3);
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
@@ -8545,7 +8545,7 @@ TEST(timer, cancel) {
     c.timer_node.init();
     w.add(&c, 1);
     w.remove(&c);
-    (void)w.tick([](Connection*) {});
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
 }
 
@@ -8558,9 +8558,9 @@ TEST(timer, multi_same_slot) {
         conns[i].timer_node.init();
         w.add(&conns[i], 1);
     }
-    (void)w.tick([](Connection*) {});
+    CHECK_EQ(w.tick([](Connection*) {}), 0u);
     u32 count = 0;
-    (void)w.tick([&](Connection*) { count++; });
+    CHECK_EQ(w.tick([&](Connection*) { count++; }), 100u);
     CHECK_EQ(count, 100u);
 }
 
@@ -8586,26 +8586,18 @@ TEST(timer, self_restart) {
     c.timer_node.init();
     w.add(&c, 0);  // slot 0
     int fires = 0;
-    // tick: cursor=0, fires at slot 0. Callback re-adds at (0+1)&63=1. cursor→1.
-    (void)w.tick([&](Connection* conn) {
-        fires++;
-        if (fires < 3) {
-            conn->timer_node.init();
-            w.add(conn, 1);
-        }
-    });
+    auto restart = [&](Connection* conn) {
+        ++fires;
+        conn->timer_node.init();
+        w.add(conn, 1);
+    };
+    // The first two callbacks rearm for the next slot.
+    CHECK_EQ(w.tick(restart), 1u);
     CHECK_EQ(fires, 1);
-    // tick: cursor=1, checks slot 1 → fires. Re-adds at (1+1)=2. cursor→2.
-    (void)w.tick([&](Connection* conn) {
-        fires++;
-        if (fires < 3) {
-            conn->timer_node.init();
-            w.add(conn, 1);
-        }
-    });
+    CHECK_EQ(w.tick(restart), 1u);
     CHECK_EQ(fires, 2);
     // tick: cursor=2, checks slot 2 → fires. fires=3, no re-add. cursor→3.
-    (void)w.tick([&](Connection*) { fires++; });
+    CHECK_EQ(w.tick([&](Connection*) { fires++; }), 1u);
     CHECK_EQ(fires, 3);
 }
 
@@ -8622,9 +8614,9 @@ TEST(timer, huge_no_crash) {
     c.reset();
     c.timer_node.init();
     w.add(&c, 0xFFFFFFFF);
-    for (int i = 0; i < 100; i++) (void)w.tick([](Connection*) {});
-    w.remove(&c);
-    CHECK(true);  // no crash
+    u32 expired = 0;
+    for (int i = 0; i < 100; i++) expired += w.tick([](Connection*) {});
+    CHECK_EQ(expired, 1u);
 }
 
 TEST(timer, stress_200_wraparound) {
@@ -10376,12 +10368,13 @@ struct StrictTlsResponseFrame {
     Connection::Callback callback = nullptr;
 };
 
-StrictTlsResponseFrame stage_strict_tls_response_frame(Connection& conn,
-                                                       ResponseReadDeadlineSendKind kind,
-                                                       u8* response_storage,
-                                                       u32 response_capacity,
-                                                       u8* upstream_storage,
-                                                       u32 upstream_capacity) {
+[[nodiscard]] StrictTlsResponseFrame stage_strict_tls_response_frame(
+    Connection& conn,
+    ResponseReadDeadlineSendKind kind,
+    u8* response_storage,
+    u32 response_capacity,
+    u8* upstream_storage,
+    u32 upstream_capacity) {
     static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
     static constexpr u8 kBody[] = "xyz";
     static constexpr u8 kOriginHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
@@ -10389,7 +10382,10 @@ StrictTlsResponseFrame stage_strict_tls_response_frame(Connection& conn,
     const u32 body_len = sizeof(kBody) - 1u;
     const u32 raw_header_len = sizeof(kOriginHeader) - 1u;
 
+    if (kind == ResponseReadDeadlineSendKind::Combined && response_capacity < header_len + body_len)
+        return {};
     conn.response_header_buf.bind(response_storage, response_capacity);
+    if (conn.response_header_buf.write(kHeader, header_len) != header_len) return {};
     conn.upstream_recv_buf.bind(upstream_storage, upstream_capacity);
     conn.response_read_deadline_generation = 7;
     conn.response_read_deadline_post_commit_generation = 7;
@@ -10418,8 +10414,8 @@ StrictTlsResponseFrame stage_strict_tls_response_frame(Connection& conn,
         conn.response_read_deadline_post_commit_raw_header_end = raw_header_len;
         conn.response_read_deadline_post_commit_inflight_body = 0;
         conn.upstream_send_len = raw_header_len;
-        (void)conn.response_header_buf.write(kHeader, header_len);
-        (void)conn.upstream_recv_buf.write(kOriginHeader, raw_header_len);
+        if (conn.upstream_recv_buf.write(kOriginHeader, raw_header_len) != raw_header_len)
+            return {};
         return {conn.response_header_buf.data(),
                 header_len,
                 &on_response_header_sent<IoUringEventLoop>};
@@ -10429,8 +10425,7 @@ StrictTlsResponseFrame stage_strict_tls_response_frame(Connection& conn,
             ResponseReadDeadlinePostCommitPhase::BodySend;
         conn.response_read_deadline_post_commit_raw_header_end = raw_header_len;
         conn.upstream_send_len = body_len;
-        (void)conn.response_header_buf.write(kHeader, header_len);
-        (void)conn.upstream_recv_buf.write(kBody, body_len);
+        if (conn.upstream_recv_buf.write(kBody, body_len) != body_len) return {};
         return {conn.upstream_recv_buf.data(), body_len, &on_response_body_sent<IoUringEventLoop>};
     }
 
@@ -10441,10 +10436,9 @@ StrictTlsResponseFrame stage_strict_tls_response_frame(Connection& conn,
     conn.resp_body_mode = BodyMode::ContentLength;
     conn.resp_body_sent = header_len + body_len;
     conn.resp_body_remaining = 0;
-    (void)conn.response_header_buf.write(kHeader, header_len);
     memcpy(response_storage + header_len, kBody, body_len);  // staged beyond Buffer's header len
-    (void)conn.upstream_recv_buf.write(kOriginHeader, raw_header_len);
-    (void)conn.upstream_recv_buf.write(kBody, body_len);
+    if (conn.upstream_recv_buf.write(kOriginHeader, raw_header_len) != raw_header_len) return {};
+    if (conn.upstream_recv_buf.write(kBody, body_len) != body_len) return {};
     return {conn.response_header_buf.data(),
             header_len + body_len,
             &on_complete_response_sent<IoUringEventLoop>};
@@ -14286,6 +14280,7 @@ TEST(tls_iouring, strict_completion_validator_authenticates_tls_logical_tombston
                                             sizeof(response_storage),
                                             upstream_storage,
                                             sizeof(upstream_storage));
+        REQUIRE(frame.callback != nullptr);
         conn.on_send = frame.callback;
         conn.response_read_deadline_send_owner_generation = 2;
         conn.response_read_deadline_send_tombstone_generation = 2;
@@ -14388,6 +14383,7 @@ TEST(tls_iouring, strict_tls_logical_send_completion_bridges_each_phase_after_ra
                                                                        sizeof(response_storage),
                                                                        upstream_storage,
                                                                        sizeof(upstream_storage));
+        REQUIRE(frame.callback != nullptr);
         if (kind == ResponseReadDeadlineSendKind::Combined) {
             // Exercise two raw drain chunks with a staged 16 KiB combined
             // frame. The origin header plus body still fit one 16 KiB slot;
@@ -14525,6 +14521,7 @@ TEST(tls_iouring, strict_tls_parked_needread_close_cancels_recv_only_with_corrup
                                                 sizeof(response_storage),
                                                 upstream_storage,
                                                 sizeof(upstream_storage));
+            REQUIRE(frame.callback != nullptr);
             u32 logical_generation = 0;
             REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
             stage_strict_tls_send_owner(
@@ -14614,6 +14611,7 @@ TEST(tls_iouring, strict_tls_constrained_output_needroom_keeps_raw_owner_and_rec
                                         sizeof(response_storage),
                                         upstream_storage,
                                         sizeof(upstream_storage));
+    REQUIRE(frame.callback != nullptr);
     conn.on_send = frame.callback;
 
     // Deliberately leave one output byte available while a distinct raw
@@ -15267,6 +15265,7 @@ TEST(tls_iouring, partial_ciphertext_send_then_error_closes_raw_and_logical_owne
                                                         sizeof(response_storage),
                                                         upstream_storage,
                                                         sizeof(upstream_storage));
+                REQUIRE(frame.callback != nullptr);
                 conn.tls_handshake_complete = true;
             }
             conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
@@ -15367,6 +15366,7 @@ TEST(tls_iouring, f_more_transfers_raw_generation_to_close_ledger_in_either_drai
                                                         sizeof(response_storage),
                                                         upstream_storage,
                                                         sizeof(upstream_storage));
+                REQUIRE(frame.callback != nullptr);
                 conn.tls_handshake_complete = true;
             }
             const u32 raw_generation = stage_tls_raw_send_target(
@@ -20641,7 +20641,7 @@ TEST(route, add_proxy_invalid_upstream_id) {
 
 TEST(route, add_proxy_path_too_long) {
     RouteConfig cfg;
-    (void)cfg.add_upstream("x", 0x7F000001, 80);
+    REQUIRE(cfg.add_upstream("x", 0x7F000001, 80).has_value());
     char long_path[256];
     for (u32 i = 0; i < 255; i++) long_path[i] = 'a';
     long_path[255] = '\0';
@@ -20697,7 +20697,7 @@ TEST(route, add_rejects_path_with_query) {
     // time the segment trie strips it from the request, so the route
     // would be effectively unmatchable.
     RouteConfig cfg;
-    (void)cfg.add_upstream("u", 0x7F000001, 80);
+    REQUIRE(cfg.add_upstream("u", 0x7F000001, 80).has_value());
     CHECK(!cfg.add_static("/api?foo=1", 0, 200));
     CHECK(!cfg.add_proxy("/api?x", 0, 0));
     CHECK_EQ(cfg.route_count, 0u);
@@ -20973,7 +20973,7 @@ TEST(route, add_response_body_rejects_at_capacity) {
 
 TEST(route, add_route_at_capacity) {
     RouteConfig cfg;
-    (void)cfg.add_upstream("x", 0x7F000001, 80);
+    REQUIRE(cfg.add_upstream("x", 0x7F000001, 80).has_value());
     for (u32 i = 0; i < RouteConfig::kMaxRoutes; i++) {
         char path[8];
         path[0] = '/';

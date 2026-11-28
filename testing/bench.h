@@ -22,9 +22,9 @@
 //   }
 
 #include "rut/common/types.h"
+#include "test_output.h"
 
-#include <time.h>    // clock_gettime, CLOCK_MONOTONIC
-#include <unistd.h>  // write
+#include <time.h>  // clock_gettime, CLOCK_MONOTONIC
 
 namespace rut::bench {
 
@@ -47,39 +47,40 @@ inline void clobber() {
 // ============================================================================
 
 inline void out(const char* s) {
-    int len = 0;
+    size_t len = 0;
     while (s[len]) len++;
-    (void)::write(1, s, len);
+    testing::write_stdout(s, len);
 }
 
 inline void out_u64(u64 v) {
-    if (v == 0) {
-        out("0");
-        return;
-    }
-    char buf[24];
-    int n = 0;
-    while (v > 0) {
-        buf[n++] = static_cast<char>('0' + v % 10);
+    constexpr char kDigits[] = "0123456789";
+    char buffer[20];
+    char* const end = buffer + sizeof(buffer);
+    char* cursor = end;
+    do {
+        *--cursor = kDigits[v % 10];
         v /= 10;
-    }
-    for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
+    } while (v != 0);
+    testing::write_stdout(cursor, end - cursor);
 }
 
 // Print u64 with commas: 1,234,567
 inline void out_u64_comma(u64 v) {
-    char buf[32];
-    int n = 0;
-    if (v == 0) {
-        out("0");
-        return;
-    }
-    while (v > 0) {
-        if (n > 0 && n % 3 == 0) buf[n++] = ',';
-        buf[n++] = static_cast<char>('0' + v % 10);
+    constexpr char kDigits[] = "0123456789";
+    char buffer[26];
+    char* const end = buffer + sizeof(buffer);
+    char* cursor = end;
+    unsigned group_digits = 0;
+    do {
+        if (group_digits == 3) {
+            *--cursor = ',';
+            group_digits = 0;
+        }
+        *--cursor = kDigits[v % 10];
         v /= 10;
-    }
-    for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
+        ++group_digits;
+    } while (v != 0);
+    testing::write_stdout(cursor, end - cursor);
 }
 
 // Print fixed-point: val is in nanoseconds, print as "X ns" or "X.YY us" or "X.YY ms"

@@ -32,38 +32,34 @@
 //   ./test_foo --shard-index=0 --shard-count=2
 //   ./test_foo --help                # show usage
 
+#include "test_output.h"
+
 #include <stdint.h>
-#include <unistd.h>  // write
 
 namespace rut::test {
 
 // --- Output ---
 
 inline void out(const char* s) {
-    int len = 0;
+    size_t len = 0;
     while (s[len]) len++;
-    (void)::write(1, s, len);
+    testing::write_stdout(s, len);
 }
 
 inline void out_int(int v) {
-    if (v == 0) {
-        (void)::write(1, "0", 1);
-        return;
-    }
-    unsigned uv;
-    if (v < 0) {
-        (void)::write(1, "-", 1);
-        uv = static_cast<unsigned>(-(v + 1)) + 1u;
-    } else {
-        uv = static_cast<unsigned>(v);
-    }
-    char buf[16];
-    int n = 0;
-    while (uv > 0) {
-        buf[n++] = static_cast<char>('0' + uv % 10);
-        uv /= 10;
-    }
-    for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
+    // Unsigned subtraction preserves the magnitude of the minimum signed int.
+    const unsigned bits = v;
+    unsigned magnitude = v < 0 ? 0u - bits : bits;
+    constexpr char kDigits[] = "0123456789";
+    char buffer[sizeof(int) * 3 + 1];
+    char* const end = buffer + sizeof(buffer);
+    char* cursor = end;
+    do {
+        *--cursor = kDigits[magnitude % 10];
+        magnitude /= 10;
+    } while (magnitude != 0);
+    if (v < 0) *--cursor = '-';
+    testing::write_stdout(cursor, end - cursor);
 }
 
 inline bool str_starts_with(const char* s, const char* prefix) {
