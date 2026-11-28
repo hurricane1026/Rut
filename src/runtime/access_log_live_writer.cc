@@ -1,6 +1,7 @@
 #include "rut/runtime/access_log_live_writer.h"
 
 #include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/platform/write.h"
 
 #include <errno.h>
@@ -406,23 +407,30 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
                                               u64 position,
                                               const char* line,
                                               u32 line_length) {
-    const u32 line_capacity = host_rings_[ring_index] != nullptr
+    range_int<0, kMaxRings> ring;
+    if (!decltype(ring)::try_from_i64(ring_index, &ring)) {
+        publish_writer_fatal(SourceLiveAccessLogFatalKind::Protocol, kSourceLiveAccessLogNoRing, 0);
+        return false;
+    }
+    const u32 line_capacity = host_rings_[ring.index()] != nullptr
                                   ? kAccessLogDownstreamHostLineCapacity
                                   : kAccessLogDownstreamRequestBytesLineCapacity;
     if (line == nullptr || line_length == 0u || line_length > line_capacity) {
-        publish_writer_fatal(
-            SourceLiveAccessLogFatalKind::Protocol, static_cast<u8>(ring_index), 0);
+        publish_writer_fatal(SourceLiveAccessLogFatalKind::Protocol, ring.to<u8>(), 0);
         return false;
     }
 
     u32 written = 0u;
     while (written < line_length) {
-        const ssize_t result =
-            ::write(output_.get(),
-                    line + i64{written},
-                    static_cast<size_t>(static_cast<i64>(line_length) - static_cast<i64>(written)));
+        const auto offset = range_int{written};
+        const auto remaining = range_int{line_length - written};
+        const ssize_t result = ::write(output_.get(), line + offset.index(), remaining.to_u64());
         if (result > 0) {
-            written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(result));
+            range_int<0, i64{UINT32_MAX} + 1> count;
+            if (!remaining.try_count(result, &count) || !(offset + count).to(&written)) {
+                publish_writer_fatal(SourceLiveAccessLogFatalKind::Write, ring.to<u8>(), EIO);
+                return false;
+            }
             continue;
         }
         if (result < 0 && errno == EINTR) continue;
@@ -430,15 +438,13 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
             if (!wait_output_writable(ring_index)) return false;
             continue;
         }
-        publish_writer_fatal(SourceLiveAccessLogFatalKind::Write,
-                             static_cast<u8>(ring_index),
-                             result < 0 ? errno : 0);
+        publish_writer_fatal(
+            SourceLiveAccessLogFatalKind::Write, ring.to<u8>(), result < 0 ? errno : 0);
         return false;
     }
 
-    if (!rings_[ring_index]->commit(position)) {
-        publish_writer_fatal(
-            SourceLiveAccessLogFatalKind::Protocol, static_cast<u8>(ring_index), 0);
+    if (!rings_[ring.index()]->commit(position)) {
+        publish_writer_fatal(SourceLiveAccessLogFatalKind::Protocol, ring.to<u8>(), 0);
         return false;
     }
     return true;

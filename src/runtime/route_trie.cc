@@ -1,5 +1,6 @@
 #include "rut/runtime/route_trie.h"
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/route_params.h"
 
@@ -26,16 +27,24 @@ namespace rut {
     // Str above any '?' / '#' before calling tokenize. Keeping
     // tokenize pure means the insert-vs-match round-trip always
     // agrees on what a segment is: bytes between slashes.
+    constexpr auto kSegmentLimitExceeded =
+        range_int<kMaxPathSegments + 1, kMaxPathSegments + 2>{}.to<u32>();
     u32 start = 0;
-    for (u32 i = 0; i <= path.len; i++) {
-        const bool at_sep = (i == path.len) || (path.ptr[i] == '/');
-        if (!at_sep) continue;
-        if (i > start) {
-            if (!out.push(Str{path.ptr + i64{start},
-                              static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(start))}))
-                return limit == SegmentLimit::KeepPrefix ? out.len : u32{i64{kMaxPathSegments} + 1};
+    u32 end = 0;
+    for (;;) {
+        if (end == path.len || path.ptr[range_int{end}.index()] == '/') {
+            if (end > start) {
+                const auto begin = range_int{start};
+                u32 length;
+                if (!(range_int{end} - begin).to(&length) ||
+                    !out.push(Str{path.ptr + begin.index(), length}))
+                    return limit == SegmentLimit::KeepPrefix ? out.len : kSegmentLimitExceeded;
+            }
+            if (end == path.len) break;
+            // A separator before the end leaves room to advance.
+            start = end + 1u;
         }
-        start = static_cast<u32>(static_cast<i64>(i) + 1);
+        ++end;
     }
     return out.len;
 }
@@ -104,9 +113,9 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     FixedVec<u16, kMaxPathSegments> pushed_parents{};
 
     auto rollback = [&]() {
-        for (u32 r = pushed_parents.len; r > 0; r--) {
-            nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len = static_cast<u32>(
-                static_cast<i64>(nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len) - 1);
+        for (u32 r = pushed_parents.len; r > 0;) {
+            --r;
+            --nodes[pushed_parents[range_int{r}.index()]].children.len;
         }
         nodes.len = saved_nodes_len;
     };
@@ -131,7 +140,11 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 rollback();
                 return false;
             }
-            child = static_cast<u16>(static_cast<i64>(nodes.len) - 1);
+            constexpr auto kOne = range_int<1, 2>{};
+            if (!(range_int{nodes.len} - kOne).to(&child)) {
+                rollback();
+                return false;
+            }
             if (!nodes[cur].children.push(child)) {
                 // Pre-flight above rules this out, but if a future
                 // FixedVec invariant change makes it reachable, fall
@@ -179,7 +192,9 @@ u16 RouteTrie::match(Str path, u8 method_char) const {
     // Unsupported method bytes can't match anything — bail before
     // touching the trie. Consistent with the insert-time rejection.
     const u32 want_slot = method_slot(method_char);
-    return match_key(path, static_cast<u8>(want_slot));
+    range_int<0, kMethodSlots> slot;
+    if (!decltype(slot)::try_from_i64(want_slot, &slot)) return TrieNode::kInvalidRoute;
+    return match_key(path, slot.to<u8>());
 }
 
 u16 RouteTrie::match_key(Str path, u8 method_key) const {
@@ -240,9 +255,10 @@ u16 RouteTrie::match_key(Str path,
             if (position == path.len) break;
             const u32 kStart = position;
             while (position < path.len && path.ptr[position] != '/') ++position;
-            const Str kValue{
-                path.ptr + i64{kStart},
-                static_cast<u32>(static_cast<i64>(position) - static_cast<i64>(kStart))};
+            const auto begin = range_int{kStart};
+            u32 segment_length;
+            if (!(range_int{position} - begin).to(&segment_length)) break;
+            const Str kValue{path.ptr + begin.index(), segment_length};
             const u16 kChild =
                 node.children.len == 1 ? node.children[0] : find_child(current, kValue);
             if (kChild == TrieNode::kInvalidNodeIdx) break;
