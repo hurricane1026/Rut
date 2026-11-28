@@ -2244,8 +2244,8 @@ TEST(http2_conn, data_waits_for_control_window_update_room) {
     CHECK_EQ(cap.data_len, 0u);
     u8 retry_out[64]{};
     u32 retry_written = 0;
-    const Http2Result retry = c.process(in + first.consumed, inlen - first.consumed, retry_out,
-                                       sizeof(retry_out), &retry_written);
+    const Http2Result retry = c.process(
+        in + first.consumed, inlen - first.consumed, retry_out, sizeof(retry_out), &retry_written);
     CHECK_FALSE(retry.close);
     CHECK_EQ(retry.consumed, inlen - first.consumed);
     CHECK_EQ(cap.data_len, 1u);

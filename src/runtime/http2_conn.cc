@@ -1348,10 +1348,16 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
         // updates can be emitted. Unknown and half-closed streams also need
         // room for their RST_STREAM plus connection credit update; manual
         // windows and empty DATA do not emit either pair.
-        if (kType == Http2FrameType::Data && h.length > 0) {
-            const Http2Stream* stream = find_stream(h.stream_id);
-            const bool kClosed = !stream || stream->state == Http2StreamState::HalfClosedRemote;
-            if ((kClosed || !stream->manual_window) && !w.room(2 * kShortControlFrame)) break;
+        if (kType == Http2FrameType::Data) {
+            const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
+            const u32 kRequiredControl =
+                h.length == 0 ? kShortControlFrame
+                              : (kEndStream ? kShortControlFrame : 2 * kShortControlFrame);
+            if (!w.room(kRequiredControl)) {
+                const Http2Stream* stream = find_stream(h.stream_id);
+                const bool kClosed = !stream || stream->state == Http2StreamState::HalfClosedRemote;
+                if (kClosed || (h.length > 0 && !stream->manual_window)) break;
+            }
         }
 
         // A serving callback parked a stream (one-at-a-time wait/proxy). We still
