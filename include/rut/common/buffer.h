@@ -3,7 +3,6 @@
 #include "rut/common/range_int.h"
 #include "rut/common/trap.h"
 #include "rut/common/types.h"
-#include <type_traits>
 
 #include <inttypes.h>
 
