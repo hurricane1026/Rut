@@ -1069,7 +1069,7 @@ int main(int argc, char** argv) {
                     write_str("--upstream-keepalive-max-requests must be at most 2147483647\n");
                     return 1;
                 }
-                value = value * 10u + digit;
+                value = value * 10 + digit;
             }
             upstream_max_requests = value;
             upstream_max_requests_specified = true;
