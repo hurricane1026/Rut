@@ -63,10 +63,10 @@ inline bool replace_h1_body_in_place(
         request.transfer_encoding != RequestTransferEncoding::None || !request.has_content_length ||
         request.content_length_count != 1)
         return false;
-    const u32 old_body_len = request.content_length;
-    if ((expected_body_len != 0xffffffffu && expected_body_len != old_body_len) ||
-        i64{old_body_len} > i64{old_total} - i64{old_header_end})
-        return false;
+    const i64 available_body = i64{old_total} - i64{old_header_end};
+    if (request.content_length < 0 || request.content_length > available_body) return false;
+    const u32 old_body_len = static_cast<u32>(request.content_length);
+    if (expected_body_len != 0xffffffffu && expected_body_len != old_body_len) return false;
     u32 line_start = 0;
     u32 line_end = 0;
     if (!request_body_override_detail::content_length_line(

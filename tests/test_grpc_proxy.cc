@@ -4027,9 +4027,16 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
     const hpack::Header overflow_headers[] = {
         {{":status", 7}, {"200", 3}},
         {{"content-type", 12}, {"application/grpc", 16}},
-        {{"content-length", 14}, {"4294967296", 10}},
+        {{"content-length", 14}, {"9223372036854775808", 19}},
     };
     run(overflow_headers, 3, false, nullptr, 0, false, nullptr, 0, 13, true);
+
+    const hpack::Header wide_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"4294967296", 10}},
+    };
+    run(wide_headers, 3, false, nullptr, 0, false, nullptr, 0, 0, false);
 
     const hpack::Header terminal_headers[] = {
         {{":status", 7}, {"200", 3}},

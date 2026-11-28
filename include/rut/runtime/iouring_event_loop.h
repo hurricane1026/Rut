@@ -4467,8 +4467,8 @@ public:
                 return;
             }
             --relay_budget_calls;
-            const u32 chunk = c.resp_body_remaining < kResponseSpliceChunkSize
-                                  ? c.resp_body_remaining
+            const u32 chunk = c.resp_body_remaining < i64{kResponseSpliceChunkSize}
+                                  ? static_cast<u32>(c.resp_body_remaining)
                                   : kResponseSpliceChunkSize;
             const u32 want = chunk < relay_budget_bytes / 2 ? chunk : relay_budget_bytes / 2;
             if (study_inside_cq) ++study_cq_splice_calls;
@@ -4507,12 +4507,16 @@ public:
             relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
             relay_pulled_bytes = wrapping_add(relay_pulled_bytes, static_cast<u64>(n));
             r.segment_sent = 0;
-            if (!try_add_to(&r.body_bytes, r.segment_len)) {
+            if (i64{r.segment_len} > INT64_MAX - r.body_bytes) {
                 close_conn(c);
                 return;
             }
-            c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
-                                                     static_cast<i64>(r.segment_len));
+            r.body_bytes += i64{r.segment_len};
+            if (i64{r.segment_len} > c.resp_body_remaining) {
+                close_conn(c);
+                return;
+            }
+            c.resp_body_remaining -= i64{r.segment_len};
             refresh_relay_progress_timer(c);
             r.write_armed = true;
             const IoEvent ready{
@@ -4558,10 +4562,11 @@ public:
         relay_written_bytes = wrapping_add(relay_written_bytes, static_cast<u64>(n));
         if (study_inside_cq)
             study_cq_splice_bytes = wrapping_add(study_cq_splice_bytes, static_cast<u64>(n));
-        if (!try_add_to(&c.resp_body_sent, n)) {
+        if (i64{n} > INT64_MAX - c.resp_body_sent) {
             close_conn(c);
             return;
         }
+        c.resp_body_sent += i64{n};
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the
@@ -6576,7 +6581,8 @@ public:
             c.response_read_deadline_post_commit_downstream_completed = 0;
             c.response_read_deadline_post_commit_inflight_body = body_to_send;
             c.resp_body_remaining = 0;
-            c.resp_body_sent = static_cast<u32>(combined_len);
+            if (combined_len < 0 || combined_len > INT64_MAX - c.resp_body_sent) return false;
+            c.resp_body_sent = combined_len;
             c.upstream_send_len = static_cast<u32>(upstream_send_len);
             c.transition_to_sending(&on_complete_response_sent<Self>);
             return submit_send(c, c.response_header_buf.data(), static_cast<u32>(combined_len));

@@ -644,8 +644,8 @@ static const char* const kInvalidRequestStrs[] = {
     "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
     // Content-Length not a number
     "POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n",
-    // Content-Length overflow u32
-    "POST / HTTP/1.1\r\nContent-Length: 99999999999\r\n\r\n",
+    // Content-Length overflow i64
+    "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n",
     // Missing URI (double space)
     "GET  HTTP/1.1\r\n\r\n",
     // Truncated version string
@@ -1202,8 +1202,20 @@ TEST(ContentLength, MaxU32PlusFive) {
 TEST(ContentLength, ElevenDigits) {
     HttpParser parser;
     ParsedRequest req;
-    // 42949672950 — 11 digits, overflows
+    // 42949672950 — 11 digits, valid in the logical length domain.
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 42949672950\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, i64{42949672950});
+}
+
+TEST(ContentLength, Int64MaxAndOverflow) {
+    HttpParser parser;
+    ParsedRequest req;
+    auto s =
+        parse_one("POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.content_length, i64{INT64_MAX});
+    s = parse_one("POST / HTTP/1.1\r\nContent-Length: 9223372036854775808\r\n\r\n", &req, &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 

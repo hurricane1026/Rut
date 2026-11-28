@@ -685,7 +685,9 @@ bool apply_request_body_override(ConnectionBase& conn, Str body) {
         return false;
     const u32 total = conn.recv_buf.len();
     const u32 old_header_end = conn.req_header_end;
-    const u32 old_body_len = conn.req_content_length;
+    if (conn.req_content_length < 0 || conn.req_content_length > i64{total} - i64{old_header_end})
+        return false;
+    const u32 old_body_len = static_cast<u32>(conn.req_content_length);
     if (old_header_end > total || old_body_len > total - old_header_end ||
         conn.req_initial_send_len < old_header_end ||
         conn.req_initial_send_len - old_header_end < old_body_len)

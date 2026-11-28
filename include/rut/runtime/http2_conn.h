@@ -134,8 +134,8 @@ struct Http2Conn {
     bool pending_is_head;
     u32 pending_body_start;
     u32 pending_synth_len;
-    u32 pending_body_len;
-    u32 pending_content_length;
+    i64 pending_body_len;
+    i64 pending_content_length;
     bool pending_has_content_length;
     bool pending_buffer_body;
     bool pending_request_forwardable;
@@ -216,7 +216,7 @@ struct Http2Conn {
     bool async_request_stream_open;
     bool async_request_forwardable;
     bool async_request_has_content_length;
-    u32 async_request_content_length;
+    i64 async_request_content_length;
     u32 async_timer_ms;
     jit::HandlerFn async_fn;
     u16 async_state;
@@ -322,7 +322,7 @@ struct Http2Conn {
                                                     u16 status,
                                                     const hpack::Header* hdrs,
                                                     u32 nhdrs,
-                                                    u32 representation_length);
+                                                    i64 representation_length);
 
 // --- Request bridge ---
 

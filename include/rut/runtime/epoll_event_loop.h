@@ -838,8 +838,8 @@ public:
             const bool writing = r.segment_len != 0;
             const u32 want = writing ? static_cast<u32>(static_cast<i64>(r.segment_len) -
                                                         static_cast<i64>(r.segment_sent))
-                                     : (c.resp_body_remaining < kResponseSpliceChunkSize
-                                            ? c.resp_body_remaining
+                                     : (c.resp_body_remaining < i64{kResponseSpliceChunkSize}
+                                            ? static_cast<u32>(c.resp_body_remaining)
                                             : kResponseSpliceChunkSize);
             ssize_t n;
             do {
@@ -866,7 +866,11 @@ public:
             }
             if (writing) {
                 r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
-                c.resp_body_sent = static_cast<u32>(static_cast<i64>(c.resp_body_sent) + n);
+                if (i64{n} > INT64_MAX - c.resp_body_sent) {
+                    this->close_conn(c);
+                    return;
+                }
+                c.resp_body_sent += i64{n};
                 if (r.segment_sent == r.segment_len) r.segment_len = r.segment_sent = 0;
                 if (r.segment_len == 0 && c.resp_body_remaining == 0) {
                     const i32 pipe_read = r.pipe_read, pipe_write = r.pipe_write;
@@ -883,10 +887,16 @@ public:
             } else {
                 r.segment_len = static_cast<u32>(n);
                 r.segment_sent = 0;
-                r.body_bytes = static_cast<u32>(static_cast<i64>(r.body_bytes) +
-                                                static_cast<i64>(r.segment_len));
-                c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
-                                                         static_cast<i64>(r.segment_len));
+                if (i64{r.segment_len} > INT64_MAX - r.body_bytes) {
+                    this->close_conn(c);
+                    return;
+                }
+                r.body_bytes += i64{r.segment_len};
+                if (i64{r.segment_len} > c.resp_body_remaining) {
+                    this->close_conn(c);
+                    return;
+                }
+                c.resp_body_remaining -= i64{r.segment_len};
             }
             timer.refresh(&c,
                           c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);

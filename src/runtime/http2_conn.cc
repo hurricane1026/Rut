@@ -316,6 +316,22 @@ namespace {
     for (u32 i = 0; remaining > 0; ++i) buf[i] = tmp[--remaining];
     return n;
 }
+
+[[nodiscard]] u32 i64_to_dec(i64 v, char* buf) {
+    if (v < 0) return 0;
+    if (v == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    char tmp[19];
+    u32 n = 0;
+    while (v > 0) {
+        tmp[n++] = last_decimal_digit(v % 10);
+        v /= 10;
+    }
+    for (u32 i = 0; i < n; ++i) buf[i] = tmp[n - 1 - i];
+    return n;
+}
 }  // namespace
 
 [[nodiscard]] static u32 http2_write_response_impl(u8* out,
@@ -328,7 +344,8 @@ namespace {
                                                    const u8* body,
                                                    u32 body_len,
                                                    bool headers_only,
-                                                   bool end_stream) {
+                                                   bool end_stream,
+                                                   i64 advertised_length = -1) {
     // Encode the header block: :status, caller headers, then content-length when
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
@@ -353,7 +370,9 @@ namespace {
     // 0 (→ the caller answers 502).
     // Room the trailing content-length line needs when there's a body, reserved
     // during the loop so the loop can't fill hblock and then overflow on the CL.
-    const i64 kClReserve = body_len > 0 ? 14 + 10 + hpack_field_overhead(14, 10) : 0;
+    const bool has_content_length = body_len > 0 || (headers_only && advertised_length >= 0);
+    const i64 cl_value = headers_only ? advertised_length : i64{body_len};
+    const i64 kClReserve = has_content_length ? 14 + 19 + hpack_field_overhead(14, 19) : 0;
     for (u32 i = 0; i < nhdrs; i++) {
         const auto field_size = range_int{hdrs[i].name.len} + range_int{hdrs[i].value.len};
         const i64 kWorst = hb + field_size.to<i64>() +
@@ -388,9 +407,10 @@ namespace {
         if (kEncoded < 0) return 0;
         hb += kEncoded;
     }
-    if (body_len > 0) {
-        char clbuf[10];
-        const u32 kClLen = u32_to_dec(body_len, clbuf);
+    if (has_content_length) {
+        char clbuf[19];
+        const u32 kClLen = headers_only ? i64_to_dec(cl_value, clbuf) : u32_to_dec(body_len, clbuf);
+        if (kClLen == 0) return 0;
         const auto field_size = range_int<14, 15>{} + range_int{kClLen};
         const i64 kWorst = hb + field_size.to<i64>() + hpack_field_overhead(14, kClLen);
         if (kWorst > kCapacity.value()) return 0;  // (reserved above)
@@ -459,9 +479,10 @@ namespace {
                                             hdrs,
                                             nhdrs,
                                             nullptr,
-                                            representation_length,
+                                            0,
                                             true,
-                                            true);
+                                            true,
+                                            representation_length);
     if (n != 0) enc = staged;
     return n;
 }
@@ -518,14 +539,15 @@ namespace {
     return path.slice(start, end);
 }
 
-[[nodiscard]] bool h2_value_to_u32(Str v, u32* out) {
+[[nodiscard]] bool h2_value_to_i64(Str v, i64* out) {
     if (v.len == 0) return false;
-    u32 acc = 0;
+    i64 acc = 0;
     for (u32 i = 0; i < v.len; i++) {
         range_int<0, 10> digit;
-        if (!decltype(digit)::try_from_i64(v.ptr[i] - '0', &digit) ||
-            !(range_int(acc).scaled_by<10>() + digit).to(&acc))
-            return false;
+        if (!decltype(digit)::try_from_i64(v.ptr[i] - '0', &digit)) return false;
+        const i64 kDigit = digit.value();
+        if (acc > (INT64_MAX - kDigit) / 10) return false;
+        acc = acc * 10 + kDigit;
     }
     *out = acc;
     return true;
@@ -670,8 +692,8 @@ namespace {
             req->headers[req->header_count++] = {kName, kValue};
         }
         if (h2_str_eq(kName, "content-length")) {
-            u32 cl = 0;
-            if (have_content_length || !h2_value_to_u32(kValue, &cl)) return false;
+            i64 cl = 0;
+            if (have_content_length || !h2_value_to_i64(kValue, &cl)) return false;
             have_content_length = true;
             req->content_length = cl;
             req->has_content_length = true;

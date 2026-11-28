@@ -731,7 +731,7 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
                            const JitDispatchOutcome& o,
                            const RouteConfig* cfg,
                            bool is_head,
-                           u32 content_length,
+                           i64 content_length,
                            bool replace_owned_async = false) {
     Http2Conn& h2 = *d.conn->h2;
     if (h2.pending_stream != 0 || (h2.async_stream != 0 && !replace_owned_async)) return false;
@@ -1589,7 +1589,6 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     }
 
     if (h2->pending_prepared_forward) {
-        const u32 kBodyLen = h2->pending_body_len;
         const u32 kSynthLen = h2->pending_synth_len;
         const RouteConfig* cfg = h2->pending_route_config;
         d.conn->forward_load_balance = h2->pending_load_balance;
@@ -1598,7 +1597,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const u32 kCacheRoute = h2->pending_http_cache_route;
         const u8* synth = h2->pending_synth;
         h2_clear_pending(*h2);
-        if (kBodyLen != 0) {
+        if (h2->pending_body_len != 0) {
             h2_emit_status(d, stream_id, 503);
             return;
         }
@@ -1621,10 +1620,17 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // Body-reading handler whose client omitted Content-Length: inject the
     // observed body length so the HTTP/1-shaped parse exposes the DATA bytes.
     if (h2->pending_buffer_body && !h2->pending_has_content_length &&
+        (h2->pending_body_len < 0 || h2->pending_body_len > i64{Http2Conn::kBodySynthCap} ||
+         h2->pending_body_len > i64{UINT32_MAX})) {
+        h2_clear_pending(*h2);
+        h2_emit_status(d, stream_id, 413);
+        return;
+    }
+    if (h2->pending_buffer_body && !h2->pending_has_content_length &&
         !h2_inject_content_length(h2->pending_synth,
                                   &h2->pending_synth_len,
                                   h2->pending_body_start,
-                                  h2->pending_body_len,
+                                  static_cast<u32>(h2->pending_body_len),
                                   Http2Conn::kBodySynthCap)) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 413);
@@ -2129,12 +2135,10 @@ void h2_on_data_cb(
         }
     }
     if (c.pending_stream != stream_id) return;
-    if (static_cast<i64>(c.pending_body_len) >
-        static_cast<i64>(UINT32_MAX) - static_cast<i64>(len)) {
+    if (i64{len} > INT64_MAX - c.pending_body_len) {
         c.pending_overflow = true;
     } else {
-        c.pending_body_len =
-            static_cast<u32>(static_cast<i64>(c.pending_body_len) + static_cast<i64>(len));
+        c.pending_body_len += i64{len};
     }
     if (c.pending_buffer_body &&
         i64{c.pending_synth_len} + i64{len} > i64{Http2Conn::kBodySynthCap}) {

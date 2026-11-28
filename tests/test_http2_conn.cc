@@ -1251,9 +1251,14 @@ TEST(h2_request, invalid_or_duplicate_content_length_fails) {
                            {{":path", 5}, {"/u", 2}},
                            {{"content-length", 14}, {"x", 1}}};
     CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
-    hpack::Header over[] = {{{":method", 7}, {"POST", 4}},
+    hpack::Header wide[] = {{{":method", 7}, {"POST", 4}},
                             {{":path", 5}, {"/u", 2}},
                             {{"content-length", 14}, {"4294967296", 10}}};
+    REQUIRE(h2_headers_to_request(wide, 3, &req));
+    CHECK_EQ(req.content_length, i64{UINT32_MAX} + 1);
+    hpack::Header over[] = {{{":method", 7}, {"POST", 4}},
+                            {{":path", 5}, {"/u", 2}},
+                            {{"content-length", 14}, {"9223372036854775808", 19}}};
     CHECK_FALSE(h2_headers_to_request(over, 3, &req));
     hpack::Header dup[] = {
         {{":method", 7}, {"POST", 4}},
@@ -2104,6 +2109,33 @@ TEST(http2_conn, write_head_headers_with_representation_length_is_transactional)
     CHECK(has_custom);
     CHECK(has_length);
     CHECK_GT(enc.dyn.nent, 0u);  // successful serialization committed HPACK state
+
+    hpack::Encoder wide_enc;
+    wide_enc.init(4096);
+    const u32 wide_n = http2_write_head_response_headers(
+        out, sizeof(out), wide_enc, 1, 200, hdrs, 1, i64{INT64_MAX});
+    REQUIRE(wide_n != 0);
+    Http2FrameHeader wide_h;
+    REQUIRE(parse_frame_header(out, wide_n, &wide_h) == ParseStatus::Complete);
+    hpack::DynamicTable wide_dyn;
+    wide_dyn.init(4096);
+    hpack::Header wide_decoded[16];
+    u8 wide_scratch[256];
+    u32 wide_count = 0;
+    REQUIRE(hpack::decode_header_block(wide_dyn,
+                                       out + kFrameHeaderSize,
+                                       wide_h.length,
+                                       wide_scratch,
+                                       sizeof(wide_scratch),
+                                       wide_decoded,
+                                       16,
+                                       &wide_count));
+    bool has_wide_length = false;
+    for (u32 i = 0; i < wide_count; i++)
+        if (wide_decoded[i].name.eq(Str{"content-length", 14}) &&
+            wide_decoded[i].value.eq(Str{"9223372036854775807", 19}))
+            has_wide_length = true;
+    CHECK(has_wide_length);
 }
 
 // http2_write_response must refuse (return 0) rather than overflow its fixed 8 KiB

@@ -274,7 +274,7 @@ struct RelayOwner {
     i32 destination_fd = -1;
     u32 segment_len = 0;
     u32 segment_sent = 0;
-    u32 body_bytes = 0;
+    i64 body_bytes = 0;
     bool read_armed = false;
     bool write_armed = false;
     bool close_pending = false;

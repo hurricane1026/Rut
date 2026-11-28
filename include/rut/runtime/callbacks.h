@@ -218,7 +218,7 @@ inline bool tls_partial_initial_connect_request_owner(const Connection& conn) {
         return false;
     if (conn.req_body_mode == BodyMode::ContentLength) {
         if (!conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
-            conn.req_content_length == 0 || conn.req_body_remaining == 0 ||
+            conn.req_content_length <= 0 || conn.req_body_remaining <= 0 ||
             conn.req_body_remaining > conn.req_content_length)
             return false;
         // The preceding guards prove 0 < remaining <= content_length, so this

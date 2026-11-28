@@ -8594,7 +8594,10 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // fails closed immediately rather than waiting for the rest of the
     // body; the check here is retained too, as defense in depth.
     if (req.target_has_fragment) return false;
-    const u32 body_len = req.has_content_length ? req.content_length : 0;
+    if (req.has_content_length &&
+        (req.content_length < 0 || req.content_length > i64{len} - i64{parser.header_end}))
+        return false;
+    const u32 body_len = req.has_content_length ? static_cast<u32>(req.content_length) : 0;
     const u8* end = data + i64{parser.header_end};
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
@@ -9151,7 +9154,10 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     ParsedRequest req;
     parser.reset();
     if (parser.parse(data, len, &req) != ParseStatus::Complete) return false;
-    const u32 body_len = req.has_content_length ? req.content_length : 0;
+    if (req.has_content_length &&
+        (req.content_length < 0 || req.content_length > i64{len} - i64{parser.header_end}))
+        return false;
+    const u32 body_len = req.has_content_length ? static_cast<u32>(req.content_length) : 0;
     const u8* end = data + i64{parser.header_end};
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
@@ -11214,8 +11220,11 @@ bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
         conn.upstream_relay_slice = sending;
         conn.upstream_recv_buf.bind(next, loop->relay_buffer_capacity(next));
         conn.upstream_relay_send_len = send_len;
-        conn.resp_body_sent =
-            static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(send_len));
+        if (i64{send_len} > INT64_MAX - conn.resp_body_sent) {
+            close_conn_if_live(loop, conn);
+            return true;
+        }
+        conn.resp_body_sent += i64{send_len};
         conn.state = ConnState::Sending;
         conn.set_slots(
             nullptr, &on_response_body_sent<Loop>, &on_response_body_recvd<Loop>, nullptr);
@@ -11340,10 +11349,10 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     u32 send_len = kDataLen;
 
     if (conn.resp_body_mode == BodyMode::ContentLength) {
-        u32 consume = kDataLen;
-        if (consume > conn.resp_body_remaining) consume = conn.resp_body_remaining;
-        conn.resp_body_remaining = static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) -
-                                                    static_cast<i64>(consume));
+        const u32 consume = conn.resp_body_remaining < i64{kDataLen}
+                                ? static_cast<u32>(conn.resp_body_remaining)
+                                : kDataLen;
+        conn.resp_body_remaining -= i64{consume};
         send_len = consume;
     } else if (conn.resp_body_mode == BodyMode::Chunked) {
         const u8* body_data = conn.upstream_recv_buf.data();
@@ -11392,8 +11401,11 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 // the unencrypted tail and pause the upstream read; the drain (and,
                 // for NeedRead, the next client recv) re-encrypt it via
                 // proxy_tls_parked_drained rather than truncating the download.
-                conn.resp_body_sent =
-                    static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(enc));
+                if (i64{enc} > INT64_MAX - conn.resp_body_sent) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                conn.resp_body_sent += i64{enc};
                 throttle_advance(conn, enc);
                 conn.upstream_send_len = enc;
                 consume_upstream_sent(conn);  // shift past encrypted; tail now at front
@@ -11413,9 +11425,11 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 }
                 return;
             }
-            conn.resp_body_sent =
-                static_cast<u32>(static_cast<i64>(conn.resp_body_sent) +
-                                 static_cast<i64>(enc));  // enc == send_len on Done
+            if (i64{enc} > INT64_MAX - conn.resp_body_sent) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.resp_body_sent += i64{enc};  // enc == send_len on Done
             throttle_advance(conn, enc);
             const bool kBodyDone = proxy_body_complete(conn);
             conn.upstream_send_len = enc;
@@ -11486,8 +11500,11 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.resp_body_sent =
-        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(send_len));
+    if (i64{send_len} > INT64_MAX - conn.resp_body_sent) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.resp_body_sent += i64{send_len};
     conn.upstream_send_len = send_len;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
     client_send(loop, conn, conn.upstream_recv_buf.data(), send_len);
@@ -12084,10 +12101,10 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     const u32 kDataLen = conn.recv_buf.len();
     u32 send_len = kDataLen;
     if (conn.req_body_mode == BodyMode::ContentLength) {
-        u32 consume = kDataLen;
-        if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
-        conn.req_body_remaining =
-            static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
+        const u32 consume = conn.req_body_remaining < i64{kDataLen}
+                                ? static_cast<u32>(conn.req_body_remaining)
+                                : kDataLen;
+        conn.req_body_remaining -= i64{consume};
         send_len = consume;
     } else if (conn.req_body_mode == BodyMode::Chunked) {
         const u8* body_data = conn.recv_buf.data();
@@ -12111,9 +12128,13 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         send_len = pos;
     }
 
-    conn.downstream_req_size =
-        static_cast<u32>(static_cast<i64>(conn.downstream_req_size) + static_cast<i64>(send_len));
-    conn.req_size = static_cast<u32>(static_cast<i64>(conn.req_size) + static_cast<i64>(send_len));
+    if (i64{send_len} > INT64_MAX - conn.downstream_req_size ||
+        i64{send_len} > INT64_MAX - conn.req_size) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.downstream_req_size += i64{send_len};
+    conn.req_size += i64{send_len};
     conn.req_initial_send_len = send_len;
     conn.set_slots(nullptr,
                    nullptr,
@@ -17034,10 +17055,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > 0) {
-        u32 consume = kInitialBodyLen;
-        if (consume > conn.resp_body_remaining) consume = conn.resp_body_remaining;
-        conn.resp_body_remaining = static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) -
-                                                    static_cast<i64>(consume));
+        const u32 consume = conn.resp_body_remaining < i64{kInitialBodyLen}
+                                ? static_cast<u32>(conn.resp_body_remaining)
+                                : kInitialBodyLen;
+        conn.resp_body_remaining -= i64{consume};
     }
 
     bool chunked_done = false;
