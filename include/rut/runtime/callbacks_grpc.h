@@ -59,7 +59,7 @@ void h2ws_h1_drive(Loop*, Connection&);
 template <typename Loop>
 void h2ws_h1_received(void*, Connection&, IoEvent);
 template <typename Loop>
-bool h2ws_h1_tls_finished(Loop*, Connection&);
+[[nodiscard]] bool h2ws_h1_tls_finished(Loop*, Connection&);
 
 template <typename Loop>
 void h1ws_h2_received(void*, Connection&, IoEvent);

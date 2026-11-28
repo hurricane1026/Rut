@@ -11255,8 +11255,11 @@ static AstStatement ws_remaining_body(const AstStatement& body, u32 first) {
     AstStatement tail{};
     tail.kind = AstStmtKind::Block;
     tail.span = body.span;
-    for (u32 i = first; i < body.block_stmts.len; ++i)
-        (void)tail.block_stmts.push(body.block_stmts[i]);
+    if (first < body.block_stmts.len) {
+        tail.block_stmts.len = body.block_stmts.len - first;
+        for (u32 i = 0; i < tail.block_stmts.len; ++i)
+            tail.block_stmts[i] = body.block_stmts[first + i];
+    }
     return tail;
 }
 
@@ -15690,9 +15693,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!concretized) return core::make_unexpected(concretized.error());
         return out;
     };
-    const auto apply_return_type = [&](HirExpr& target,
-                                       const char* context) -> FrontendResult<void> {
-        (void)context;
+    const auto apply_return_type = [&](HirExpr& target) -> FrontendResult<void> {
         auto ret = concrete_return_expr();
         if (!ret) return core::make_unexpected(ret.error());
         if (!same_hir_type_shape(mod, target, ret.value())) {
@@ -15982,7 +15983,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                   fn.type_params.len,
                                                   expr.span);
             if (!then_expr) return core::make_unexpected(then_expr.error());
-            auto pipe_then_typed = apply_return_type(then_expr.value(), "pipe conditional");
+            auto pipe_then_typed = apply_return_type(then_expr.value());
             if (!pipe_then_typed) return core::make_unexpected(pipe_then_typed.error());
             if (pipe_lhs->may_error && then_expr->may_error &&
                 (pipe_lhs->error_struct_index != then_expr->error_struct_index ||
@@ -16127,7 +16128,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     if (!inlined) {
         return core::make_unexpected(inlined.error());
     }
-    auto return_typed = apply_return_type(inlined.value(), "direct");
+    auto return_typed = apply_return_type(inlined.value());
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
     // Same rule as the any/all gates: a fallible i64 has no error carrier

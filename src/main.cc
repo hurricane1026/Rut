@@ -1039,7 +1039,7 @@ int main(int argc, char** argv) {
     bool upstream_dns_specified = false;
     bool ebpf_plan_requested = false;
     const char* ebpf_output_prefix = nullptr;
-    u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
+    [[maybe_unused]] u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [program.rut | --compile PATH]
     //                      [--shards N] [--no-pin] [--drain N]
@@ -1533,7 +1533,6 @@ int main(int argc, char** argv) {
         write_str("No .rut program given — serving default routes only.\n");
     }
 #else
-    (void)opt_level;
     if (config_path) {
         write_str("This build has no JIT (RUT_ENABLE_JIT=OFF); cannot load ");
         write_str(config_path);

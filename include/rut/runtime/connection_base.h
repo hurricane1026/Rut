@@ -758,13 +758,13 @@ struct ConnectionBase {
     bool alloc_ws_buffers(SlicePool& pool) {
         if (ws_max_message_size > kWsMaxMessageCapacity) return false;
         const u32 kCapacity = ws_buffer_capacity();
+#if RUT_ENABLE_WEBSOCKET
         const WsDeflateOptions kDownstream{ws_downstream_deflate.client_window,
                                            ws_downstream_deflate.server_window,
                                            ws_downstream_deflate.client_no_context_takeover};
         const WsDeflateOptions kUpstream{ws_upstream_deflate.server_window,
                                          ws_upstream_deflate.client_window,
                                          ws_upstream_deflate.server_no_context_takeover};
-#if RUT_ENABLE_WEBSOCKET
         const bool kCodecsMatch =
             (ws_downstream_deflate.enabled
                  ? ws_downstream_codec && ws_deflate_matches(*ws_downstream_codec, kDownstream)
@@ -774,8 +774,6 @@ struct ConnectionBase {
                  : ws_upstream_codec == nullptr);
 #else
         const bool kCodecsMatch = !ws_downstream_codec && !ws_upstream_codec;
-        (void)kDownstream;
-        (void)kUpstream;
         if (ws_downstream_deflate.enabled || ws_upstream_deflate.enabled) return false;
 #endif
         if (ws_c2u_msg || ws_u2c_msg || ws_c2u_out || ws_u2c_out)
@@ -816,12 +814,10 @@ struct ConnectionBase {
         ws_u2c_out = buffers[3];
         return true;
     }
-    void free_ws_codecs(SlicePool& pool) {
+    void free_ws_codecs([[maybe_unused]] SlicePool& pool) {
 #if RUT_ENABLE_WEBSOCKET
         ws_deflate_destroy(pool, ws_downstream_codec);
         ws_deflate_destroy(pool, ws_upstream_codec);
-#else
-        (void)pool;
 #endif
         ws_downstream_codec = nullptr;
         ws_upstream_codec = nullptr;

@@ -227,8 +227,7 @@ struct ResponseBodyChain {
 
     // Valid only after a successful reserve_tail() with no intervening
     // append()/reserve_tail() failure or consume() of the tail.
-    u8* write_ptr(const SlicePool& pool) const {
-        (void)pool;
+    [[nodiscard]] u8* write_ptr(const SlicePool&) const {
         return tail ? payload(tail) + i64{tail->len} : nullptr;
     }
     u32 write_avail(const SlicePool& pool) const {

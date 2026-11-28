@@ -60,14 +60,13 @@ private:
     [[nodiscard]] char peek() const { return source_.ptr[pos_]; }
 
     FrontendResult<u32> alloc(JsonKind kind, Span span) {
-        if (doc_.nodes.full())
-            return frontend_error(FrontendError::TooManyItems,
-                                  span,
-                                  lit_str("JSON document exceeds the bounded node capacity"));
         JsonNode node{};
         node.kind = kind;
         node.span = span;
-        (void)doc_.nodes.push(node);
+        if (!doc_.nodes.push(node))
+            return frontend_error(FrontendError::TooManyItems,
+                                  span,
+                                  lit_str("JSON document exceeds the bounded node capacity"));
         return doc_.nodes.len - 1u;
     }
 

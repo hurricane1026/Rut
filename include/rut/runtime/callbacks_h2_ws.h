@@ -48,7 +48,7 @@ bool h2ws_h1_pause(Loop* loop, Connection& c) {
 }
 
 template <typename Loop>
-bool h2ws_h1_tls_finished(Loop* loop, Connection& c) {
+[[nodiscard]] bool h2ws_h1_tls_finished(Loop*, Connection& c) {
     c.ws_tls_shutdown_pending = c.ws_tls_shutdown_need_read = false;
     c.ws_upstream_send_pending = false;
     c.on_send = nullptr;
@@ -60,7 +60,6 @@ bool h2ws_h1_tls_finished(Loop* loop, Connection& c) {
             x->request_end_sent = true;
     }
     c.ws_client_write_shutdown = true;
-    (void)loop;
     return true;
 }
 

@@ -485,26 +485,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // ends at the split). Loop body re-reads `cur` to decide.
         cur = new_child_ref;
         i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(k));
-        // Re-establish patch site for the new cur (we just rewrote
-        // it). Resolve it the same way as the full-match branch.
-        {
-            ArtChildRef* site = nullptr;
-            const u16 ni = art_idx(cur);
-            // For the patch site of the next iteration's child of
-            // cur, we'll resolve lazily on the next descent step;
-            // setting it to nullptr here is safe because the next
-            // iteration will recompute it. But cur itself was just
-            // written through cur_patch_site, so future writes to
-            // *cur_patch_site would clobber it. Reset cur_patch_site
-            // to point at where cur lives in its parent so future
-            // upgrades of cur propagate correctly. Since we just
-            // wrote cur via *cur_patch_site, that pointer is still
-            // valid and points at cur's slot in the parent.
-            (void)site;
-            (void)ni;
-            // cur_patch_site stays as-is (still pointing at the slot
-            // that holds cur in its parent).
-        }
+        // cur_patch_site still points at the parent's slot holding the replacement.
     }
 
     // Set the per-method terminal slot at `cur`. First-insert-wins.

@@ -363,7 +363,7 @@ struct SlicePool {
     // marked in use, not a bulk buffer. On true the whole kSliceSize range at `ptr`
     // is the caller's to release (see below). Always false off Linux, where
     // MADV_DONTNEED need not zero the pages. Pure check; touches nothing.
-    [[nodiscard]] bool bound_slice_valid(const u8* ptr) const {
+    [[nodiscard]] bool bound_slice_valid([[maybe_unused]] const u8* ptr) const {
 #ifdef __linux__
         if (!ptr || !base || !in_use_map || count == 0 || is_bulk(ptr)) return false;
         if (ptr < base || ptr >= base + i64{count} * kSliceSize) return false;
@@ -375,7 +375,6 @@ struct SlicePool {
         if (offset % kSliceSize != 0) return false;
         return in_use_map[offset / kSliceSize];
 #else
-        (void)ptr;
         return false;
 #endif
     }

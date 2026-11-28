@@ -379,7 +379,7 @@ struct Shard {
 
     // Spawn the shard's thread. Optionally pin to CPU core.
     // pin_cpu: -1 = no pinning, >=0 = pin to that core.
-    core::Expected<void, Error> spawn(i32 pin_cpu = -1) {
+    [[nodiscard]] core::Expected<void, Error> spawn([[maybe_unused]] i32 pin_cpu = -1) {
         if (!loop) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
         if (live_log_ring && !live_log_producer.initialized())
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
@@ -431,8 +431,6 @@ struct Shard {
             }
             // If CPU not in allowed set or getaffinity failed, spawn unpinned
         }
-#else
-        (void)pin_cpu;  // macOS development shards run without CPU affinity.
 #endif
 
         const bool kStartedPasswordNow =

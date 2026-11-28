@@ -240,9 +240,8 @@ inline void record_passive_timeout(Loop* loop, Connection& conn) {
 inline void record_active_probe_result(u16 upstream_id,
                                        u32 backend_idx,
                                        bool healthy,
-                                       u64 now_us,
+                                       u64 /*now_us*/,
                                        ActiveHealthThresholds thresholds = {}) {
-    (void)now_us;  // Active verdicts have no timed expiry.
     BackendHealth* h = backend_health(upstream_id, backend_idx);
     if (h == nullptr) return;
     if (healthy) {

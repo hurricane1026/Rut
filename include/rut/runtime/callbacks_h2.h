@@ -2154,8 +2154,7 @@ void h2_on_data_cb(
 // cancelled. The timer/upstream are armed only AFTER process() returns, so at RST
 // time there is no in-flight I/O to undo; the config epoch pinned for the suspend
 // is released by the post-process path once async_stream is clear.
-inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
-    (void)ctx;
+inline void h2_on_reset_cb(void*, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
     if (c.pending_stream == stream_id) h2_clear_pending(c);
     if (c.outbound_stream == stream_id) {
@@ -2689,11 +2688,6 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         // foundation-only action and release both before sending status.
         u8 resp[8192];
         H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
-        // Resolve the pinned id even though both valid and invalid ids are
-        // rejected until H2 serialization exists.
-        const bool valid = h2->async_cfg != nullptr &&
-                           h2->async_cfg->redirect_policy_id_is_valid(kOutcome.redirect_policy_id);
-        (void)valid;
         h2_emit_status(d, kStreamId, 400);
         conn.pending_handler_fn = nullptr;
         h2_clear_async(*h2);

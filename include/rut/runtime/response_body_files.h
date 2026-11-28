@@ -8,10 +8,8 @@
 #include <unistd.h>
 
 namespace rut {
-inline void attach_response_body_files(RouteConfig& cfg) {
-#ifndef __linux__
-    (void)cfg;  // memfd/sendfile are Linux-only; bodies keep memory sends.
-#else
+inline void attach_response_body_files([[maybe_unused]] RouteConfig& cfg) {
+#ifdef __linux__
     for (u32 i = 0; i < cfg.response_body_count; ++i) {
         auto& body = cfg.response_bodies[i];
         if (body.file_ref != 0 || body.len < RouteConfig::kFileBodyMinLen) continue;

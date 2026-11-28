@@ -395,35 +395,23 @@ bool RouteConfig::add_proxy(const char* path, u8 method, u16 upstream_id) {
     return true;
 }
 
-bool RouteConfig::add_ws_terminate(const char* path,
-                                   u8 method,
-                                   u16 upstream_id,
-                                   WsMessageHandlerFn handler,
-                                   u32 max_message_size,
-                                   u16 close_code,
-                                   WsTextRewrite forward_text,
-                                   Str close_reason,
-                                   const WsClosePolicy* close_policies,
-                                   u32 close_policy_count,
-                                   const WsTextRewrite* forward_texts,
-                                   u32 forward_text_count,
-                                   Str subprotocol) {
+[[nodiscard]] bool RouteConfig::add_ws_terminate(
+    [[maybe_unused]] const char* path,
+    [[maybe_unused]] u8 method,
+    [[maybe_unused]] u16 upstream_id,
+    [[maybe_unused]] WsMessageHandlerFn handler,
+    [[maybe_unused]] u32 max_message_size,
+    [[maybe_unused]] u16 close_code,
+    [[maybe_unused]] WsTextRewrite forward_text,
+    [[maybe_unused]] Str close_reason,
+    [[maybe_unused]] const WsClosePolicy* close_policies,
+    [[maybe_unused]] u32 close_policy_count,
+    [[maybe_unused]] const WsTextRewrite* forward_texts,
+    [[maybe_unused]] u32 forward_text_count,
+    [[maybe_unused]] Str subprotocol) {
 #if !RUT_ENABLE_WEBSOCKET
     // The 101/tunnel path is compiled out in this build — a terminate route could
     // never enter terminate mode, so fail loud instead of publishing an unusable route.
-    (void)path;
-    (void)method;
-    (void)upstream_id;
-    (void)handler;
-    (void)max_message_size;
-    (void)close_code;
-    (void)forward_text;
-    (void)close_reason;
-    (void)close_policies;
-    (void)close_policy_count;
-    (void)forward_texts;
-    (void)forward_text_count;
-    (void)subprotocol;
     return false;
 #else
     if (!ws_terminate_metadata_valid(handler,
@@ -454,35 +442,22 @@ bool RouteConfig::add_ws_terminate(const char* path,
 #endif
 }
 
-bool RouteConfig::attach_ws_terminate_to_jit(u32 route_index,
-                                             const char* path,
-                                             u8 method,
-                                             u16 upstream_id,
-                                             WsMessageHandlerFn handler,
-                                             u32 max_message_size,
-                                             u16 close_code,
-                                             WsTextRewrite forward_text,
-                                             Str close_reason,
-                                             const WsClosePolicy* close_policies,
-                                             u32 close_policy_count,
-                                             const WsTextRewrite* forward_texts,
-                                             u32 forward_text_count,
-                                             Str subprotocol) {
+[[nodiscard]] bool RouteConfig::attach_ws_terminate_to_jit(
+    [[maybe_unused]] u32 route_index,
+    [[maybe_unused]] const char* path,
+    [[maybe_unused]] u8 method,
+    [[maybe_unused]] u16 upstream_id,
+    [[maybe_unused]] WsMessageHandlerFn handler,
+    [[maybe_unused]] u32 max_message_size,
+    [[maybe_unused]] u16 close_code,
+    [[maybe_unused]] WsTextRewrite forward_text,
+    [[maybe_unused]] Str close_reason,
+    [[maybe_unused]] const WsClosePolicy* close_policies,
+    [[maybe_unused]] u32 close_policy_count,
+    [[maybe_unused]] const WsTextRewrite* forward_texts,
+    [[maybe_unused]] u32 forward_text_count,
+    [[maybe_unused]] Str subprotocol) {
 #if !RUT_ENABLE_WEBSOCKET
-    (void)route_index;
-    (void)path;
-    (void)method;
-    (void)upstream_id;
-    (void)handler;
-    (void)max_message_size;
-    (void)close_code;
-    (void)forward_text;
-    (void)close_reason;
-    (void)close_policies;
-    (void)close_policy_count;
-    (void)forward_texts;
-    (void)forward_text_count;
-    (void)subprotocol;
     return false;
 #else
     if (route_index >= route_count || path == nullptr || upstream_id >= upstream_count ||

@@ -3952,7 +3952,7 @@ struct Parser {
                         dst[kText.len] = 0;
                         seen |= bit;
                         if (cur().type == TokenType::RBrace) break;
-                        (void)take(TokenType::Comma);
+                        if (cur().type == TokenType::Comma) ++pos;
                         if (cur().type == TokenType::RBrace) break;
                     }
                     auto end = expect(TokenType::RBrace);
@@ -4171,7 +4171,7 @@ struct Parser {
                             auto parsed = parse_health_status_array(statuses, kName);
                             if (!parsed) return core::make_unexpected(parsed.error());
                         }
-                        (void)take(TokenType::Comma);
+                        if (cur().type == TokenType::Comma) ++pos;
                     }
                     auto close = expect(TokenType::RBrace);
                     if (!close) return core::make_unexpected(close.error());
@@ -4406,7 +4406,7 @@ struct Parser {
                                                   span_from(*hc_field.value()),
                                                   hc_key);
                         }
-                        (void)take(TokenType::Comma);
+                        if (cur().type == TokenType::Comma) ++pos;
                         if (cur().type == TokenType::RBrace) break;  // trailing comma
                     }
                     auto hc_rbrace = expect(TokenType::RBrace);
@@ -4431,7 +4431,7 @@ struct Parser {
                 // (`{ backends: [...]\n health_check: {...} }`) blocks. The
                 // lexer drops newlines, so we stop only at the closing brace
                 // and let the next iteration parse the following `field:`.
-                (void)take(TokenType::Comma);
+                if (cur().type == TokenType::Comma) ++pos;
                 if (cur().type == TokenType::RBrace) break;
             }
             auto rbrace = expect(TokenType::RBrace);

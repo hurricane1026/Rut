@@ -1326,37 +1326,37 @@ public:
     // by `max_message_size` (at most one buffer slice). Same failure modes as
     // add_proxy() plus handler, size, UTF-8, and bounded-table validation. Policy
     // arrays are copied, but their text views must outlive the route configuration.
-    bool add_ws_terminate(const char* path,
-                          u8 method,
-                          u16 upstream_id,
-                          WsMessageHandlerFn handler,
-                          u32 max_message_size,
-                          u16 close_code = 1000,
-                          WsTextRewrite forward_text = {},
-                          Str close_reason = {},
-                          const WsClosePolicy* close_policies = nullptr,
-                          u32 close_policy_count = 0,
-                          const WsTextRewrite* forward_texts = nullptr,
-                          u32 forward_text_count = 0,
-                          Str subprotocol = {});
+    [[nodiscard]] bool add_ws_terminate(const char* path,
+                                        u8 method,
+                                        u16 upstream_id,
+                                        WsMessageHandlerFn handler,
+                                        u32 max_message_size,
+                                        u16 close_code = 1000,
+                                        WsTextRewrite forward_text = {},
+                                        Str close_reason = {},
+                                        const WsClosePolicy* close_policies = nullptr,
+                                        u32 close_policy_count = 0,
+                                        const WsTextRewrite* forward_texts = nullptr,
+                                        u32 forward_text_count = 0,
+                                        Str subprotocol = {});
 
     // Attach terminate-mode metadata to an already registered HTTP JIT route.
     // The compiler uses this after `register_jit_routes` so HTTP guards execute
     // before the handler's Forward outcome can open the configured upstream.
-    bool attach_ws_terminate_to_jit(u32 route_index,
-                                    const char* path,
-                                    u8 method,
-                                    u16 upstream_id,
-                                    WsMessageHandlerFn handler,
-                                    u32 max_message_size,
-                                    u16 close_code = 1000,
-                                    WsTextRewrite forward_text = {},
-                                    Str close_reason = {},
-                                    const WsClosePolicy* close_policies = nullptr,
-                                    u32 close_policy_count = 0,
-                                    const WsTextRewrite* forward_texts = nullptr,
-                                    u32 forward_text_count = 0,
-                                    Str subprotocol = {});
+    [[nodiscard]] bool attach_ws_terminate_to_jit(u32 route_index,
+                                                  const char* path,
+                                                  u8 method,
+                                                  u16 upstream_id,
+                                                  WsMessageHandlerFn handler,
+                                                  u32 max_message_size,
+                                                  u16 close_code = 1000,
+                                                  WsTextRewrite forward_text = {},
+                                                  Str close_reason = {},
+                                                  const WsClosePolicy* close_policies = nullptr,
+                                                  u32 close_policy_count = 0,
+                                                  const WsTextRewrite* forward_texts = nullptr,
+                                                  u32 forward_text_count = 0,
+                                                  Str subprotocol = {});
 
     // Set a route's rate limit to a single token-bucket rule (`max` per
     // `window_sec`, burst capacity defaulting to `max`, per-client-IP key),

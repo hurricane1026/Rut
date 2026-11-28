@@ -21,9 +21,9 @@ core::Expected<void, Error> set_nonblocking(i32 fd) {
     return {};
 }
 
-core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared,
-                                                u16 requested_port,
-                                                bool reuse_port) {
+[[nodiscard]] core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared,
+                                                              u16 requested_port,
+                                                              [[maybe_unused]] bool reuse_port) {
     if (!declared.valid())
         return core::make_unexpected(Error::make(EAFNOSUPPORT, Error::Source::Socket));
     if (declared.port != 0u && declared.port != requested_port)
@@ -40,8 +40,6 @@ core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared,
         close(fd);
         return core::make_unexpected(err);
     }
-#else
-    (void)reuse_port;
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
