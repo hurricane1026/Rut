@@ -1877,7 +1877,7 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
 }
 
 template <typename Loop>
-void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
+void on_request_complete(Loop* loop, Connection& conn, u16 status, i64 resp_size);
 
 template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev);
@@ -2888,7 +2888,10 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 }
 
 template <typename Loop>
-void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
+void on_request_complete(Loop* loop, Connection& conn, u16 status, i64 resp_size) {
+    if (resp_size < 0) resp_size = 0;
+    const u32 resp_size_u32 =
+        resp_size > i64{UINT32_MAX} ? UINT32_MAX : static_cast<u32>(resp_size);
 #if RUT_ENABLE_WEBSOCKET
     // The handshake owner is needed through the response decision. Every ordinary
     // response completion (including a non-101 response) retires it here before
@@ -2918,7 +2921,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.status = status;
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
-        entry.resp_size = resp_size;
+        entry.resp_size = resp_size_u32;
         entry.req_size = conn.downstream_req_size > i64{UINT32_MAX}
                              ? UINT32_MAX
                              : static_cast<u32>(conn.downstream_req_size);
@@ -2992,7 +2995,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         __builtin_memset(cap, 0, sizeof(*cap));
         cap->timestamp_us = realtime_us();
         cap->req_content_length = conn.req_content_length;
-        cap->resp_content_length = resp_size;
+        cap->resp_content_length = resp_size_u32;
         cap->resp_status = status;
         cap->raw_header_len = conn.capture_header_len;
         cap->peer_port = conn.peer_port;
@@ -3928,9 +3931,9 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.downstream_req_size += i64{consume};
     conn.req_size += i64{consume};
-    conn.req_initial_send_len = static_cast<u32>(
-        static_cast<i64>(conn.req_header_end) +
-        (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
+    // This is a physical receive-buffer boundary, not the logical cumulative
+    // body position; the latter may exceed u32 for a streamed request.
+    conn.req_initial_send_len = conn.recv_buf.len();
 
     if (conn.req_body_remaining > 0) {
         conn.transition_to_reading_body(&on_jit_request_body_recvd<Loop>);
@@ -4022,9 +4025,7 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.downstream_req_size += i64{consume};
     conn.req_size += i64{consume};
-    conn.req_initial_send_len = static_cast<u32>(
-        static_cast<i64>(conn.req_header_end) +
-        (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
+    conn.req_initial_send_len = conn.recv_buf.len();
     if (conn.req_body_remaining > 0) {
         if (fixed_upload && !response_read_deadline_fixed_upload_route_stable(conn, false)) {
             loop->close_conn(conn);
@@ -13775,7 +13776,7 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
     return ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
 }
 
-inline u32 strict_response_dec(char* out, u32 value);
+inline u32 strict_response_dec(char* out, i64 value);
 inline u32 strict_response_date(char* out, u64 now_us);
 
 namespace detail {
@@ -14840,8 +14841,9 @@ inline bool strict_response_forbidden(Str name) {
     return false;
 }
 
-inline u32 strict_response_dec(char* out, u32 value) {
-    char tmp[10];
+inline u32 strict_response_dec(char* out, i64 value) {
+    if (value < 0) return 0;
+    char tmp[19];
     u32 n = 0;
     do {
         tmp[n++] = last_decimal_digit(value);
@@ -15581,7 +15583,7 @@ inline bool build_strict_response_headers(
         return conn.response_header_buf.write(reinterpret_cast<const u8*>(p), n) == n;
     };
     auto put_lit = [&](const char* p) { return put(p, static_cast<u32>(__builtin_strlen(p))); };
-    char num[10];
+    char num[19];
     char line[32];
     line[0] = static_cast<char>('0' + resp.status_code / 100);
     line[1] = static_cast<char>('0' + (resp.status_code / 10) % 10);

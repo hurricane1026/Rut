@@ -469,7 +469,7 @@ namespace {
                                                     u16 status,
                                                     const hpack::Header* hdrs,
                                                     u32 nhdrs,
-                                                    u32 representation_length) {
+                                                    i64 representation_length) {
     auto staged = enc;
     const u32 n = http2_write_response_impl(out,
                                             out_cap,
