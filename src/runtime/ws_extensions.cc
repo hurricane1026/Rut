@@ -215,40 +215,44 @@ namespace {
 
 u32 ws_rewrite_extensions(
     u8* buffer, u32 header_len, u32 total_len, u32 capacity, Str extension_value) {
-    if (!buffer || header_len < 4 || total_len < header_len || total_len > capacity ||
-        (!extension_value.ptr && extension_value.len) ||
-        memcmp(buffer + i64{header_len} - 4, "\r\n\r\n", 4) != 0)
+    if (!buffer || header_len < 4 || total_len > capacity ||
+        (!extension_value.ptr && extension_value.len))
+        return 0;
+    const auto header = range_int{header_len};
+    u32 tail_length;
+    if (!(range_int{total_len} - header).to(&tail_length) ||
+        memcmp(buffer + range_int{header_len - 4}.index(), "\r\n\r\n", 4) != 0)
         return 0;
     for (u32 i = 0; i < extension_value.len; ++i) {
         const u8 kByte = byte_value(extension_value.ptr[i]);
         if (kByte < 0x20 || kByte >= 0x7f) return 0;
     }
-    const i64 fields_end = i64{header_len} - 2;
-    const i64 first_end = line_end(buffer, 0, header_len);
+    const auto fields_end = (header - range_int<2, 3>{}).value();
+    const i64 first_end = line_end(buffer, 0, header.to<i64>());
     if (first_end == header_len || first_end == 0) return 0;
     const i64 first_field = first_end + 2;
     i64 removed = 0;
     for (i64 pos = first_field; pos < fields_end;) {
-        const i64 end = line_end(buffer, pos, header_len);
+        const i64 end = line_end(buffer, pos, header.to<i64>());
         if (end == header_len || end == pos) return 0;
         const i64 next = end + 2;
         if (field_is(buffer, pos, end, lit_str("sec-websocket-extensions"))) removed += next - pos;
         pos = next;
     }
     constexpr Str kPrefix = lit_str("Sec-WebSocket-Extensions: ");
-    constexpr u32 kLineOverhead = i64{kPrefix.len} + 2;
+    constexpr auto kPrefixLen = range_int<kPrefix.len, kPrefix.len + 1>{};
+    constexpr u32 kLineOverhead = (kPrefixLen + range_int<2, 3>{}).to<u32>();
     const u32 kOverhead = extension_value.len ? kLineOverhead : 0;
-    const auto header = range_int(header_len);
     const auto added = range_int(extension_value.len) + range_int(kOverhead);
     // Each removed byte belongs to a distinct scanned field in this header.
     const i64 new_header = header.value() - removed + added.value();
-    const auto tail = range_int(total_len) - header;
     u32 new_header_len;
-    if (new_header + tail.value() > capacity || !range_int(new_header).to(&new_header_len))
+    if (!range_int{new_header}.to(&new_header_len) ||
+        (range_int{new_header_len} + range_int{tail_length}).value() > capacity)
         return 0;
     i64 written = first_field;
     for (i64 pos = first_field; pos < fields_end;) {
-        const i64 end = line_end(buffer, pos, header_len);
+        const i64 end = line_end(buffer, pos, header.to<i64>());
         const i64 next = end + 2;
         if (!field_is(buffer, pos, end, lit_str("sec-websocket-extensions"))) {
             const i64 line_size = next - pos;
@@ -259,12 +263,12 @@ u32 ws_rewrite_extensions(
     }
     // Shift the tail after scanning the old header; shrinking must not destroy
     // fields still being read, and growing must not overwrite early frame bytes.
-    memmove(buffer + new_header, buffer + header.index(), tail.max(range_int<0, 1>{}).to<u32>());
+    memmove(buffer + range_int{new_header_len}.index(), buffer + header.index(), tail_length);
     if (extension_value.len) {
         memcpy(buffer + written, kPrefix.ptr, kPrefix.len);
-        written += i64{kPrefix.len};
+        written += kPrefixLen.to<i64>();
         memcpy(buffer + written, extension_value.ptr, extension_value.len);
-        written += i64{extension_value.len};
+        written += range_int{extension_value.len}.to<i64>();
         memcpy(buffer + written, "\r\n", 2);
         written += 2;
     }
@@ -274,11 +278,12 @@ u32 ws_rewrite_extensions(
 
 Str ws_selected_subprotocol(const u8* header, u32 header_len) {
     if (!header || header_len < 4) return {};
-    const i64 fields_end = i64{header_len} - 2;
-    const i64 first_end = line_end(header, 0, header_len);
+    const auto length = range_int{header_len};
+    const auto fields_end = (length - range_int<2, 3>{}).value();
+    const i64 first_end = line_end(header, 0, length.to<i64>());
     if (first_end == header_len) return {};
     for (i64 pos = first_end + 2; pos < fields_end;) {
-        const i64 line_stop = line_end(header, pos, header_len);
+        const i64 line_stop = line_end(header, pos, length.to<i64>());
         if (line_stop == header_len || line_stop == pos) return {};
         i64 colon = 0;
         if (field_is(header, pos, line_stop, lit_str("sec-websocket-protocol"), &colon)) {

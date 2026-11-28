@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/http_parser.h"  // ParseStatus
+#include <utility>
 
 // RFC 6455 WebSocket framing primitives (§5). Pure, zero-allocation parse/serialize
 // for the 2..14-octet frame header, in-place payload unmasking, and frame-header
@@ -26,8 +27,8 @@ static constexpr u32 kWsMaxHeaderSize = 14;
 static constexpr u64 kWsMaxControlPayload = 125;
 
 // True for Close/Ping/Pong (the 0x8 opcode bit).
-inline bool ws_opcode_is_control(WsOpcode op) {
-    return (static_cast<u8>(op) & 0x8) != 0;
+[[nodiscard]] inline bool ws_opcode_is_control(WsOpcode op) {
+    return (std::to_underlying(op) & 0x8) != 0;
 }
 
 constexpr bool ws_opcode_valid(WsOpcode op) {

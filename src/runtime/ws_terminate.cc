@@ -20,16 +20,32 @@ json::Document& ws_json_document() {
     return document;
 }
 
+[[nodiscard]] bool ws_json_input(const u8* payload, u64 len, Str path, Str* input) {
+    using JsonLength = range_int<0, json::kMaxBytes + 1>;
+    JsonLength length;
+    if (!payload || !JsonLength::try_from_u64(len, &length) || path.len > json::kMaxBytes ||
+        (!path.ptr && path.len))
+        return false;
+    *input = {reinterpret_cast<const char*>(payload), length.to<u32>()};
+    return true;
+}
+
+[[nodiscard]] bool ws_json_suffix_matches(Str actual, Str suffix) {
+    if (suffix.empty()) return true;
+    u32 offset;
+    return (range_int{actual.len} - range_int{suffix.len}).to(&offset) &&
+           memcmp(actual.ptr + range_int{offset}.index(), suffix.ptr, suffix.len) == 0;
+}
+
 bool ws_json_stringify_to_workspace(
     json::Document& document, const u8* payload, u64 len, Str path, u32& output_len) {
     output_len = 0;
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     json::Writer encoded{document.other};
     const bool kSerialized = kId != json::kNone && document.write(kId, encoded) && encoded.ok;
@@ -42,22 +58,20 @@ bool ws_json_stringify_to_workspace(
 
 bool ws_json_has_path(const u8* payload, u64 len, Str path) {
     // One bounded workspace per worker thread. Never narrow an unchecked message length.
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kValid =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kValid = document.parse(input);
     const bool kPresent = kValid && document.pointer(path) != json::kNone;
     document.source = {};  // do not retain a borrowed message view between callbacks
     return kPresent;
 }
 
 bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsString = kId != json::kNone && document.nodes[kId].kind == json::Kind::String;
     document.source = {};
@@ -67,13 +81,12 @@ bool ws_json_string_at_path(const u8* payload, u64 len, Str path) {
 WsJsonStringScanResult ws_json_scan_string_at_path(
     const u8* payload, u64 len, Str path, WsJsonStringScanner scanner, void* context) {
     json::Document& document = ws_json_document();
-    if (!scanner || !payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!scanner || !ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return WsJsonStringScanResult::Error;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     json::Writer decoded{document.scratch};
     const bool kDecoded = kId != json::kNone && document.nodes[kId].kind == json::Kind::String &&
@@ -85,13 +98,12 @@ WsJsonStringScanResult ws_json_scan_string_at_path(
 
 bool ws_json_number_text_at_path(const u8* payload, u64 len, Str path) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsNumber = kId != json::kNone && document.nodes[kId].kind == json::Kind::Number;
     document.source = {};
@@ -101,13 +113,12 @@ bool ws_json_number_text_at_path(const u8* payload, u64 len, Str path) {
 bool ws_json_number_text_matches_at_path(
     const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len) || (!expected.ptr && expected.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input) || (!expected.ptr && expected.len)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool matches = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
@@ -124,11 +135,7 @@ bool ws_json_number_text_matches_at_path(
                     (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
                 break;
             case WsJsonStringMatch::Suffix:
-                matches =
-                    expected.len <= kActual.len &&
-                    (expected.len == 0 || memcmp(kActual.ptr + i64{kActual.len} - i64{expected.len},
-                                                 expected.ptr,
-                                                 expected.len) == 0);
+                matches = ws_json_suffix_matches(kActual, expected);
                 break;
             case WsJsonStringMatch::Contains:
                 matches = expected.len == 0 ||
@@ -171,11 +178,7 @@ bool ws_json_stringify_matches_at_path(
                       (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
             break;
         case WsJsonStringMatch::Suffix:
-            matches =
-                expected.len <= kActual.len &&
-                (expected.len == 0 || memcmp(kActual.ptr + i64{kActual.len} - i64{expected.len},
-                                             expected.ptr,
-                                             expected.len) == 0);
+            matches = ws_json_suffix_matches(kActual, expected);
             break;
         case WsJsonStringMatch::Contains:
             matches = expected.len == 0 ||
@@ -195,12 +198,10 @@ bool ws_json_string_equals_at_path(const u8* payload, u64 len, Str path, Str exp
 
 bool ws_json_string_matches_at_path(
     const u8* payload, u64 len, Str path, Str expected, WsJsonStringMatch operation) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len) || (!expected.ptr && expected.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input) || (!expected.ptr && expected.len)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool matches = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::String) {
@@ -218,11 +219,7 @@ bool ws_json_string_matches_at_path(
                                memcmp(document.scratch, expected.ptr, expected.len) == 0);
                     break;
                 case WsJsonStringMatch::Suffix:
-                    matches = expected.len <= decoded.len &&
-                              (expected.len == 0 ||
-                               memcmp(document.scratch + i64{decoded.len} - i64{expected.len},
-                                      expected.ptr,
-                                      expected.len) == 0);
+                    matches = ws_json_suffix_matches({document.scratch, decoded.len}, expected);
                     break;
                 case WsJsonStringMatch::Contains:
                     matches = expected.len == 0 ||
@@ -238,11 +235,10 @@ bool ws_json_string_matches_at_path(
 }
 
 bool ws_json_bool_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsBool = kId != json::kNone && document.nodes[kId].kind == json::Kind::Boolean;
     document.source = {};
@@ -250,11 +246,10 @@ bool ws_json_bool_at_path(const u8* payload, u64 len, Str path) {
 }
 
 bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expected) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kEqual = kId != json::kNone && document.nodes[kId].kind == json::Kind::Boolean &&
                         document.raw(kId).eq(expected ? lit_str("true") : lit_str("false"));
@@ -263,11 +258,10 @@ bool ws_json_bool_equals_at_path(const u8* payload, u64 len, Str path, bool expe
 }
 
 bool ws_json_int_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     i64 value = 0;
     const bool kIsInt = kId != json::kNone && document.nodes[kId].kind == json::Kind::Number &&
@@ -278,11 +272,10 @@ bool ws_json_int_at_path(const u8* payload, u64 len, Str path) {
 
 bool ws_json_int_compare_at_path(
     const u8* payload, u64 len, Str path, i64 expected, WsJsonIntComparison comparison) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     i64 value = 0;
     bool matches = false;
@@ -305,12 +298,10 @@ bool ws_json_int_compare_at_path(
 }
 
 bool ws_json_kind_equals_at_path(const u8* payload, u64 len, Str path, Str expected) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len) || (!expected.ptr && expected.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input) || (!expected.ptr && expected.len)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     Str kind{};
     if (kId != json::kNone) {
@@ -341,11 +332,10 @@ bool ws_json_kind_equals_at_path(const u8* payload, u64 len, Str path, Str expec
 }
 
 bool ws_json_count_at_path(const u8* payload, u64 len, Str path) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     const bool kIsContainer =
         kId != json::kNone && (document.nodes[kId].kind == json::Kind::Array ||
@@ -356,16 +346,15 @@ bool ws_json_count_at_path(const u8* payload, u64 len, Str path) {
 
 bool ws_json_count_compare_at_path(
     const u8* payload, u64 len, Str path, i32 expected, WsJsonIntComparison comparison) {
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes || (!path.ptr && path.len))
-        return false;
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) return false;
     json::Document& document = ws_json_document();
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool matches = false;
     if (kId != json::kNone && (document.nodes[kId].kind == json::Kind::Array ||
                                document.nodes[kId].kind == json::Kind::Object)) {
-        const i32 kCount = static_cast<i32>(document.size(kId));
+        const i64 kCount = range_int{document.size(kId)}.to<i64>();
         switch (comparison) {
             case WsJsonIntComparison::Lt:
                 matches = kCount < expected;
@@ -407,24 +396,31 @@ namespace {
     u8 key[4] = {0, 0, 0, 0};
     if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
+    using PayloadLength = range_int<0, __int128_t{UINT32_MAX} + 1>;
+    PayloadLength payload_count;
+    if (!PayloadLength::try_from_u64(len, &payload_count)) return false;
     u32 output_len;
-    const auto decoration_len = range_int(prefix.len) + range_int(suffix.len);
-    if (add_overflow(len, decoration_len.value(), &output_len)) return false;
-    const u32 payload_len = static_cast<u32>(len);
+    if (!(payload_count + range_int{prefix.len} + range_int{suffix.len}).to(&output_len))
+        return false;
     const u32 kHeaderLength =
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
     if (kHeaderLength == 0) return false;
-    if (i64{*produced} + i64{kHeaderLength} + i64{output_len} > i64{out_cap}) return false;
-    for (u32 i = 0; i < kHeaderLength; i++) out[i64{*produced} + i64{i}] = hdr[i];
-    u8* dst = out + i64{*produced} + i64{kHeaderLength};
-    for (u32 i = 0; i < prefix.len; i++) dst[i] = static_cast<u8>(prefix.ptr[i]);
-    for (u32 i = 0; i < payload_len; i++) dst[i64{prefix.len} + i64{i}] = payload[i];
-    const auto suffix_offset = range_int(prefix.len) + range_int(payload_len);
+    const auto cursor = range_int{*produced};
+    const auto payload_start = cursor + range_int{kHeaderLength};
+    PayloadLength end;
+    if (!range_int{out_cap}.try_count((payload_start + range_int{output_len}).value(), &end))
+        return false;
+    u8* frame = out + cursor.index();
+    for (u32 i = 0; i < kHeaderLength; i++) frame[i] = hdr[i];
+    u8* dst = out + payload_start.index();
+    for (u32 i = 0; i < prefix.len; i++) dst[i] = byte_value(prefix.ptr[i]);
+    u8* const body = dst + range_int{prefix.len}.index();
+    for (u32 i = 0; i < payload_count.to<u32>(); i++) body[i] = payload[i];
+    const auto suffix_offset = range_int{prefix.len} + payload_count;
     for (u32 i = 0; i < suffix.len; i++)
-        dst[(suffix_offset + range_int(i)).index()] = static_cast<u8>(suffix.ptr[i]);
+        dst[(suffix_offset + range_int{i}).index()] = byte_value(suffix.ptr[i]);
     if (masked) ws_unmask(dst, output_len, key);
-    *produced = static_cast<u32>(static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength) +
-                                 static_cast<i64>(output_len));
+    *produced = end.to<u32>();
     return true;
 }
 
@@ -443,23 +439,21 @@ namespace {
     u32 frame_len;
     if (sub_overflow(*produced, begin, &frame_len)) return false;
     WsFrameHeader header{};
-    if (ws_parse_header(out + range_int(begin).value(), frame_len, st.masked, &header) !=
+    if (ws_parse_header(out + range_int{begin}.index(), frame_len, st.masked, &header) !=
             ParseStatus::Complete ||
-        (header.opcode != WsOpcode::Text && header.opcode != WsOpcode::Binary) ||
-        header.header_len > frame_len ||
-        header.payload_len != (range_int(frame_len) - range_int(header.header_len)).value())
+        (header.opcode != WsOpcode::Text && header.opcode != WsOpcode::Binary))
         return false;
-    u8* const kPayload = out + i64{begin} + i64{header.header_len};
-    if (st.masked) ws_unmask(kPayload, static_cast<u64>(header.payload_len), header.mask_key);
+    u32 payload_length;
+    if (!(range_int{frame_len} - range_int{header.header_len}).to(&payload_length) ||
+        header.payload_len != payload_length)
+        return false;
+    u8* const kPayload = out + (range_int{begin} + range_int{header.header_len}).index();
+    if (st.masked) ws_unmask(kPayload, payload_length, header.mask_key);
     u32 length = 0;
-    const auto kStatus = ws_deflate_payload(*st.encoder,
-                                            kPayload,
-                                            static_cast<u32>(header.payload_len),
-                                            scratch,
-                                            scratch_capacity,
-                                            &length);
+    const auto kStatus = ws_deflate_payload(
+        *st.encoder, kPayload, payload_length, scratch, scratch_capacity, &length);
     if (kStatus == WsDeflateStatus::Error) return false;
-    if (kStatus == WsDeflateStatus::Ok && length < header.payload_len) {
+    if (kStatus == WsDeflateStatus::Ok && length < payload_length) {
         *produced = begin;
         return emit_frame(out,
                           out_cap,
@@ -473,7 +467,7 @@ namespace {
                           {},
                           true);
     }
-    if (st.masked) ws_unmask(kPayload, static_cast<u64>(header.payload_len), header.mask_key);
+    if (st.masked) ws_unmask(kPayload, payload_length, header.mask_key);
     return true;
 }
 #endif
@@ -483,9 +477,11 @@ bool decode_close_payload(const u8* payload, u32 len, u16& code, Str& reason) {
     code = 1005;
     reason = {};
     if (len == 0) return true;
-    code = static_cast<u16>((static_cast<u16>(payload[0]) << 8) | payload[1]);
-    reason = {reinterpret_cast<const char*>(payload + 2),
-              static_cast<u32>(static_cast<i64>(len) - 2)};
+    constexpr auto kCodeLength = range_int<2, 3>{};
+    u32 reason_length;
+    if (!(range_int{len} - kCodeLength).to(&reason_length)) return false;
+    code = (range_int{payload[0]}.scaled_by<256>() + range_int{payload[1]}).to<u16>();
+    reason = {reinterpret_cast<const char*>(payload + kCodeLength.index()), reason_length};
     return ws_valid_close_code(code) && ws_valid_close_reason(reason);
 }
 
@@ -501,13 +497,12 @@ bool emit_json_string_frame(u8* out,
                             bool masked,
                             u64& mask_rng) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool emitted = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::String) {
@@ -515,8 +510,7 @@ bool emit_json_string_frame(u8* out,
         if (document.string(kId, decoded) && decoded.ok &&
             ws_valid_text_payload({document.scratch, decoded.len})) {
             const u64 kOutputSize =
-                static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(decoded.len) +
-                                 static_cast<i64>(suffix.len));
+                (range_int{prefix.len} + range_int{decoded.len} + range_int{suffix.len}).to_u64();
             if (kOutputSize <= kWsMaxMessageCapacity &&
                 (max_size == 0 || kOutputSize <= max_size)) {
                 emitted = emit_frame(out,
@@ -549,20 +543,18 @@ bool emit_json_number_text_frame(u8* out,
                                  bool masked,
                                  u64& mask_rng) {
     json::Document& document = ws_json_document();
-    if (!payload || len > json::kMaxBytes || path.len > json::kMaxBytes ||
-        (!path.ptr && path.len)) {
+    Str input;
+    if (!ws_json_input(payload, len, path, &input)) {
         document.source = {};
         return false;
     }
-    const bool kParsed =
-        document.parse({reinterpret_cast<const char*>(payload), static_cast<u32>(len)});
+    const bool kParsed = document.parse(input);
     const u32 kId = kParsed ? document.pointer(path) : json::kNone;
     bool emitted = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
         const Str kLexeme = document.raw(kId);
         const u64 kOutputSize =
-            static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(kLexeme.len) +
-                             static_cast<i64>(suffix.len));
+            (range_int{prefix.len} + range_int{kLexeme.len} + range_int{suffix.len}).to_u64();
         if (kOutputSize <= kWsMaxMessageCapacity && (max_size == 0 || kOutputSize <= max_size)) {
             emitted = emit_frame(out,
                                  out_cap,
@@ -596,8 +588,7 @@ bool emit_json_stringify_frame(u8* out,
     u32 serialized_len = 0;
     if (!ws_json_stringify_to_workspace(document, payload, len, path, serialized_len)) return false;
     const u64 kOutputSize =
-        static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(serialized_len) +
-                         static_cast<i64>(suffix.len));
+        (range_int{prefix.len} + range_int{serialized_len} + range_int{suffix.len}).to_u64();
     if (kOutputSize > kWsMaxMessageCapacity || (max_size != 0 && kOutputSize > max_size))
         return false;
     return emit_frame(out,
@@ -622,7 +613,8 @@ bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     if (rewrite.source == WsTextSource::Dynamic)
         return !rewrite.prefix.ptr && !rewrite.prefix.len && !rewrite.suffix.ptr &&
                !rewrite.suffix.len && !rewrite.source_path.ptr && !rewrite.source_path.len;
-    const i64 literal_size = i64{rewrite.prefix.len} + i64{rewrite.suffix.len};
+    const u64 literal_size =
+        (range_int{rewrite.prefix.len} + range_int{rewrite.suffix.len}).to_u64();
     const bool kSourceValid =
         rewrite.source <= WsTextSource::MessageBytes &&
         (rewrite.source != WsTextSource::MessageBytes ||
@@ -639,7 +631,7 @@ bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
                   (rewrite.suffix.ptr || rewrite.suffix.len == 0)
             : ws_valid_text_payload(rewrite.prefix) && ws_valid_text_payload(rewrite.suffix);
     return kSourceValid && literal_size <= kWsMaxMessageCapacity &&
-           (max_size == 0 || static_cast<u64>(literal_size) <= max_size) && kPayloadValid;
+           (max_size == 0 || literal_size <= max_size) && kPayloadValid;
 }
 
 bool ws_valid_close_reason(Str reason) {
@@ -647,11 +639,12 @@ bool ws_valid_close_reason(Str reason) {
 }
 
 bool WsClosePayload::assign(u16 status, Str text) {
+    u8 length;
     if ((!ws_valid_close_code(status) && status != 1005) || (status == 1005 && !text.empty()) ||
-        !ws_valid_close_reason(text))
+        !ws_valid_close_reason(text) || !range_int{text.len}.to(&length))
         return false;
     for (u32 i = 0; i < text.len; ++i) reason_storage[i] = text.ptr[i];
-    reason_len = static_cast<u8>(text.len);
+    reason_len = length;
     code = status;
     return true;
 }

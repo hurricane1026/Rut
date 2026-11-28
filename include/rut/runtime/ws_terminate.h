@@ -19,14 +19,19 @@
 namespace rut {
 struct WsDeflateCodec;
 
-inline constexpr u32 kWsMaxCloseReasonBytes = u32{i64{kWsMaxControlPayload} - 2};
+inline constexpr u32 kWsMaxCloseReasonBytes =
+    (range_int<kWsMaxControlPayload, kWsMaxControlPayload + 1>{} - range_int<2, 3>{}).to<u32>();
 
 // Default remains the ordinary-slice payload budget. Explicit larger limits
 // use existing bulk storage; reserve the worst-case masked frame header.
 inline constexpr u32 kWsTerminateMessageCapacity =
-    static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(kWsMaxHeaderSize));
-inline constexpr u32 kWsMaxMessageCapacity = static_cast<u32>(
-    static_cast<i64>(SlicePool::kBulkSliceSize) - static_cast<i64>(kWsMaxHeaderSize));
+    (range_int<SlicePool::kSliceSize, SlicePool::kSliceSize + 1>{} -
+     range_int<kWsMaxHeaderSize, kWsMaxHeaderSize + 1>{})
+        .to<u32>();
+inline constexpr u32 kWsMaxMessageCapacity =
+    (range_int<SlicePool::kBulkSliceSize, SlicePool::kBulkSliceSize + 1>{} -
+     range_int<kWsMaxHeaderSize, kWsMaxHeaderSize + 1>{})
+        .to<u32>();
 
 constexpr bool ws_valid_message_capacity(u32 size) {
     return size != 0 && size <= kWsMaxMessageCapacity;

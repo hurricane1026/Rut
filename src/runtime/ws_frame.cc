@@ -17,8 +17,7 @@ ParseStatus ws_parse_header(
     // RFC 7692 owns RSV1 only; no negotiated extension owns RSV2 or RSV3.
     if ((b0 & 0x30) != 0) return ParseStatus::Error;
 
-    const u8 opcode_bits = b0 & 0x0F;
-    const WsOpcode opcode = static_cast<WsOpcode>(opcode_bits);
+    const WsOpcode opcode{bounded_remainder<16>(b0).to<u8>()};
     if (!ws_opcode_valid(opcode)) return ParseStatus::Error;
     const bool kCompressed = (b0 & 0x40) != 0;
     if (kCompressed &&
@@ -45,10 +44,10 @@ ParseStatus ws_parse_header(
     i64 payload_len = 0;
     u8 offset = 2;
     if (len7 < 126) {
-        payload_len = len7;
+        payload_len = range_int{len7}.to<i64>();
     } else if (len7 == 126) {
         if (len < 4) return ParseStatus::Incomplete;
-        payload_len = (i64{buf[2]} << 8) | i64{buf[3]};
+        payload_len = (range_int{buf[2]}.scaled_by<256>() + range_int{buf[3]}).to<i64>();
         offset = 4;
         // §5.2: the minimal number of length bytes MUST be used — a 16-bit length below
         // 126 is a non-canonical encoding.
@@ -62,7 +61,9 @@ ParseStatus ws_parse_header(
             // RUT_INTEGER_RANGE: each iteration appends one of exactly eight wire bytes.
             wire_length = (wire_length << 8) | buf[kPosition.index()];
         }
-        if (!try_u64_to_i64(wire_length, &payload_len)) return ParseStatus::Error;
+        range_int<0> length;
+        if (!range_int<0>::try_from_u64(wire_length, &length)) return ParseStatus::Error;
+        payload_len = length.to<i64>();
         offset = 10;
         // Minimal-length rule: a 64-bit length that fits in 16 bits is non-canonical.
         if (payload_len <= 0xFFFF) return ParseStatus::Error;
@@ -73,7 +74,7 @@ ParseStatus ws_parse_header(
         const auto kMaskedLength = range_int(offset) + range_int<4, 5>{};
         if (len < kMaskedLength.value()) return ParseStatus::Incomplete;
         header_length = kMaskedLength.to<u32>();
-        __builtin_memmove(out->mask_key, buf + range_int(offset).value(), sizeof(out->mask_key));
+        __builtin_memmove(out->mask_key, buf + range_int{offset}.index(), sizeof(out->mask_key));
     } else {
         for (i32 i = 0; i < 4; ++i) out->mask_key[i] = 0;
     }
@@ -122,7 +123,7 @@ u32 ws_write_header(u8* out,
     if (payload_len >= (u64{1} << 63)) return 0;  // 64-bit length MSB is reserved zero
 
     const u64 flags = (fin ? u64{0x80} : 0) | (compressed ? u64{0x40} : 0);
-    out[0] = bounded_remainder<256>(flags | static_cast<u8>(op)).to<u8>();
+    out[0] = bounded_remainder<256>(flags | range_int{std::to_underlying(op)}.to_u64()).to<u8>();
     const u8 mask_bit = masked ? 0x80 : 0x00;
     u8 offset;
     if (payload_len <= 125) {
@@ -144,7 +145,7 @@ u32 ws_write_header(u8* out,
         offset = 10;
     }
     if (masked) {
-        __builtin_memmove(out + range_int(offset).value(), mask_key, 4);
+        __builtin_memmove(out + range_int{offset}.index(), mask_key, 4);
         return (range_int(offset) + range_int<4, 5>{}).to<u32>();
     }
     return offset;
