@@ -56,7 +56,7 @@ bool set_fd_nonblocking(i32 fd) {
 Connection* make_eligible(IoUringEventLoop& loop,
                           i32 upstream_fd,
                           i32 downstream_fd,
-                          u32 body_len,
+                          i64 body_len,
                           bool client_keepalive = false) {
     Connection* c = loop.alloc_conn();
     if (c == nullptr) return nullptr;
@@ -358,6 +358,35 @@ TEST(iouring_splice, shutdown_closes_relay_pipe_after_cancel_is_queued) {
     CHECK_EQ(fcntl(pipe_write, F_GETFD), -1);
     CHECK_EQ(errno, EBADF);
     CHECK_EQ(loop.relay_cancel_retry_count, 0u);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
+TEST(iouring_splice, wide_logical_counters_survive_one_segment) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    i32 upstream[2] = {-1, -1};
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    constexpr u32 kSegment = 4096;
+    u8 payload[kSegment];
+    fill_pattern(payload, kSegment);
+    REQUIRE(send_all(upstream[1], payload, kSegment));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], i64{UINT32_MAX} + 2 * kSegment);
+    REQUIRE(c != nullptr);
+    c->resp_body_sent = i64{UINT32_MAX} + 17;
+    c->relay_owner.body_bytes = i64{UINT32_MAX} + 9;
+    upstream[0] = downstream[0] = -1;
+    REQUIRE(loop.test_start_response_splice(*c));
+    for (u32 i = 0; i < 8 && c->resp_body_sent == i64{UINT32_MAX} + 17; ++i) pump_once(loop);
+    u8 received[kSegment];
+    REQUIRE(read_exact(downstream[1], received, kSegment));
+    CHECK_EQ(__builtin_memcmp(received, payload, kSegment), 0);
+    CHECK_EQ(c->resp_body_remaining, i64{UINT32_MAX} + kSegment);
+    CHECK_EQ(c->resp_body_sent, i64{UINT32_MAX} + 17 + kSegment);
+    CHECK_EQ(c->relay_owner.body_bytes, i64{UINT32_MAX} + 9 + kSegment);
     close(upstream[1]);
     close(downstream[1]);
 }

@@ -3948,7 +3948,8 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
                       const hpack::Header* trailers,
                       u32 trailer_count,
                       u8 expected_failure,
-                      bool expect_detached) {
+                      bool expect_detached,
+                      u64 initial_response_bytes = 0) {
         GrpcDriveFixture loop;
         Connection upstream;
         upstream.reset();
@@ -3966,6 +3967,7 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
         x.upstream = &upstream;
         x.downstream = &downstream;
         x.upstream_stream = x.downstream_stream = 1;
+        x.response_bytes = initial_response_bytes;
         x.slot_held = true;
         x.upstream_id = 7;
         REQUIRE(upstream_h2.open_stream(1) != nullptr);
@@ -4037,6 +4039,24 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
         {{"content-length", 14}, {"4294967296", 10}},
     };
     run(wide_headers, 3, false, nullptr, 0, false, nullptr, 0, 0, false);
+
+    const hpack::Header wide_complete_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"4294967298", 10}},
+    };
+    const u8 one_byte[] = {'x'};
+    run(wide_complete_headers,
+        3,
+        false,
+        one_byte,
+        1,
+        true,
+        status_trailers,
+        1,
+        0,
+        false,
+        u64{UINT32_MAX} + 1);
 
     const hpack::Header terminal_headers[] = {
         {{":status", 7}, {"200", 3}},
